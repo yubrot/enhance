@@ -1,0 +1,9 @@
+[package]
+name = "enhance"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+byteorder = "1"
