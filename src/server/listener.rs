@@ -7,23 +7,28 @@ use crate::server::connection::Connection;
 
 /// TCP server implementing PostgreSQL wire protocol.
 pub struct Server {
-    addr: String,
-    /// Next process ID (NOTE: This server does not actually fork a process)
+    listener: TcpListener,
     next_process_id: Arc<AtomicI32>,
 }
 
 impl Server {
-    pub fn new(addr: impl Into<String>) -> Self {
+    /// Creates a new server from an already-bound `TcpListener`.
+    pub fn new(listener: TcpListener) -> Self {
         Self {
-            addr: addr.into(),
+            listener,
             next_process_id: Arc::new(AtomicI32::new(1)),
         }
     }
 
-    pub async fn run(&self) -> Result<(), std::io::Error> {
-        let listener = TcpListener::bind(&self.addr).await?;
-        println!("enhance: listening on {}", self.addr);
+    /// Binds to the given address and returns a ready-to-serve `Server`.
+    pub async fn bind(addr: impl Into<String>) -> Result<Self, std::io::Error> {
+        let addr = addr.into();
+        let listener = TcpListener::bind(&addr).await?;
+        Ok(Self::new(listener))
+    }
 
+    /// Starts accepting connections and serving clients.
+    pub async fn serve(self) -> Result<(), std::io::Error> {
         // NOTE: This is a minimal implementation suitable for learning/development.
         // For production use, the following improvements would be necessary:
         //
@@ -52,7 +57,7 @@ impl Server {
         //    - Add health check endpoint
 
         loop {
-            let (socket, peer_addr) = listener.accept().await?;
+            let (socket, peer_addr) = self.listener.accept().await?;
             let process_id = self.next_process_id.fetch_add(1, Ordering::SeqCst);
 
             println!(

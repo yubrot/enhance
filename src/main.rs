@@ -6,8 +6,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("enhance: A From-Scratch RDBMS Implementation");
     println!("Starting on {}", addr);
 
-    let server = Server::new(addr);
-    server.run().await?;
+    let server = Server::bind(addr).await?;
+    server.serve().await?;
 
     Ok(())
 }

@@ -3,9 +3,8 @@
 //! Provides a simple interface for setting up a test server and running psql commands.
 
 use std::process::Command;
-use std::time::Duration;
 
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 use enhance::server::Server;
@@ -61,19 +60,14 @@ pub struct PsqlTestServer {
 
 impl PsqlTestServer {
     /// Starts a new test server on an available port.
-    ///
-    /// Waits for the server to be ready before returning.
     pub async fn start() -> Self {
-        let port = Self::find_available_port().await;
-        let addr = format!("127.0.0.1:{}", port);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
 
-        let server = Server::new(&addr);
+        let server = Server::new(listener);
         let handle = tokio::spawn(async move {
-            let _ = server.run().await;
+            let _ = server.serve().await;
         });
-
-        // Wait for server to accept connections
-        Self::wait_for_server(port).await;
 
         Self { port, handle }
     }
@@ -97,23 +91,6 @@ impl PsqlTestServer {
         }
     }
 
-    /// Finds an available port by binding to port 0.
-    async fn find_available_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap().port()
-    }
-
-    /// Waits for the server to accept TCP connections.
-    async fn wait_for_server(port: u16) {
-        let addr = format!("127.0.0.1:{}", port);
-        for _ in 0..50 {
-            if TcpStream::connect(&addr).await.is_ok() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("Server did not become ready within 500ms");
-    }
 }
 
 impl Drop for PsqlTestServer {
