@@ -3,6 +3,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Read a null-terminated string from an async reader.
 /// Returns the string (without the null terminator).
+///
+/// NOTE: Production improvements needed:
+/// - Add maximum length parameter to prevent unbounded memory allocation
+/// - A malicious client could send data without null terminator, causing OOM
+/// - Consider using a bounded buffer with explicit size limit (e.g., 64KB)
 pub async fn read_cstring<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<String> {
     let mut bytes = Vec::new();
     loop {

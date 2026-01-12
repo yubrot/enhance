@@ -41,10 +41,16 @@ pub struct StartupParameters {
 
 impl StartupMessage {
     /// Read a startup-phase message from the stream (including length prefix).
+    ///
+    /// NOTE: Production improvements needed:
+    /// - Add maximum message size limit (PostgreSQL uses 1GB max)
+    /// - Implement read timeout to prevent slow-loris attacks
+    /// - Consider using a pre-allocated buffer pool for parsing
     pub async fn read<R: AsyncRead + Unpin>(r: &mut R) -> Result<Self, ProtocolError> {
         let len = r.read_i32().await?;
 
         // Minimum length is 8 (length + code)
+        // NOTE: Production should also enforce maximum length (e.g., 10KB for startup)
         if len < 8 {
             return Err(ProtocolError::InvalidMessage);
         }
@@ -79,6 +85,10 @@ impl StartupMessage {
         }
     }
 
+    /// NOTE: Production improvements needed:
+    /// - Limit maximum parameter name/value lengths
+    /// - Limit total number of parameters (prevent DoS via memory exhaustion)
+    /// - Sanitize/validate parameter values (e.g., encoding names)
     async fn read_startup_parameters<R: AsyncRead + Unpin>(
         r: &mut R,
         mut remaining: usize,

@@ -27,6 +27,29 @@ enum ConnectionState {
 }
 
 /// A single client connection.
+///
+/// NOTE: This is a minimal implementation suitable for learning/development.
+/// For production use, the following improvements would be necessary:
+///
+/// 1. Authentication:
+///    - Implement proper authentication methods (MD5, SCRAM-SHA-256)
+///    - Validate credentials against user database
+///    - Support pg_hba.conf-style access control rules
+///
+/// 2. Security:
+///    - Use cryptographically secure random number generator for secret_key
+///    - Implement SSL/TLS support (currently rejected)
+///    - Add rate limiting for failed authentication attempts
+///
+/// 3. Connection Lifecycle:
+///    - Implement idle connection timeout
+///    - Add query execution timeout
+///    - Support graceful shutdown notification from server
+///
+/// 4. Protocol Completeness:
+///    - Handle all frontend message types (currently only startup + terminate)
+///    - Implement query cancellation via CancelRequest
+///    - Support COPY protocol for bulk data transfer
 pub struct Connection {
     socket: BufWriter<TcpStream>,
     process_id: i32,
@@ -36,7 +59,8 @@ pub struct Connection {
 
 impl Connection {
     pub fn new(socket: TcpStream, process_id: i32) -> Self {
-        // Generate a simple secret key
+        // NOTE: Production would use a CSPRNG (e.g., rand::thread_rng())
+        // The secret_key is used to authenticate CancelRequest messages
         let secret_key = process_id.wrapping_mul(0x5DEECE66u32 as i32);
 
         Self {
@@ -158,6 +182,11 @@ impl Connection {
     }
 
     async fn handle_query_phase(&mut self) -> Result<(), ConnectionError> {
+        // NOTE: Production improvements needed:
+        // - Add message size limit (e.g., max 1GB) to prevent memory exhaustion
+        // - Implement read timeout to detect hung clients
+        // - Use a bounded buffer pool instead of allocating per-message
+
         // Read message type byte
         let msg_type = match self.socket.read_u8().await {
             Ok(t) => t,
