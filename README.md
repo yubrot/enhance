@@ -93,3 +93,7 @@ This project is built using an AI-Driven, Understanding-First approach.
 * AI as Driver: The AI generates implementation code based on specific architectural requirements.
 * User as Navigator: I review every line, ensure it adheres to the ADR, and verify the memory/concurrency safety.
 * Iteration: Use `psql` and unit tests at every week's end to verify the "Vertical Slice" of the system.
+
+## Production Readiness
+
+This project is designed for learning and experimentation, not production use. Throughout the codebase, inline `NOTE:` comments document what would be necessary to make each component production-ready (e.g., graceful shutdown, connection limiting, proper authentication, input validation). These comments serve as a roadmap for future hardening while keeping the learning-focused implementation minimal and understandable.
