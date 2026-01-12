@@ -1,0 +1,171 @@
+# Week 1
+
+**Goal**: TCP Server & Handshake - Implement Tokio listener, handle StartupMessage (Big Endian) and SSLRequest, achieve "Trust" authentication state.
+
+# This Week I Learned
+
+## How PostgreSQL Wire Protocol 3.0 Begins
+
+Since we use psql as a client, we needed to learn some aspects of the PostgreSQL Wire Protocol 3.0.
+
+### Big-Endian Binary Encoding
+
+PostgreSQL protocol uses network byte order (Big-Endian):
+
+### Frontend
+
+PostgreSQL protocol has a special initialization sequence:
+
+1. **The first message has no message type byte** - Regular messages start with a 1-byte type identifier ('Q', 'X', etc.), but the very first message starts with just the length (i32)
+2. **Special request codes** - Instead of a protocol version number, special values can appear:
+   - `80877103` = SSLRequest (SSL connection negotiation)
+   - `80877104` = GSSENCRequest (GSSAPI encryption)
+   - `80877102` = CancelRequest (cancel running query)
+   - `196608` = Protocol version 3.0 (normal StartupMessage)
+3. **StartupMessage structure** - After the protocol version, null-terminated key-value pairs follow, ending with a final null byte
+
+### Backend
+
+Learned the specific message sequence required for psql to complete connection:
+
+1. **AuthenticationOk** (type='R', i32=0) - Notify authentication success
+2. **BackendKeyData** (type='K') - Process ID and secret key (used for CancelRequest)
+3. **ParameterStatus** (type='S') - Send multiple server parameters (server_version, encodings, DateStyle, TimeZone, etc.)
+4. **ReadyForQuery** (type='Z') - Transaction status ('I'=Idle, 'T'=Transaction, 'E'=Error)
+
+Without sending this sequence correctly, psql cannot complete the connection.
+
+```mermaid
+sequenceDiagram
+    participant Client as psql
+    participant Server as enhance
+
+    Note over Client,Server: Initial Connection
+    Client->>Server: SSLRequest (code=80877103)
+    Server-->>Client: 'N' (SSL not supported)
+
+    Client->>Server: StartupMessage (version=196608, user=postgres, database=postgres)
+
+    Note over Client,Server: Authentication Phase
+    Server-->>Client: AuthenticationOk (type='R', code=0)
+
+    Note over Client,Server: Startup Info Phase
+    Server-->>Client: BackendKeyData (type='K', pid, secret)
+    Server-->>Client: ParameterStatus (type='S', name=value) x multiple
+    Server-->>Client: ReadyForQuery (type='Z', status='I')
+
+    Note over Client,Server: Connection Ready
+    Client->>Server: Query / Terminate messages...
+```
+
+## Implementing Async TCP Server with Tokio
+
+Learned the basic patterns for async servers with Tokio:
+
+- **`TcpListener::bind()` and `.accept()` loop** - Main thread accepts connections
+- **`tokio::spawn()` for per-connection tasks** - Each connection processed in independent task for concurrency
+- **`TcpStream` split** - Read/write with `AsyncReadExt` and `AsyncWriteExt`
+- **State machine pattern** - `ConnectionState` enum manages connection lifecycle (AwaitingStartup → SslRejected → Authenticating → SendingStartupInfo → Ready)
+
+## Testing with Real psql Client
+
+Achieved integration testing with actual `psql` command:
+
+- **Launch psql with `std::process::Command`** - Connect to custom server with `-h localhost -p 15432`
+- **Pipe stdin/stdout** - Control psql programmatically
+- **Verify successful connection** - Ensure psql connects and exits cleanly
+- **Real-world compatibility** - Guarantees compatibility with actual clients, not just unit tests
+
+```bash
+$ psql -h localhost -p 15432 -U postgres
+psql (16.0)
+Type "help" for help.
+
+postgres=> \q
+# Successfully connects and exits cleanly
+```
+
+## Concurrency Model: PostgreSQL vs enhance
+
+Understanding the architectural difference in handling concurrent connections:
+
+### PostgreSQL: Multi-Process Architecture
+
+PostgreSQL uses a traditional multi-process model:
+
+1. **Process Structure**
+   - `postmaster`: Main process that accepts client connections
+   - `postgres`: Backend process forked per connection (one OS process per client)
+   - Utility processes: WAL writer, checkpointer, autovacuum, etc.
+
+2. **Memory Sharing via OS Shared Memory**
+   - **Shared Buffer Pool**: Disk page cache shared across all processes
+   - **WAL Buffer**: Transaction log buffer
+   - **Lock Table**: Table/row-level lock information
+   - **Other**: Transaction state, statistics, etc.
+
+3. **Synchronization Primitives**
+   - POSIX semaphores, spinlocks, latches for controlling access to shared memory
+   - Multiple processes coordinate access to the same page using locks
+
+### enhance: Async Task-Based Architecture
+
+enhance takes a modern Rust-centric approach:
+
+1. **Concurrency Model**
+   - Single process with Tokio async runtime
+   - One async task per connection (not OS threads)
+   - Lightweight task switching managed by Tokio executor
+
+2. **Memory Sharing via Rust's Type System**
+   - **`Arc<RwLock<Page>>`**: Safe shared access to pages across tasks
+   - No OS-level shared memory needed
+   - Rust's ownership system prevents data races at compile time
+
+3. **Synchronization Primitives**
+   - `RwLock` for read/write access control
+   - `Arc` for reference counting across tasks
+   - Type safety guarantees memory safety without runtime overhead
+
+**Trade-offs**: PostgreSQL's multi-process model provides strong isolation (process crashes don't affect others) and cross-platform compatibility. enhance's async model offers lower memory overhead per connection and leverages Rust's compile-time safety guarantees, making it ideal for this learning project.
+
+## Next Steps
+
+### Week 2: Simple Query Protocol
+
+Handle the 'Q' message and begin parsing simple SELECT queries
+
+### Future Module Structure
+
+As the project grows, the codebase will be organized to maintain clear separation of concerns:
+
+```
+src/
+├── protocol/      # Wire protocol messages (frontend/backend)
+│                  # Binary encoding/decoding for PostgreSQL protocol
+│
+├── server/        # TCP listener and connection handling
+│                  # Protocol state machine (StartupMessage → Ready)
+│                  # Thin adapter: SQL string → engine → BackendMessage
+│
+├── storage/       # Storage engine (Week 5+)
+│   ├── vfs/       # VFS trait (Memory/File implementations)
+│   ├── buffer/    # Buffer pool manager with LRU
+│   └── page/      # Slotted page structure, CRUD operations
+│
+├── sql/           # SQL processing (Week 13+)
+│   ├── lexer/     # Tokenization
+│   ├── parser/    # Recursive descent parser → AST
+│   └── planner/   # AST → Query plan
+│
+├── execution/     # Volcano model executors (Week 15+)
+│   ├── scan/      # SeqScan, IndexScan
+│   ├── filter/    # WHERE clause evaluation
+│   └── join/      # Nested loop join, etc.
+│
+├── index/         # B+Tree implementation (Week 19+)
+│
+└── transaction/   # Transaction manager and WAL (Week 21+)
+```
+
+**Design Principle**: The `server/` module remains a thin protocol handler. Core database logic (query execution, storage, transactions) lives in separate modules that can be tested independently of the wire protocol.

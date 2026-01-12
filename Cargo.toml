@@ -6,4 +6,3 @@ rust-version = "1.92"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-byteorder = "1"
