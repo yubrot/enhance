@@ -4,11 +4,14 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use tokio::net::TcpListener;
 
 use crate::server::connection::Connection;
+use crate::server::handshake::{Handshake, HandshakeResult};
+use crate::server::registry::Registry;
 
 /// TCP server implementing PostgreSQL wire protocol.
 pub struct Server {
     listener: TcpListener,
-    next_process_id: Arc<AtomicI32>,
+    next_pid: Arc<AtomicI32>,
+    registry: Arc<Registry>,
 }
 
 impl Server {
@@ -16,7 +19,8 @@ impl Server {
     pub fn new(listener: TcpListener) -> Self {
         Self {
             listener,
-            next_process_id: Arc::new(AtomicI32::new(1)),
+            next_pid: Arc::new(AtomicI32::new(1)),
+            registry: Arc::new(Registry::new()),
         }
     }
 
@@ -58,21 +62,40 @@ impl Server {
 
         loop {
             let (socket, peer_addr) = self.listener.accept().await?;
-            let process_id = self.next_process_id.fetch_add(1, Ordering::SeqCst);
+            let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
+            let registry = self.registry.clone();
 
-            println!(
-                "Accepted connection from {} (pid={})",
-                peer_addr, process_id
-            );
+            println!("(pid={}) Accepted connection from {}", pid, peer_addr);
 
-            // NOTE: Spawned task is detached - no tracking of completion
-            // Production: Use JoinSet or similar to track and await all tasks on shutdown
             tokio::spawn(async move {
-                let mut connection = Connection::new(socket, process_id);
+                let handshake = Handshake::new(socket, pid);
+                let (socket, secret_key) = match handshake.run().await {
+                    Ok(HandshakeResult::Success { socket, secret_key }) => {
+                        println!("(pid={}) Connection ready", pid);
+                        (socket, secret_key)
+                    }
+                    Ok(HandshakeResult::CancelRequested {
+                        pid: target_pid,
+                        secret_key,
+                    }) => {
+                        println!("(pid={}) Cancel request: target_pid={}", pid, target_pid);
+                        registry.cancel(target_pid, secret_key);
+                        println!("(pid={}) Connection closed", pid);
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("(pid={}) Handshake error: {}", pid, e);
+                        return;
+                    }
+                };
+
+                let cancel_token = registry.register(pid, secret_key);
+                let mut connection = Connection::new(socket, pid, cancel_token);
                 if let Err(e) = connection.run().await {
-                    eprintln!("Connection error (pid={}): {}", process_id, e);
+                    eprintln!("(pid={}) Connection error: {}", pid, e);
                 }
-                println!("Connection closed (pid={})", process_id);
+                registry.unregister(pid);
+                println!("(pid={}) Connection closed", pid);
             });
         }
     }

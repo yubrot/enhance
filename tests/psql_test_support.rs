@@ -91,6 +91,12 @@ impl PsqlTestServer {
         }
     }
 
+    /// Connects to the test server using a `TcpStream`.
+    pub async fn connect(&self) -> tokio::net::TcpStream {
+        tokio::net::TcpStream::connect(format!("127.0.0.1:{}", self.port))
+            .await
+            .unwrap()
+    }
 }
 
 impl Drop for PsqlTestServer {
