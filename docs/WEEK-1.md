@@ -1,6 +1,6 @@
 # Week 1
 
-**Goal**: TCP Server & Handshake - Implement Tokio listener, handle StartupMessage (Big Endian) and SSLRequest, achieve "Trust" authentication state.
+> TCP Server & Handshake: Implement Tokio listener. Handle StartupMessage (Big Endian) and SSLRequest. Achieve a "Trust" authentication state.
 
 # This Week I Learned
 
@@ -58,32 +58,37 @@ sequenceDiagram
     Client->>Server: Query / Terminate messages...
 ```
 
-## Implementing Async TCP Server with Tokio
+### Testing with Real psql Client
 
-Learned the basic patterns for async servers with Tokio:
+Verified the implementation by connecting with an actual `psql` command:
 
-- **`TcpListener::bind()` and `.accept()` loop** - Main thread accepts connections
-- **`tokio::spawn()` for per-connection tasks** - Each connection processed in independent task for concurrency
-- **`TcpStream` split** - Read/write with `AsyncReadExt` and `AsyncWriteExt`
-- **State machine pattern** - `ConnectionState` enum manages connection lifecycle (AwaitingStartup → SslRejected → Authenticating → SendingStartupInfo → Ready)
-
-## Testing with Real psql Client
-
-Achieved integration testing with actual `psql` command:
-
-- **Launch psql with `std::process::Command`** - Connect to custom server with `-h localhost -p 15432`
-- **Pipe stdin/stdout** - Control psql programmatically
-- **Verify successful connection** - Ensure psql connects and exits cleanly
-- **Real-world compatibility** - Guarantees compatibility with actual clients, not just unit tests
+- **Manual Verification** - Run the server with `cargo run` and connect using `psql -h localhost -p 5432 -U postgres`.
+- **Real-world Compatibility** - Confirmed that the server correctly handles the initialization sequence (SSLRequest, StartupMessage) and sends the required startup info (AuthenticationOk, ParameterStatus, etc.) for `psql` to reach the prompt.
+- **Clean Exit** - Verified that `\q` terminates the connection gracefully.
 
 ```bash
-$ psql -h localhost -p 15432 -U postgres
+$ psql -h localhost -p 5432 -U postgres
 psql (16.0)
 Type "help" for help.
 
 postgres=> \q
 # Successfully connects and exits cleanly
 ```
+
+## Implementing Async TCP Server with Tokio
+
+Learned the basic patterns for async servers with Tokio:
+
+- **`TcpListener::bind()` and `.accept()` loop** - Main thread accepts connections
+- **`tokio::spawn()` for per-connection tasks** - Each connection processed in independent task for concurrency
+
+## Handling Query Cancellation
+
+Implemented the protocol-level query cancellation mechanism:
+
+- **Connection Registry** - A global `Registry` tracks active connections by their PID and secret key.
+- **CancelRequest Handling** - When a `CancelRequest` arrives, the server identifies the target connection via the registry and triggers a `CancellationToken` to stop its execution.
+- **Cross-Task Communication** - Uses `tokio_util::sync::CancellationToken` for safe, async-friendly interruption of connection tasks.
 
 ## Concurrency Model: PostgreSQL vs enhance
 
@@ -118,7 +123,7 @@ enhance takes a modern Rust-centric approach:
    - Lightweight task switching managed by Tokio executor
 
 2. **Memory Sharing via Rust's Type System**
-   - **`Arc<RwLock<Page>>`**: Safe shared access to pages across tasks
+   - **`Arc<RwLock<Page>>` (maybe)**: Safe shared access to pages across tasks
    - No OS-level shared memory needed
    - Rust's ownership system prevents data races at compile time
 
@@ -129,13 +134,13 @@ enhance takes a modern Rust-centric approach:
 
 **Trade-offs**: PostgreSQL's multi-process model provides strong isolation (process crashes don't affect others) and cross-platform compatibility. enhance's async model offers lower memory overhead per connection and leverages Rust's compile-time safety guarantees, making it ideal for this learning project.
 
-## Next Steps
+# Next Steps
 
-### Week 2: Simple Query Protocol
+## Week 2: Simple Query Protocol
 
-Handle the 'Q' message and begin parsing simple SELECT queries
+> Handle the 'Q' message. Implement the basic loop to return CommandComplete.
 
-### Future Module Structure
+## Future Module Structure
 
 As the project grows, the codebase will be organized to maintain clear separation of concerns:
 
