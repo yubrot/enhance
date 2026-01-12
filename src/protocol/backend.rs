@@ -1,4 +1,7 @@
-use crate::protocol::codec::WritePgExt;
+use std::io;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+
+use crate::protocol::codec::write_cstring;
 
 /// Messages sent by the backend (server) to the client.
 #[derive(Debug)]
@@ -16,54 +19,48 @@ pub enum BackendMessage {
 }
 
 impl BackendMessage {
-    /// Encode the message to bytes.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        self.encode_into(&mut buf);
-        buf
-    }
-
-    /// Encode the message into an existing buffer.
-    pub fn encode_into(&self, buf: &mut Vec<u8>) {
+    /// Write this message to the stream.
+    pub async fn write<W: AsyncWrite + Unpin>(&self, w: &mut W) -> io::Result<()> {
         match self {
             BackendMessage::AuthenticationOk => {
-                buf.push(b'R');
-                buf.write_i32(8); // length
-                buf.write_i32(0); // auth type 0 = Ok
+                w.write_u8(b'R').await?;
+                w.write_i32(8).await?; // length
+                w.write_i32(0).await?; // auth type 0 = Ok
             }
             BackendMessage::BackendKeyData {
                 process_id,
                 secret_key,
             } => {
-                buf.push(b'K');
-                buf.write_i32(12); // length
-                buf.write_i32(*process_id);
-                buf.write_i32(*secret_key);
+                w.write_u8(b'K').await?;
+                w.write_i32(12).await?; // length
+                w.write_i32(*process_id).await?;
+                w.write_i32(*secret_key).await?;
             }
             BackendMessage::ParameterStatus { name, value } => {
-                buf.push(b'S');
+                w.write_u8(b'S').await?;
                 let len = 4 + name.len() + 1 + value.len() + 1;
-                buf.write_i32(len as i32);
-                buf.write_cstring(name);
-                buf.write_cstring(value);
+                w.write_i32(len as i32).await?;
+                write_cstring(w, name).await?;
+                write_cstring(w, value).await?;
             }
             BackendMessage::ReadyForQuery { status } => {
-                buf.push(b'Z');
-                buf.write_i32(5); // length
-                buf.push(status.as_byte());
+                w.write_u8(b'Z').await?;
+                w.write_i32(5).await?; // length
+                w.write_u8(status.as_byte()).await?;
             }
             BackendMessage::ErrorResponse { fields } => {
-                buf.push(b'E');
-                let mut body = Vec::new();
+                w.write_u8(b'E').await?;
+                // Calculate body length
+                let body_len: usize = fields.iter().map(|f| 1 + f.value.len() + 1).sum::<usize>() + 1;
+                w.write_i32((4 + body_len) as i32).await?;
                 for field in fields {
-                    body.push(field.code);
-                    body.write_cstring(&field.value);
+                    w.write_u8(field.code).await?;
+                    write_cstring(w, &field.value).await?;
                 }
-                body.push(0); // terminator
-                buf.write_i32((4 + body.len()) as i32);
-                buf.extend(body);
+                w.write_u8(0).await?; // terminator
             }
         }
+        Ok(())
     }
 }
 
@@ -99,35 +96,38 @@ pub struct ErrorField {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_encode_authentication_ok() {
+    #[tokio::test]
+    async fn test_write_authentication_ok() {
         let msg = BackendMessage::AuthenticationOk;
-        let bytes = msg.encode();
-        assert_eq!(bytes, vec![b'R', 0, 0, 0, 8, 0, 0, 0, 0]);
+        let mut buf = Vec::new();
+        msg.write(&mut buf).await.unwrap();
+        assert_eq!(buf, vec![b'R', 0, 0, 0, 8, 0, 0, 0, 0]);
     }
 
-    #[test]
-    fn test_encode_ready_for_query() {
+    #[tokio::test]
+    async fn test_write_ready_for_query() {
         let msg = BackendMessage::ReadyForQuery {
             status: TransactionStatus::Idle,
         };
-        let bytes = msg.encode();
-        assert_eq!(bytes, vec![b'Z', 0, 0, 0, 5, b'I']);
+        let mut buf = Vec::new();
+        msg.write(&mut buf).await.unwrap();
+        assert_eq!(buf, vec![b'Z', 0, 0, 0, 5, b'I']);
     }
 
-    #[test]
-    fn test_encode_parameter_status() {
+    #[tokio::test]
+    async fn test_write_parameter_status() {
         let msg = BackendMessage::ParameterStatus {
             name: "server_version".to_string(),
             value: "16.0".to_string(),
         };
-        let bytes = msg.encode();
+        let mut buf = Vec::new();
+        msg.write(&mut buf).await.unwrap();
         // 'S' + length(4) + "server_version\0" + "16.0\0"
         // length = 4 + 15 ("server_version\0") + 5 ("16.0\0") = 24
-        assert_eq!(bytes[0], b'S');
-        assert_eq!(&bytes[1..5], &[0, 0, 0, 24]); // length field
+        assert_eq!(buf[0], b'S');
+        assert_eq!(&buf[1..5], &[0, 0, 0, 24]); // length field
         assert_eq!(
-            &bytes[5..],
+            &buf[5..],
             b"server_version\0\x31\x36\x2e\x30\0" // "server_version\016.0\0"
         );
     }

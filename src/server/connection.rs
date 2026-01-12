@@ -2,7 +2,7 @@ mod error;
 
 pub use error::ConnectionError;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 
 use crate::protocol::{
@@ -28,11 +28,10 @@ enum ConnectionState {
 
 /// A single client connection.
 pub struct Connection {
-    socket: TcpStream,
+    socket: BufWriter<TcpStream>,
     process_id: i32,
     secret_key: i32,
     state: ConnectionState,
-    buffer: Vec<u8>,
 }
 
 impl Connection {
@@ -41,11 +40,10 @@ impl Connection {
         let secret_key = process_id.wrapping_mul(0x5DEECE66u32 as i32);
 
         Self {
-            socket,
+            socket: BufWriter::new(socket),
             process_id,
             secret_key,
             state: ConnectionState::AwaitingStartup,
-            buffer: Vec::with_capacity(8192),
         }
     }
 
@@ -72,27 +70,19 @@ impl Connection {
     }
 
     async fn handle_startup_message(&mut self) -> Result<(), ConnectionError> {
-        // Read the length prefix
-        let length = self.socket.read_i32().await?;
-
-        if !(8..=10000).contains(&length) {
-            return Err(ConnectionError::Protocol(ProtocolError::InvalidMessage));
-        }
-
-        // Read the message body (length includes the 4-byte length field itself)
-        self.buffer.resize((length - 4) as usize, 0);
-        self.socket.read_exact(&mut self.buffer).await?;
-        let message = StartupMessage::parse(&self.buffer)?;
+        let message = StartupMessage::read(&mut self.socket).await?;
 
         match message {
             StartupMessage::SslRequest => {
                 // Reject SSL with 'N'
                 self.socket.write_all(b"N").await?;
+                self.socket.flush().await?;
                 self.state = ConnectionState::SslRejected;
             }
             StartupMessage::GssEncRequest => {
                 // Reject GSSAPI encryption with 'N'
                 self.socket.write_all(b"N").await?;
+                self.socket.flush().await?;
                 self.state = ConnectionState::SslRejected;
             }
             StartupMessage::Startup {
@@ -117,21 +107,22 @@ impl Connection {
     }
 
     async fn send_authentication_ok(&mut self) -> Result<(), ConnectionError> {
-        let msg = BackendMessage::AuthenticationOk;
-        self.socket.write_all(&msg.encode()).await?;
+        BackendMessage::AuthenticationOk
+            .write(&mut self.socket)
+            .await?;
+        self.socket.flush().await?;
         self.state = ConnectionState::SendingStartupInfo;
         Ok(())
     }
 
     async fn send_startup_info(&mut self) -> Result<(), ConnectionError> {
-        let mut buf = Vec::new();
-
         // Send BackendKeyData
         BackendMessage::BackendKeyData {
             process_id: self.process_id,
             secret_key: self.secret_key,
         }
-        .encode_into(&mut buf);
+        .write(&mut self.socket)
+        .await?;
 
         // Send essential ParameterStatus messages
         // psql expects certain parameters to be present
@@ -150,16 +141,18 @@ impl Connection {
                 name: name.to_string(),
                 value: value.to_string(),
             }
-            .encode_into(&mut buf);
+            .write(&mut self.socket)
+            .await?;
         }
 
         // Send ReadyForQuery
         BackendMessage::ReadyForQuery {
             status: TransactionStatus::Idle,
         }
-        .encode_into(&mut buf);
+        .write(&mut self.socket)
+        .await?;
 
-        self.socket.write_all(&buf).await?;
+        self.socket.flush().await?;
         self.state = ConnectionState::Ready;
         Ok(())
     }
@@ -181,11 +174,11 @@ impl Connection {
             return Err(ConnectionError::Protocol(ProtocolError::InvalidMessage));
         }
 
-        // Read message body
+        // Skip message body if present
         if length > 4 {
             let body_len = (length - 4) as usize;
-            self.buffer.resize(body_len, 0);
-            self.socket.read_exact(&mut self.buffer).await?;
+            let mut buf = vec![0u8; body_len];
+            self.socket.read_exact(&mut buf).await?;
         }
 
         match msg_type {
@@ -195,7 +188,7 @@ impl Connection {
             }
             _ => {
                 // Send ErrorResponse for any query (not yet implemented)
-                let error = BackendMessage::ErrorResponse {
+                BackendMessage::ErrorResponse {
                     fields: vec![
                         ErrorField {
                             code: b'S',
@@ -214,18 +207,18 @@ impl Connection {
                             value: "Queries not yet implemented".to_string(),
                         },
                     ],
-                };
-
-                let mut buf = Vec::new();
-                error.encode_into(&mut buf);
+                }
+                .write(&mut self.socket)
+                .await?;
 
                 // Send ReadyForQuery to allow client to continue
                 BackendMessage::ReadyForQuery {
                     status: TransactionStatus::Idle,
                 }
-                .encode_into(&mut buf);
+                .write(&mut self.socket)
+                .await?;
 
-                self.socket.write_all(&buf).await?;
+                self.socket.flush().await?;
             }
         }
 

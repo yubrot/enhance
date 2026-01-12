@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::io::Read;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::protocol::ProtocolError;
-use crate::protocol::codec::ReadPgExt;
+use crate::protocol::codec::read_cstring;
 
 /// SSLRequest magic number
 pub const SSL_REQUEST_CODE: i32 = (1234 << 16) | 5679; // 80877103
@@ -40,17 +40,26 @@ pub struct StartupParameters {
 }
 
 impl StartupMessage {
-    /// Parse a startup-phase message from raw bytes.
-    /// The `buf` should contain the complete startup message body (after the length field).
-    pub fn parse(mut buf: &[u8]) -> Result<Self, ProtocolError> {
-        let code = buf.read_i32()?;
+    /// Read a startup-phase message from the stream (including length prefix).
+    pub async fn read<R: AsyncRead + Unpin>(r: &mut R) -> Result<Self, ProtocolError> {
+        let len = r.read_i32().await?;
+
+        // Minimum length is 8 (length + code)
+        if len < 8 {
+            return Err(ProtocolError::InvalidMessage);
+        }
+
+        let code = r.read_i32().await?;
+
+        // Remaining bytes after length and code
+        let remaining = (len - 8) as usize;
 
         match code {
-            SSL_REQUEST_CODE if buf.is_empty() => Ok(StartupMessage::SslRequest),
-            GSSENC_REQUEST_CODE if buf.is_empty() => Ok(StartupMessage::GssEncRequest),
-            CANCEL_REQUEST_CODE if buf.len() == 8 => {
-                let process_id = buf.read_i32()?;
-                let secret_key = buf.read_i32()?;
+            SSL_REQUEST_CODE if remaining == 0 => Ok(StartupMessage::SslRequest),
+            GSSENC_REQUEST_CODE if remaining == 0 => Ok(StartupMessage::GssEncRequest),
+            CANCEL_REQUEST_CODE if remaining == 8 => {
+                let process_id = r.read_i32().await?;
+                let secret_key = r.read_i32().await?;
                 Ok(StartupMessage::CancelRequest {
                     process_id,
                     secret_key,
@@ -59,26 +68,50 @@ impl StartupMessage {
             SSL_REQUEST_CODE | GSSENC_REQUEST_CODE | CANCEL_REQUEST_CODE => {
                 Err(ProtocolError::InvalidMessage)
             }
-            version if (version >> 16) == 3 => Ok(StartupMessage::Startup {
-                protocol_version: version,
-                parameters: Self::parse_startup_parameters(&mut buf)?,
-            }),
+            version if (version >> 16) == 3 => {
+                let parameters = Self::read_startup_parameters(r, remaining).await?;
+                Ok(StartupMessage::Startup {
+                    protocol_version: version,
+                    parameters,
+                })
+            }
             _ => Err(ProtocolError::UnsupportedProtocolVersion(code)),
         }
     }
 
-    fn parse_startup_parameters<R: Read>(buf: &mut R) -> Result<StartupParameters, ProtocolError> {
+    async fn read_startup_parameters<R: AsyncRead + Unpin>(
+        r: &mut R,
+        mut remaining: usize,
+    ) -> Result<StartupParameters, ProtocolError> {
         let mut params = StartupParameters::default();
 
         loop {
-            let name = match buf.read_cstring() {
-                Ok(s) if s.is_empty() => break,
-                Ok(s) => s,
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(_) => return Err(ProtocolError::InvalidUtf8),
-            };
+            if remaining == 0 {
+                break;
+            }
 
-            let value = buf.read_cstring().map_err(|_| ProtocolError::InvalidUtf8)?;
+            let name = read_cstring(r).await.map_err(|e| {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    ProtocolError::InsufficientData
+                } else {
+                    ProtocolError::InvalidUtf8
+                }
+            })?;
+
+            // Account for name + null terminator
+            remaining = remaining.saturating_sub(name.len() + 1);
+
+            // Empty name signals end of parameters
+            if name.is_empty() {
+                break;
+            }
+
+            let value = read_cstring(r)
+                .await
+                .map_err(|_| ProtocolError::InvalidUtf8)?;
+
+            // Account for value + null terminator
+            remaining = remaining.saturating_sub(value.len() + 1);
 
             match name.as_str() {
                 "user" => params.user = value,
@@ -101,28 +134,37 @@ impl StartupMessage {
 
 #[cfg(test)]
 mod tests {
-    use crate::protocol::codec::WritePgExt;
-
     use super::*;
+    use std::io::Cursor;
+    use tokio::io::AsyncWriteExt;
 
-    #[test]
-    fn test_parse_ssl_request() {
-        // SSL_REQUEST_CODE = 80877103 = 0x04D2162F
-        let buf = [0x04, 0xD2, 0x16, 0x2F];
-        let msg = StartupMessage::parse(&buf).unwrap();
+    async fn make_startup_message(code: i32, body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let len = 4 + 4 + body.len(); // length + code + body
+        buf.write_i32(len as i32).await.unwrap();
+        buf.write_i32(code).await.unwrap();
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    #[tokio::test]
+    async fn test_read_ssl_request() {
+        let buf = make_startup_message(SSL_REQUEST_CODE, &[]).await;
+        let mut cursor = Cursor::new(buf);
+        let msg = StartupMessage::read(&mut cursor).await.unwrap();
         assert!(matches!(msg, StartupMessage::SslRequest));
     }
 
-    #[test]
-    fn test_parse_startup_message() {
-        // Protocol version 3.0 + parameters
-        let mut buf = Vec::new();
-        buf.write_i32(3 << 16);
-        buf.extend_from_slice(b"user\0postgres\0");
-        buf.extend_from_slice(b"database\0testdb\0");
-        buf.push(0); // terminator
+    #[tokio::test]
+    async fn test_read_startup_message() {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"user\0postgres\0");
+        body.extend_from_slice(b"database\0testdb\0");
+        body.push(0); // terminator
 
-        let msg = StartupMessage::parse(&buf).unwrap();
+        let buf = make_startup_message(3 << 16, &body).await;
+        let mut cursor = Cursor::new(buf);
+        let msg = StartupMessage::read(&mut cursor).await.unwrap();
 
         match msg {
             StartupMessage::Startup {
