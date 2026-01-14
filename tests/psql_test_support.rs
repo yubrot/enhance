@@ -38,16 +38,6 @@ impl PsqlOutput {
             self.output
         );
     }
-
-    /// Asserts that the output contains any of the given substrings.
-    pub fn assert_output_contains_any(&self, expected: &[&str]) {
-        let found = expected.iter().any(|s| self.output.contains(s));
-        assert!(
-            found,
-            "output should contain one of {:?}: {}",
-            expected, self.output
-        );
-    }
 }
 
 /// A test server wrapper that handles setup and teardown.

@@ -90,8 +90,8 @@ impl Server {
                 };
 
                 let cancel_token = registry.register(pid, secret_key);
-                let mut connection = Connection::new(socket, pid, cancel_token);
-                if let Err(e) = connection.run().await {
+                let mut connection = Connection::new(socket, pid);
+                if let Err(e) = connection.run(cancel_token).await {
                     eprintln!("(pid={}) Connection error: {}", pid, e);
                 }
                 registry.unregister(pid);
