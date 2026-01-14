@@ -14,14 +14,6 @@ async fn test_psql_connect_and_quit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_psql_query_returns_error() {
-    let server = PsqlTestServer::start().await;
-
-    let result = server.run_psql("SELECT 1;\\q");
-    result.assert_output_contains_any(&["not yet implemented", "Queries not yet implemented"]);
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn test_psql_multiple_connections() {
     let server = PsqlTestServer::start().await;
 
@@ -99,4 +91,62 @@ async fn test_psql_cancel_request() {
         Ok(Err(_)) => {} // Error is also fine (e.g. connection reset)
         Err(_) => panic!("Timed out waiting for connection to close"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_set_command() {
+    let server = PsqlTestServer::start().await;
+
+    let result = server.run_psql("SET client_encoding = 'UTF8';\\q");
+    result.assert_success();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_simple_query() {
+    let server = PsqlTestServer::start().await;
+
+    let result = server.run_psql("SELECT 1;\\q");
+    result.assert_success();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_multiple_queries() {
+    let server = PsqlTestServer::start().await;
+
+    let result = server.run_psql("SELECT 1; SELECT 2; SELECT 3;\\q");
+    result.assert_success();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_create_table() {
+    let server = PsqlTestServer::start().await;
+
+    let result = server.run_psql("CREATE TABLE test (id INT);\\q");
+    result.assert_success();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_insert_update_delete() {
+    let server = PsqlTestServer::start().await;
+
+    let result = server
+        .run_psql("INSERT INTO test VALUES (1); UPDATE test SET id = 2; DELETE FROM test;\\q");
+    result.assert_success();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_transaction_commands() {
+    let server = PsqlTestServer::start().await;
+
+    let result = server.run_psql("BEGIN; SELECT 1; COMMIT;\\q");
+    result.assert_success();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_empty_query() {
+    let server = PsqlTestServer::start().await;
+
+    // Empty query should be handled gracefully
+    let result = server.run_psql(";\\q");
+    result.assert_success();
 }

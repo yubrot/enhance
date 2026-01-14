@@ -17,6 +17,12 @@ struct ConnectionHandle {
     cancel_token: CancellationToken,
 }
 
+impl Default for Registry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Registry {
     pub fn new() -> Self {
         Self {
@@ -48,10 +54,10 @@ impl Registry {
     /// Attempts to cancel a connection identified by its PID and secret key.
     pub fn cancel(&self, pid: i32, secret_key: i32) {
         let conns = self.connections.lock().expect("mutex poisoned");
-        if let Some(handle) = conns.get(&pid) {
-            if handle.secret_key == secret_key {
-                handle.cancel_token.cancel();
-            }
+        if let Some(handle) = conns.get(&pid)
+            && handle.secret_key == secret_key
+        {
+            handle.cancel_token.cancel();
         }
     }
 }

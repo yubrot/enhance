@@ -67,7 +67,7 @@ Verified the implementation by connecting with an actual `psql` command:
 - **Clean Exit** - Verified that `\q` terminates the connection gracefully.
 
 ```bash
-$ psql -h localhost -p 5432 -U postgres
+$ psql -h localhost -p 15432 -U postgres
 psql (16.0)
 Type "help" for help.
 
@@ -99,11 +99,13 @@ Understanding the architectural difference in handling concurrent connections:
 PostgreSQL uses a traditional multi-process model:
 
 1. **Process Structure**
+
    - `postmaster`: Main process that accepts client connections
    - `postgres`: Backend process forked per connection (one OS process per client)
    - Utility processes: WAL writer, checkpointer, autovacuum, etc.
 
 2. **Memory Sharing via OS Shared Memory**
+
    - **Shared Buffer Pool**: Disk page cache shared across all processes
    - **WAL Buffer**: Transaction log buffer
    - **Lock Table**: Table/row-level lock information
@@ -118,11 +120,13 @@ PostgreSQL uses a traditional multi-process model:
 enhance takes a modern Rust-centric approach:
 
 1. **Concurrency Model**
+
    - Single process with Tokio async runtime
    - One async task per connection (not OS threads)
    - Lightweight task switching managed by Tokio executor
 
 2. **Memory Sharing via Rust's Type System**
+
    - **`Arc<RwLock<Page>>` (maybe)**: Safe shared access to pages across tasks
    - No OS-level shared memory needed
    - Rust's ownership system prevents data races at compile time

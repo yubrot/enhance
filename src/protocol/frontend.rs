@@ -142,6 +142,59 @@ impl StartupMessage {
     }
 }
 
+/// Messages sent by the frontend (client) during query phase.
+///
+/// NOTE: Production improvements needed:
+/// - Add maximum query length limit (PostgreSQL uses 1GB max)
+/// - Consider query sanitization/logging (redact sensitive data)
+#[derive(Debug)]
+pub enum FrontendMessage {
+    /// 'Q' - Simple query
+    Query(String),
+    /// 'X' - Termination
+    Terminate,
+}
+
+impl FrontendMessage {
+    /// Read a query-phase message from the stream.
+    /// Returns None on EOF (clean disconnect).
+    ///
+    /// NOTE: Production improvements needed:
+    /// - Add timeout to prevent slow-loris attacks
+    /// - Limit query size (PostgreSQL: 1GB max)
+    /// - Support more message types (Parse, Bind, Execute, etc.)
+    pub async fn read<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Self>, ProtocolError> {
+        // Read message type byte
+        let msg_type = match r.read_u8().await {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        // Read length (includes self but not type byte)
+        // TODO: this should be passed to read_cstring or else
+        let length = r.read_i32().await?;
+        if length < 4 {
+            return Err(ProtocolError::InvalidMessage);
+        }
+
+        match msg_type {
+            b'Q' => {
+                // Query: read null-terminated string
+                let query = read_cstring(r)
+                    .await
+                    .map_err(|_| ProtocolError::InvalidUtf8)?;
+                Ok(Some(FrontendMessage::Query(query)))
+            }
+            b'X' => {
+                // Terminate: no body (just length=4)
+                Ok(Some(FrontendMessage::Terminate))
+            }
+            _ => Err(ProtocolError::UnknownMessageType(msg_type)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +240,57 @@ mod tests {
             }
             _ => panic!("expected Startup message"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_read_query_message() {
+        let mut buf = Vec::new();
+        buf.push(b'Q');
+        buf.write_i32(13).await.unwrap(); // length = 4 + 9 ("SELECT 1\0")
+        buf.extend_from_slice(b"SELECT 1\0");
+
+        let mut cursor = Cursor::new(buf);
+        let msg = FrontendMessage::read(&mut cursor).await.unwrap().unwrap();
+
+        match msg {
+            FrontendMessage::Query(q) => assert_eq!(q, "SELECT 1"),
+            _ => panic!("expected Query message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_terminate_message() {
+        let mut buf = Vec::new();
+        buf.push(b'X');
+        buf.write_i32(4).await.unwrap(); // length (no body)
+
+        let mut cursor = Cursor::new(buf);
+        let msg = FrontendMessage::read(&mut cursor).await.unwrap().unwrap();
+
+        assert!(matches!(msg, FrontendMessage::Terminate));
+    }
+
+    #[tokio::test]
+    async fn test_read_eof() {
+        let buf = Vec::new();
+        let mut cursor = Cursor::new(buf);
+        let msg = FrontendMessage::read(&mut cursor).await.unwrap();
+
+        assert!(msg.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_unknown_message_type() {
+        let mut buf = Vec::new();
+        buf.push(b'Z'); // Unknown type
+        buf.write_i32(4).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let result = FrontendMessage::read(&mut cursor).await;
+
+        assert!(matches!(
+            result,
+            Err(ProtocolError::UnknownMessageType(b'Z'))
+        ));
     }
 }

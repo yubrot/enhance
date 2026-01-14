@@ -6,6 +6,7 @@ pub enum ProtocolError {
     UnsupportedProtocolVersion(i32),
     MissingParameter(&'static str),
     InvalidUtf8,
+    UnknownMessageType(u8),
     Io(std::io::Error),
 }
 
@@ -19,6 +20,9 @@ impl std::fmt::Display for ProtocolError {
             }
             ProtocolError::MissingParameter(p) => write!(f, "missing parameter: {}", p),
             ProtocolError::InvalidUtf8 => write!(f, "invalid UTF-8"),
+            ProtocolError::UnknownMessageType(t) => {
+                write!(f, "unknown message type: 0x{:02x}", t)
+            }
             ProtocolError::Io(e) => write!(f, "I/O error: {}", e),
         }
     }
