@@ -138,11 +138,7 @@ enhance takes a modern Rust-centric approach:
 
 **Trade-offs**: PostgreSQL's multi-process model provides strong isolation (process crashes don't affect others) and cross-platform compatibility. enhance's async model offers lower memory overhead per connection and leverages Rust's compile-time safety guarantees, making it ideal for this learning project.
 
-# Next Steps
-
-## Week 2: Simple Query Protocol
-
-> Handle the 'Q' message. Implement the basic loop to return CommandComplete.
+# Looking ahead
 
 ## Future Module Structure
 
