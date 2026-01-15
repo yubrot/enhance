@@ -5,4 +5,7 @@ pub mod frontend;
 
 pub use backend::{BackendMessage, ErrorField, FieldDescription, TransactionStatus};
 pub use error::ProtocolError;
-pub use frontend::{FrontendMessage, StartupMessage, StartupParameters};
+pub use frontend::{
+    BindMessage, CloseMessage, CloseTarget, DescribeMessage, DescribeTarget, ExecuteMessage,
+    FrontendMessage, ParseMessage, StartupMessage, StartupParameters,
+};

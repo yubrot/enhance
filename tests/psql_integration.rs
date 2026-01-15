@@ -150,3 +150,243 @@ async fn test_psql_empty_query() {
     let result = server.run_psql(";\\q");
     result.assert_success();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_extended_query_protocol() {
+    let server = PsqlTestServer::start().await;
+    let mut stream = server.connect().await;
+
+    // Startup handshake
+    stream.write_i32(23).await.unwrap();
+    stream.write_i32(3 << 16).await.unwrap();
+    stream.write_all(b"user\0postgres\0\0").await.unwrap();
+
+    // Wait for ReadyForQuery
+    loop {
+        let tag = stream.read_u8().await.unwrap();
+        let len = stream.read_i32().await.unwrap();
+        let mut body = vec![0u8; (len - 4) as usize];
+        if !body.is_empty() {
+            stream.read_exact(&mut body).await.unwrap();
+        }
+        if tag == b'Z' {
+            break;
+        }
+    }
+
+    // Send Parse message: unnamed statement, "SELECT 1", no params
+    stream.write_u8(b'P').await.unwrap(); // Parse
+    stream.write_i32(4 + 1 + 9 + 2).await.unwrap(); // length
+    stream.write_all(b"\0").await.unwrap(); // statement name (unnamed)
+    stream.write_all(b"SELECT 1\0").await.unwrap(); // query
+    stream.write_i16(0).await.unwrap(); // param count
+
+    // Send Bind message: unnamed portal to unnamed statement
+    stream.write_u8(b'B').await.unwrap(); // Bind
+    stream.write_i32(4 + 1 + 1 + 2 + 2 + 2).await.unwrap(); // length
+    stream.write_all(b"\0").await.unwrap(); // portal name (unnamed)
+    stream.write_all(b"\0").await.unwrap(); // statement name (unnamed)
+    stream.write_i16(0).await.unwrap(); // format code count
+    stream.write_i16(0).await.unwrap(); // param count
+    stream.write_i16(0).await.unwrap(); // result format count
+
+    // Send Execute message: unnamed portal, all rows
+    stream.write_u8(b'E').await.unwrap(); // Execute
+    stream.write_i32(4 + 1 + 4).await.unwrap(); // length
+    stream.write_all(b"\0").await.unwrap(); // portal name (unnamed)
+    stream.write_i32(0).await.unwrap(); // max rows (0 = all)
+
+    // Send Sync message
+    stream.write_u8(b'S').await.unwrap(); // Sync
+    stream.write_i32(4).await.unwrap(); // length (no body)
+
+    stream.flush().await.unwrap();
+
+    // Read responses
+    let mut got_parse_complete = false;
+    let mut got_bind_complete = false;
+    let mut got_command_complete = false;
+    let mut got_ready = false;
+
+    while !got_ready {
+        let tag = stream.read_u8().await.unwrap();
+        let len = stream.read_i32().await.unwrap();
+        let mut body = vec![0u8; (len - 4) as usize];
+        if !body.is_empty() {
+            stream.read_exact(&mut body).await.unwrap();
+        }
+
+        match tag {
+            b'1' => got_parse_complete = true,
+            b'2' => got_bind_complete = true,
+            b'C' => got_command_complete = true,
+            b'Z' => got_ready = true,
+            b'E' => {
+                let error_msg = String::from_utf8_lossy(&body);
+                panic!("Received error: {:?}", error_msg)
+            }
+            _ => {}
+        }
+    }
+
+    assert!(got_parse_complete, "Should receive ParseComplete");
+    assert!(got_bind_complete, "Should receive BindComplete");
+    assert!(got_command_complete, "Should receive CommandComplete");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_extended_query_describe() {
+    let server = PsqlTestServer::start().await;
+    let mut stream = server.connect().await;
+
+    // Startup handshake
+    stream.write_i32(23).await.unwrap();
+    stream.write_i32(3 << 16).await.unwrap();
+    stream.write_all(b"user\0postgres\0\0").await.unwrap();
+
+    // Wait for ReadyForQuery
+    loop {
+        let tag = stream.read_u8().await.unwrap();
+        let len = stream.read_i32().await.unwrap();
+        let mut body = vec![0u8; (len - 4) as usize];
+        if !body.is_empty() {
+            stream.read_exact(&mut body).await.unwrap();
+        }
+        if tag == b'Z' {
+            break;
+        }
+    }
+
+    // Parse a statement with params
+    stream.write_u8(b'P').await.unwrap();
+    stream.write_i32(4 + 6 + 18 + 2 + 4 + 4).await.unwrap(); // length
+    stream.write_all(b"test\0").await.unwrap(); // statement name
+    stream.write_all(b"SELECT $1, $2\0").await.unwrap(); // query
+    stream.write_i16(2).await.unwrap(); // param count
+    stream.write_i32(23).await.unwrap(); // INT4
+    stream.write_i32(25).await.unwrap(); // TEXT
+
+    // Describe the statement
+    stream.write_u8(b'D').await.unwrap(); // Describe
+    stream.write_i32(4 + 1 + 5).await.unwrap(); // length
+    stream.write_u8(b'S').await.unwrap(); // type: Statement
+    stream.write_all(b"test\0").await.unwrap(); // name
+
+    // Send Sync
+    stream.write_u8(b'S').await.unwrap();
+    stream.write_i32(4).await.unwrap();
+
+    stream.flush().await.unwrap();
+
+    // Read responses
+    let mut got_parse_complete = false;
+    let mut got_parameter_description = false;
+    let mut got_no_data = false;
+
+    loop {
+        let tag = stream.read_u8().await.unwrap();
+        let len = stream.read_i32().await.unwrap();
+        let mut body = vec![0u8; (len - 4) as usize];
+        if !body.is_empty() {
+            stream.read_exact(&mut body).await.unwrap();
+        }
+
+        match tag {
+            b'1' => got_parse_complete = true,
+            b't' => {
+                got_parameter_description = true;
+                // Verify parameter types
+                let param_count = i16::from_be_bytes([body[0], body[1]]);
+                assert_eq!(param_count, 2, "Should have 2 parameters");
+                let param1_oid = i32::from_be_bytes([body[2], body[3], body[4], body[5]]);
+                let param2_oid = i32::from_be_bytes([body[6], body[7], body[8], body[9]]);
+                assert_eq!(param1_oid, 23, "First param should be INT4");
+                assert_eq!(param2_oid, 25, "Second param should be TEXT");
+            }
+            b'n' => got_no_data = true,
+            b'Z' => break,
+            b'E' => {
+                let error_msg = String::from_utf8_lossy(&body);
+                panic!("Received error: {:?}", error_msg)
+            }
+            _ => {}
+        }
+    }
+
+    assert!(got_parse_complete, "Should receive ParseComplete");
+    assert!(
+        got_parameter_description,
+        "Should receive ParameterDescription"
+    );
+    assert!(got_no_data, "Should receive NoData");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_extended_query_close() {
+    let server = PsqlTestServer::start().await;
+    let mut stream = server.connect().await;
+
+    // Startup handshake
+    stream.write_i32(23).await.unwrap();
+    stream.write_i32(3 << 16).await.unwrap();
+    stream.write_all(b"user\0postgres\0\0").await.unwrap();
+
+    // Wait for ReadyForQuery
+    loop {
+        let tag = stream.read_u8().await.unwrap();
+        let len = stream.read_i32().await.unwrap();
+        let mut body = vec![0u8; (len - 4) as usize];
+        if !body.is_empty() {
+            stream.read_exact(&mut body).await.unwrap();
+        }
+        if tag == b'Z' {
+            break;
+        }
+    }
+
+    // Parse a statement
+    stream.write_u8(b'P').await.unwrap();
+    stream.write_i32(4 + 6 + 9 + 2).await.unwrap();
+    stream.write_all(b"stmt\0").await.unwrap();
+    stream.write_all(b"SELECT 1\0").await.unwrap();
+    stream.write_i16(0).await.unwrap();
+
+    // Close the statement
+    stream.write_u8(b'C').await.unwrap(); // Close
+    stream.write_i32(4 + 1 + 5).await.unwrap(); // length
+    stream.write_u8(b'S').await.unwrap(); // type: Statement
+    stream.write_all(b"stmt\0").await.unwrap(); // name
+
+    // Send Sync
+    stream.write_u8(b'S').await.unwrap();
+    stream.write_i32(4).await.unwrap();
+
+    stream.flush().await.unwrap();
+
+    // Read responses
+    let mut got_parse_complete = false;
+    let mut got_close_complete = false;
+
+    loop {
+        let tag = stream.read_u8().await.unwrap();
+        let len = stream.read_i32().await.unwrap();
+        let mut body = vec![0u8; (len - 4) as usize];
+        if !body.is_empty() {
+            stream.read_exact(&mut body).await.unwrap();
+        }
+
+        match tag {
+            b'1' => got_parse_complete = true,
+            b'3' => got_close_complete = true,
+            b'Z' => break,
+            b'E' => {
+                let error_msg = String::from_utf8_lossy(&body);
+                panic!("Received error: {:?}", error_msg)
+            }
+            _ => {}
+        }
+    }
+
+    assert!(got_parse_complete, "Should receive ParseComplete");
+    assert!(got_close_complete, "Should receive CloseComplete");
+}

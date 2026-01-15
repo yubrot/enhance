@@ -36,10 +36,9 @@ This project is designed as a 6-month intensive learning journey, focusing on co
 
 Goal: Connect via `psql` and handle the stateful Parse/Bind/Execute flow.
 
-* Week 1: TCP Server & Handshake: Implement Tokio listener. Handle StartupMessage (Big Endian) and SSLRequest. Achieve a "Trust" authentication state.
-* Week 2: Simple Query Protocol: Handle the 'Q' message. Implement the basic loop to return CommandComplete.
-* Week 3: Extended Query (Parse & Describe): Implement stateful storage for PreparedStatement. Return dummy metadata for 'D' messages.
-* Week 4: Extended Query (Bind & Execute): Implement the Portal concept (execution instances). Complete the flow from SQL string to execution trigger.
+* Week 1: TCP Server & Handshake: Implement Tokio listener. Handle StartupMessage (Big Endian) and SSLRequest. Achieve a "Trust" authentication state. ✅
+* Week 2: Simple Query Protocol: Handle the 'Q' message. Implement the basic loop to return CommandComplete. ✅
+* Week 3-4: Extended Query Protocol (Parse/Bind/Execute): Implement stateful storage for PreparedStatement and Portal concept. Handle the complete flow from Parse, Describe, Bind, to Execute messages. ✅
 
 ### Month 2: Concurrent Storage Engine & VFS
 

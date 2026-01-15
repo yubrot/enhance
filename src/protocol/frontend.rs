@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::protocol::ProtocolError;
-use crate::protocol::codec::read_cstring;
+use crate::protocol::codec::{read_cstring, read_nullable_bytes};
 
 /// SSLRequest magic number
 pub const SSL_REQUEST_CODE: i32 = (1234 << 16) | 5679; // 80877103
@@ -142,6 +142,77 @@ impl StartupMessage {
     }
 }
 
+/// Parse message - creates a prepared statement
+#[derive(Debug, Clone)]
+pub struct ParseMessage {
+    /// Name of the prepared statement (empty string = unnamed)
+    pub statement_name: String,
+    /// SQL query string
+    pub query: String,
+    /// Parameter type OIDs (may be empty, server infers types)
+    pub param_types: Vec<i32>,
+}
+
+/// Bind message - binds parameters to create a portal
+#[derive(Debug, Clone)]
+pub struct BindMessage {
+    /// Destination portal name (empty = unnamed)
+    pub portal_name: String,
+    /// Source prepared statement name
+    pub statement_name: String,
+    /// Parameter format codes (0=text, 1=binary)
+    pub param_format_codes: Vec<i16>,
+    /// Parameter values (None = NULL)
+    pub param_values: Vec<Option<Vec<u8>>>,
+    /// Result column format codes
+    pub result_format_codes: Vec<i16>,
+}
+
+/// Describe message target type
+#[derive(Debug, Clone, Copy)]
+pub enum DescribeTarget {
+    /// 'S' - Describe a prepared statement
+    Statement,
+    /// 'P' - Describe a portal
+    Portal,
+}
+
+/// Describe message - request metadata about statement or portal
+#[derive(Debug, Clone)]
+pub struct DescribeMessage {
+    /// Target type: Statement or Portal
+    pub target_type: DescribeTarget,
+    /// Name of the statement or portal
+    pub name: String,
+}
+
+/// Execute message - execute a portal
+#[derive(Debug, Clone)]
+pub struct ExecuteMessage {
+    /// Portal name (empty = unnamed)
+    pub portal_name: String,
+    /// Maximum rows to return (0 = unlimited)
+    pub max_rows: i32,
+}
+
+/// Close message target type
+#[derive(Debug, Clone, Copy)]
+pub enum CloseTarget {
+    /// 'S' - Close a prepared statement
+    Statement,
+    /// 'P' - Close a portal
+    Portal,
+}
+
+/// Close message - close a statement or portal
+#[derive(Debug, Clone)]
+pub struct CloseMessage {
+    /// Target type: Statement or Portal
+    pub target_type: CloseTarget,
+    /// Name of the statement or portal
+    pub name: String,
+}
+
 /// Messages sent by the frontend (client) during query phase.
 ///
 /// NOTE: Production improvements needed:
@@ -153,6 +224,20 @@ pub enum FrontendMessage {
     Query(String),
     /// 'X' - Termination
     Terminate,
+    /// 'P' - Parse (create prepared statement)
+    Parse(ParseMessage),
+    /// 'B' - Bind (bind parameters to create portal)
+    Bind(BindMessage),
+    /// 'D' - Describe (get statement/portal metadata)
+    Describe(DescribeMessage),
+    /// 'E' - Execute (execute a portal)
+    Execute(ExecuteMessage),
+    /// 'C' - Close (close statement/portal)
+    Close(CloseMessage),
+    /// 'S' - Sync (end implicit transaction)
+    Sync,
+    /// 'H' - Flush (flush output)
+    Flush,
 }
 
 impl FrontendMessage {
@@ -162,7 +247,6 @@ impl FrontendMessage {
     /// NOTE: Production improvements needed:
     /// - Add timeout to prevent slow-loris attacks
     /// - Limit query size (PostgreSQL: 1GB max)
-    /// - Support more message types (Parse, Bind, Execute, etc.)
     pub async fn read<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Self>, ProtocolError> {
         // Read message type byte
         let msg_type = match r.read_u8().await {
@@ -189,6 +273,114 @@ impl FrontendMessage {
             b'X' => {
                 // Terminate: no body (just length=4)
                 Ok(Some(FrontendMessage::Terminate))
+            }
+            b'P' => {
+                // Parse: statement_name, query, param_count, param_types[]
+                let statement_name = read_cstring(r)
+                    .await
+                    .map_err(|_| ProtocolError::InvalidUtf8)?;
+                let query = read_cstring(r)
+                    .await
+                    .map_err(|_| ProtocolError::InvalidUtf8)?;
+                let param_count = r.read_i16().await? as usize;
+                let mut param_types = Vec::with_capacity(param_count);
+                for _ in 0..param_count {
+                    param_types.push(r.read_i32().await?);
+                }
+                Ok(Some(FrontendMessage::Parse(ParseMessage {
+                    statement_name,
+                    query,
+                    param_types,
+                })))
+            }
+            b'B' => {
+                // Bind: portal_name, statement_name, format_codes, params, result_formats
+                let portal_name = read_cstring(r)
+                    .await
+                    .map_err(|_| ProtocolError::InvalidUtf8)?;
+                let statement_name = read_cstring(r)
+                    .await
+                    .map_err(|_| ProtocolError::InvalidUtf8)?;
+
+                // Parameter format codes
+                let format_count = r.read_i16().await? as usize;
+                let mut param_format_codes = Vec::with_capacity(format_count);
+                for _ in 0..format_count {
+                    param_format_codes.push(r.read_i16().await?);
+                }
+
+                // Parameter values
+                let param_count = r.read_i16().await? as usize;
+                let mut param_values = Vec::with_capacity(param_count);
+                for _ in 0..param_count {
+                    param_values.push(read_nullable_bytes(r).await?);
+                }
+
+                // Result format codes
+                let result_format_count = r.read_i16().await? as usize;
+                let mut result_format_codes = Vec::with_capacity(result_format_count);
+                for _ in 0..result_format_count {
+                    result_format_codes.push(r.read_i16().await?);
+                }
+
+                Ok(Some(FrontendMessage::Bind(BindMessage {
+                    portal_name,
+                    statement_name,
+                    param_format_codes,
+                    param_values,
+                    result_format_codes,
+                })))
+            }
+            b'D' => {
+                // Describe: type ('S' or 'P'), name
+                let target_byte = r.read_u8().await?;
+                let target_type = match target_byte {
+                    b'S' => DescribeTarget::Statement,
+                    b'P' => DescribeTarget::Portal,
+                    _ => return Err(ProtocolError::InvalidMessage),
+                };
+                let name = read_cstring(r)
+                    .await
+                    .map_err(|_| ProtocolError::InvalidUtf8)?;
+                Ok(Some(FrontendMessage::Describe(DescribeMessage {
+                    target_type,
+                    name,
+                })))
+            }
+            b'E' => {
+                // Execute: portal_name, max_rows
+                let portal_name = read_cstring(r)
+                    .await
+                    .map_err(|_| ProtocolError::InvalidUtf8)?;
+                let max_rows = r.read_i32().await?;
+                Ok(Some(FrontendMessage::Execute(ExecuteMessage {
+                    portal_name,
+                    max_rows,
+                })))
+            }
+            b'C' => {
+                // Close: type ('S' or 'P'), name
+                let target_byte = r.read_u8().await?;
+                let target_type = match target_byte {
+                    b'S' => CloseTarget::Statement,
+                    b'P' => CloseTarget::Portal,
+                    _ => return Err(ProtocolError::InvalidMessage),
+                };
+                let name = read_cstring(r)
+                    .await
+                    .map_err(|_| ProtocolError::InvalidUtf8)?;
+                Ok(Some(FrontendMessage::Close(CloseMessage {
+                    target_type,
+                    name,
+                })))
+            }
+            b'S' => {
+                // Sync: no body (just length=4)
+                Ok(Some(FrontendMessage::Sync))
+            }
+            b'H' => {
+                // Flush: no body (just length=4)
+                Ok(Some(FrontendMessage::Flush))
             }
             _ => Err(ProtocolError::UnknownMessageType(msg_type)),
         }

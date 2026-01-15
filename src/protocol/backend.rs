@@ -24,6 +24,18 @@ pub enum BackendMessage {
     CommandComplete { tag: String },
     /// 'I' - Empty query response
     EmptyQueryResponse,
+    /// '1' - Parse complete
+    ParseComplete,
+    /// '2' - Bind complete
+    BindComplete,
+    /// '3' - Close complete
+    CloseComplete,
+    /// 'n' - No data
+    NoData,
+    /// 's' - Portal suspended
+    PortalSuspended,
+    /// 't' - Parameter description
+    ParameterDescription { param_types: Vec<i32> },
 }
 
 impl BackendMessage {
@@ -92,6 +104,29 @@ impl BackendMessage {
             }
             BackendMessage::EmptyQueryResponse => {
                 Self::write_head(w, b'I', 0).await?;
+            }
+            BackendMessage::ParseComplete => {
+                Self::write_head(w, b'1', 0).await?;
+            }
+            BackendMessage::BindComplete => {
+                Self::write_head(w, b'2', 0).await?;
+            }
+            BackendMessage::CloseComplete => {
+                Self::write_head(w, b'3', 0).await?;
+            }
+            BackendMessage::NoData => {
+                Self::write_head(w, b'n', 0).await?;
+            }
+            BackendMessage::PortalSuspended => {
+                Self::write_head(w, b's', 0).await?;
+            }
+            BackendMessage::ParameterDescription { param_types } => {
+                let body_len = 2 + (param_types.len() * 4);
+                Self::write_head(w, b't', body_len).await?;
+                w.write_i16(param_types.len() as i16).await?;
+                for oid in param_types {
+                    w.write_i32(*oid).await?;
+                }
             }
         }
         Ok(())
