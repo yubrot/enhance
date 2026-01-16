@@ -40,6 +40,13 @@ pub struct StartupParameters {
 }
 
 impl StartupMessage {
+    /// Parse a startup message from a byte buffer.
+    pub async fn from_bytes(buf: &[u8]) -> Result<Self, ProtocolError> {
+        use std::io::Cursor;
+        let mut cursor = Cursor::new(buf);
+        Self::read(&mut cursor).await
+    }
+
     /// Read a startup-phase message from the stream (including length prefix).
     ///
     /// NOTE: Production improvements needed:
@@ -100,13 +107,7 @@ impl StartupMessage {
                 break;
             }
 
-            let name = read_cstring(r).await.map_err(|e| {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    ProtocolError::InsufficientData
-                } else {
-                    ProtocolError::InvalidUtf8
-                }
-            })?;
+            let name = read_cstring(r).await?;
 
             // Account for name + null terminator
             remaining = remaining.saturating_sub(name.len() + 1);
@@ -116,9 +117,7 @@ impl StartupMessage {
                 break;
             }
 
-            let value = read_cstring(r)
-                .await
-                .map_err(|_| ProtocolError::InvalidUtf8)?;
+            let value = read_cstring(r).await?;
 
             // Account for value + null terminator
             remaining = remaining.saturating_sub(value.len() + 1);
@@ -140,77 +139,6 @@ impl StartupMessage {
 
         Ok(params)
     }
-}
-
-/// Parse message - creates a prepared statement
-#[derive(Debug, Clone)]
-pub struct ParseMessage {
-    /// Name of the prepared statement (empty string = unnamed)
-    pub statement_name: String,
-    /// SQL query string
-    pub query: String,
-    /// Parameter type OIDs (may be empty, server infers types)
-    pub param_types: Vec<i32>,
-}
-
-/// Bind message - binds parameters to create a portal
-#[derive(Debug, Clone)]
-pub struct BindMessage {
-    /// Destination portal name (empty = unnamed)
-    pub portal_name: String,
-    /// Source prepared statement name
-    pub statement_name: String,
-    /// Parameter format codes (0=text, 1=binary)
-    pub param_format_codes: Vec<i16>,
-    /// Parameter values (None = NULL)
-    pub param_values: Vec<Option<Vec<u8>>>,
-    /// Result column format codes
-    pub result_format_codes: Vec<i16>,
-}
-
-/// Describe message target type
-#[derive(Debug, Clone, Copy)]
-pub enum DescribeTarget {
-    /// 'S' - Describe a prepared statement
-    Statement,
-    /// 'P' - Describe a portal
-    Portal,
-}
-
-/// Describe message - request metadata about statement or portal
-#[derive(Debug, Clone)]
-pub struct DescribeMessage {
-    /// Target type: Statement or Portal
-    pub target_type: DescribeTarget,
-    /// Name of the statement or portal
-    pub name: String,
-}
-
-/// Execute message - execute a portal
-#[derive(Debug, Clone)]
-pub struct ExecuteMessage {
-    /// Portal name (empty = unnamed)
-    pub portal_name: String,
-    /// Maximum rows to return (0 = unlimited)
-    pub max_rows: i32,
-}
-
-/// Close message target type
-#[derive(Debug, Clone, Copy)]
-pub enum CloseTarget {
-    /// 'S' - Close a prepared statement
-    Statement,
-    /// 'P' - Close a portal
-    Portal,
-}
-
-/// Close message - close a statement or portal
-#[derive(Debug, Clone)]
-pub struct CloseMessage {
-    /// Target type: Statement or Portal
-    pub target_type: CloseTarget,
-    /// Name of the statement or portal
-    pub name: String,
 }
 
 /// Messages sent by the frontend (client) during query phase.
@@ -240,7 +168,85 @@ pub enum FrontendMessage {
     Flush,
 }
 
+/// Parse message - creates a prepared statement
+#[derive(Debug, Clone)]
+pub struct ParseMessage {
+    /// Name of the prepared statement (empty string = unnamed)
+    pub statement_name: String,
+    /// SQL query string
+    pub query: String,
+    /// Parameter type OIDs (may be empty, server infers types)
+    pub param_types: Vec<i32>,
+}
+
+/// Bind message - binds parameters to create a portal
+#[derive(Debug, Clone)]
+pub struct BindMessage {
+    /// Destination portal name (empty = unnamed)
+    pub portal_name: String,
+    /// Source prepared statement name
+    pub statement_name: String,
+    /// Parameter format codes (0=text, 1=binary)
+    pub param_format_codes: Vec<i16>,
+    /// Parameter values (None = NULL)
+    pub param_values: Vec<Option<Vec<u8>>>,
+    /// Result column format codes
+    pub result_format_codes: Vec<i16>,
+}
+
+/// Describe message - request metadata about statement or portal
+#[derive(Debug, Clone)]
+pub struct DescribeMessage {
+    /// Target type: Statement or Portal
+    pub target_type: DescribeTarget,
+    /// Name of the statement or portal
+    pub name: String,
+}
+
+/// Describe message target type
+#[derive(Debug, Clone, Copy)]
+pub enum DescribeTarget {
+    /// 'S' - Describe a prepared statement
+    Statement,
+    /// 'P' - Describe a portal
+    Portal,
+}
+
+/// Execute message - execute a portal
+#[derive(Debug, Clone)]
+pub struct ExecuteMessage {
+    /// Portal name (empty = unnamed)
+    pub portal_name: String,
+    /// Maximum rows to return (0 = unlimited)
+    pub max_rows: i32,
+}
+
+/// Close message - close a statement or portal
+#[derive(Debug, Clone)]
+pub struct CloseMessage {
+    /// Target type: Statement or Portal
+    pub target_type: CloseTarget,
+    /// Name of the statement or portal
+    pub name: String,
+}
+
+/// Close message target type
+#[derive(Debug, Clone, Copy)]
+pub enum CloseTarget {
+    /// 'S' - Close a prepared statement
+    Statement,
+    /// 'P' - Close a portal
+    Portal,
+}
+
 impl FrontendMessage {
+    /// Parse a frontend message from a byte buffer.
+    pub async fn from_bytes(buf: &[u8]) -> Result<Option<Self>, ProtocolError> {
+        use std::io::Cursor;
+        let mut cursor = Cursor::new(buf);
+        Self::read(&mut cursor).await
+    }
+
     /// Read a query-phase message from the stream.
     /// Returns None on EOF (clean disconnect).
     ///
@@ -265,9 +271,7 @@ impl FrontendMessage {
         match msg_type {
             b'Q' => {
                 // Query: read null-terminated string
-                let query = read_cstring(r)
-                    .await
-                    .map_err(|_| ProtocolError::InvalidUtf8)?;
+                let query = read_cstring(r).await?;
                 Ok(Some(FrontendMessage::Query(query)))
             }
             b'X' => {
@@ -276,12 +280,8 @@ impl FrontendMessage {
             }
             b'P' => {
                 // Parse: statement_name, query, param_count, param_types[]
-                let statement_name = read_cstring(r)
-                    .await
-                    .map_err(|_| ProtocolError::InvalidUtf8)?;
-                let query = read_cstring(r)
-                    .await
-                    .map_err(|_| ProtocolError::InvalidUtf8)?;
+                let statement_name = read_cstring(r).await?;
+                let query = read_cstring(r).await?;
                 let param_count = r.read_i16().await? as usize;
                 let mut param_types = Vec::with_capacity(param_count);
                 for _ in 0..param_count {
@@ -295,12 +295,8 @@ impl FrontendMessage {
             }
             b'B' => {
                 // Bind: portal_name, statement_name, format_codes, params, result_formats
-                let portal_name = read_cstring(r)
-                    .await
-                    .map_err(|_| ProtocolError::InvalidUtf8)?;
-                let statement_name = read_cstring(r)
-                    .await
-                    .map_err(|_| ProtocolError::InvalidUtf8)?;
+                let portal_name = read_cstring(r).await?;
+                let statement_name = read_cstring(r).await?;
 
                 // Parameter format codes
                 let format_count = r.read_i16().await? as usize;
@@ -339,9 +335,7 @@ impl FrontendMessage {
                     b'P' => DescribeTarget::Portal,
                     _ => return Err(ProtocolError::InvalidMessage),
                 };
-                let name = read_cstring(r)
-                    .await
-                    .map_err(|_| ProtocolError::InvalidUtf8)?;
+                let name = read_cstring(r).await?;
                 Ok(Some(FrontendMessage::Describe(DescribeMessage {
                     target_type,
                     name,
@@ -349,9 +343,7 @@ impl FrontendMessage {
             }
             b'E' => {
                 // Execute: portal_name, max_rows
-                let portal_name = read_cstring(r)
-                    .await
-                    .map_err(|_| ProtocolError::InvalidUtf8)?;
+                let portal_name = read_cstring(r).await?;
                 let max_rows = r.read_i32().await?;
                 Ok(Some(FrontendMessage::Execute(ExecuteMessage {
                     portal_name,
@@ -366,9 +358,7 @@ impl FrontendMessage {
                     b'P' => CloseTarget::Portal,
                     _ => return Err(ProtocolError::InvalidMessage),
                 };
-                let name = read_cstring(r)
-                    .await
-                    .map_err(|_| ProtocolError::InvalidUtf8)?;
+                let name = read_cstring(r).await?;
                 Ok(Some(FrontendMessage::Close(CloseMessage {
                     target_type,
                     name,
@@ -390,9 +380,9 @@ impl FrontendMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
     use tokio::io::AsyncWriteExt;
 
+    /// Helper to create a startup message with given code and body
     async fn make_startup_message(code: i32, body: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
         let len = 4 + 4 + body.len(); // length + code + body
@@ -402,11 +392,20 @@ mod tests {
         buf
     }
 
+    /// Helper to create a frontend message with given type and body
+    async fn make_frontend_message(msg_type: u8, body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(msg_type);
+        let len = 4 + body.len(); // length includes self (4 bytes) + body
+        buf.write_i32(len as i32).await.unwrap();
+        buf.extend_from_slice(body);
+        buf
+    }
+
     #[tokio::test]
     async fn test_read_ssl_request() {
         let buf = make_startup_message(SSL_REQUEST_CODE, &[]).await;
-        let mut cursor = Cursor::new(buf);
-        let msg = StartupMessage::read(&mut cursor).await.unwrap();
+        let msg = StartupMessage::from_bytes(&buf).await.unwrap();
         assert!(matches!(msg, StartupMessage::SslRequest));
     }
 
@@ -418,56 +417,68 @@ mod tests {
         body.push(0); // terminator
 
         let buf = make_startup_message(3 << 16, &body).await;
-        let mut cursor = Cursor::new(buf);
-        let msg = StartupMessage::read(&mut cursor).await.unwrap();
+        let msg = StartupMessage::from_bytes(&buf).await.unwrap();
 
-        match msg {
-            StartupMessage::Startup {
-                protocol_version,
-                parameters,
-            } => {
-                assert_eq!(protocol_version, 3 << 16);
-                assert_eq!(parameters.user, "postgres");
-                assert_eq!(parameters.database, Some("testdb".to_string()));
-            }
-            _ => panic!("expected Startup message"),
-        }
+        let StartupMessage::Startup {
+            protocol_version,
+            parameters,
+        } = msg
+        else {
+            panic!("expected Startup message, got {msg:?}")
+        };
+
+        assert_eq!(protocol_version, 3 << 16);
+        assert_eq!(parameters.user, "postgres");
+        assert_eq!(parameters.database, Some("testdb".to_string()));
     }
 
     #[tokio::test]
-    async fn test_read_query_message() {
-        let mut buf = Vec::new();
-        buf.push(b'Q');
-        buf.write_i32(13).await.unwrap(); // length = 4 + 9 ("SELECT 1\0")
-        buf.extend_from_slice(b"SELECT 1\0");
+    async fn test_read_startup_message_missing_user() {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"database\0testdb\0");
+        body.push(0); // terminator
 
-        let mut cursor = Cursor::new(buf);
-        let msg = FrontendMessage::read(&mut cursor).await.unwrap().unwrap();
+        let buf = make_startup_message(3 << 16, &body).await;
+        let result = StartupMessage::from_bytes(&buf).await;
 
-        match msg {
-            FrontendMessage::Query(q) => assert_eq!(q, "SELECT 1"),
-            _ => panic!("expected Query message"),
-        }
+        assert!(matches!(
+            result,
+            Err(ProtocolError::MissingParameter("user"))
+        ));
     }
 
     #[tokio::test]
-    async fn test_read_terminate_message() {
-        let mut buf = Vec::new();
-        buf.push(b'X');
-        buf.write_i32(4).await.unwrap(); // length (no body)
+    async fn test_read_gssenc_request() {
+        let buf = make_startup_message(GSSENC_REQUEST_CODE, &[]).await;
+        let msg = StartupMessage::from_bytes(&buf).await.unwrap();
+        assert!(matches!(msg, StartupMessage::GssEncRequest));
+    }
 
-        let mut cursor = Cursor::new(buf);
-        let msg = FrontendMessage::read(&mut cursor).await.unwrap().unwrap();
+    #[tokio::test]
+    async fn test_read_cancel_request() {
+        let mut body = Vec::new();
+        body.write_i32(12345).await.unwrap(); // process_id
+        body.write_i32(67890).await.unwrap(); // secret_key
 
-        assert!(matches!(msg, FrontendMessage::Terminate));
+        let buf = make_startup_message(CANCEL_REQUEST_CODE, &body).await;
+        let msg = StartupMessage::from_bytes(&buf).await.unwrap();
+
+        let StartupMessage::CancelRequest {
+            process_id,
+            secret_key,
+        } = msg
+        else {
+            panic!("expected CancelRequest message, got {msg:?}")
+        };
+
+        assert_eq!(process_id, 12345);
+        assert_eq!(secret_key, 67890);
     }
 
     #[tokio::test]
     async fn test_read_eof() {
         let buf = Vec::new();
-        let mut cursor = Cursor::new(buf);
-        let msg = FrontendMessage::read(&mut cursor).await.unwrap();
-
+        let msg = FrontendMessage::from_bytes(&buf).await.unwrap();
         assert!(msg.is_none());
     }
 
@@ -477,12 +488,202 @@ mod tests {
         buf.push(b'Z'); // Unknown type
         buf.write_i32(4).await.unwrap();
 
-        let mut cursor = Cursor::new(buf);
-        let result = FrontendMessage::read(&mut cursor).await;
-
+        let result = FrontendMessage::from_bytes(&buf).await;
         assert!(matches!(
             result,
             Err(ProtocolError::UnknownMessageType(b'Z'))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_read_query_message() {
+        let buf = make_frontend_message(b'Q', b"SELECT 1\0").await;
+        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+
+        let FrontendMessage::Query(q) = msg else {
+            panic!("expected Query message, got {msg:?}")
+        };
+
+        assert_eq!(q, "SELECT 1");
+    }
+
+    #[tokio::test]
+    async fn test_read_terminate_message() {
+        let buf = make_frontend_message(b'X', &[]).await;
+        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+        assert!(matches!(msg, FrontendMessage::Terminate));
+    }
+
+    #[tokio::test]
+    async fn test_read_parse_message() {
+        let mut body = Vec::new();
+        body.push(0); // empty (unnamed) statement - commonly used in PostgreSQL
+        body.extend_from_slice(b"SELECT $1, $2\0");
+        body.write_i16(2).await.unwrap(); // 2 parameters
+        body.write_i32(23).await.unwrap(); // INT4 OID
+        body.write_i32(25).await.unwrap(); // TEXT OID
+
+        let buf = make_frontend_message(b'P', &body).await;
+        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+
+        let FrontendMessage::Parse(parse) = msg else {
+            panic!("expected Parse message, got {msg:?}")
+        };
+
+        assert_eq!(parse.statement_name, ""); // unnamed statement
+        assert_eq!(parse.query, "SELECT $1, $2");
+        assert_eq!(parse.param_types, vec![23, 25]);
+    }
+
+    #[tokio::test]
+    async fn test_read_parse_message_named() {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"portal\0");
+        body.extend_from_slice(b"SELECT $1\0");
+        body.write_i16(1).await.unwrap();
+        body.write_i32(23).await.unwrap();
+
+        let buf = make_frontend_message(b'P', &body).await;
+        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+
+        let FrontendMessage::Parse(parse) = msg else {
+            panic!("expected Parse message, got {msg:?}")
+        };
+
+        assert_eq!(parse.statement_name, "portal");
+        assert_eq!(parse.query, "SELECT $1");
+        assert_eq!(parse.param_types, vec![23]);
+    }
+
+    #[tokio::test]
+    async fn test_read_bind_message() {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"portal\0"); // portal_name
+        body.extend_from_slice(b"stmt\0"); // statement_name
+        body.write_i16(1).await.unwrap(); // format_count
+        body.write_i16(0).await.unwrap(); // format code (text)
+        body.write_i16(3).await.unwrap(); // param_count: 3 params (non-NULL, NULL, non-NULL)
+        body.write_i32(2).await.unwrap(); // first param length
+        body.extend_from_slice(b"42"); // first param value
+        body.write_i32(-1).await.unwrap(); // second param is NULL (-1)
+        body.write_i32(5).await.unwrap(); // third param length
+        body.extend_from_slice(b"hello"); // third param value
+        body.write_i16(1).await.unwrap(); // result_format_count
+        body.write_i16(0).await.unwrap(); // result format code
+
+        let buf = make_frontend_message(b'B', &body).await;
+        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+
+        let FrontendMessage::Bind(bind) = msg else {
+            panic!("expected Bind message, got {msg:?}")
+        };
+
+        assert_eq!(bind.portal_name, "portal");
+        assert_eq!(bind.statement_name, "stmt");
+        assert_eq!(bind.param_format_codes, vec![0]);
+        assert_eq!(bind.param_values.len(), 3);
+        assert_eq!(bind.param_values[0], Some(b"42".to_vec()));
+        assert_eq!(bind.param_values[1], None); // NULL parameter
+        assert_eq!(bind.param_values[2], Some(b"hello".to_vec()));
+        assert_eq!(bind.result_format_codes, vec![0]);
+    }
+
+    #[tokio::test]
+    async fn test_read_describe_statement() {
+        let mut body = Vec::new();
+        body.push(b'S'); // Statement
+        body.push(0); // empty (unnamed) statement
+
+        let buf = make_frontend_message(b'D', &body).await;
+        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+
+        let FrontendMessage::Describe(desc) = msg else {
+            panic!("expected Describe message, got {msg:?}")
+        };
+
+        assert!(matches!(desc.target_type, DescribeTarget::Statement));
+        assert_eq!(desc.name, ""); // unnamed statement
+    }
+
+    #[tokio::test]
+    async fn test_read_describe_portal() {
+        let mut body = Vec::new();
+        body.push(b'P'); // Portal
+        body.extend_from_slice(b"portal\0");
+
+        let buf = make_frontend_message(b'D', &body).await;
+        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+
+        let FrontendMessage::Describe(desc) = msg else {
+            panic!("expected Describe message, got {msg:?}")
+        };
+
+        assert!(matches!(desc.target_type, DescribeTarget::Portal));
+        assert_eq!(desc.name, "portal");
+    }
+
+    #[tokio::test]
+    async fn test_read_execute_message() {
+        let mut body = Vec::new();
+        body.push(0); // empty (unnamed) portal - commonly used in PostgreSQL
+        body.write_i32(100).await.unwrap(); // max_rows
+
+        let buf = make_frontend_message(b'E', &body).await;
+        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+
+        let FrontendMessage::Execute(exec) = msg else {
+            panic!("expected Execute message, got {msg:?}")
+        };
+
+        assert_eq!(exec.portal_name, ""); // unnamed portal
+        assert_eq!(exec.max_rows, 100);
+    }
+
+    #[tokio::test]
+    async fn test_read_close_statement() {
+        let mut body = Vec::new();
+        body.push(b'S'); // Statement
+        body.push(0); // empty (unnamed) statement
+
+        let buf = make_frontend_message(b'C', &body).await;
+        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+
+        let FrontendMessage::Close(close) = msg else {
+            panic!("expected Close message, got {msg:?}")
+        };
+
+        assert!(matches!(close.target_type, CloseTarget::Statement));
+        assert_eq!(close.name, ""); // unnamed statement
+    }
+
+    #[tokio::test]
+    async fn test_read_close_portal() {
+        let mut body = Vec::new();
+        body.push(b'P'); // Portal
+        body.push(0); // empty (unnamed) portal
+
+        let buf = make_frontend_message(b'C', &body).await;
+        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+
+        let FrontendMessage::Close(close) = msg else {
+            panic!("expected Close message, got {msg:?}")
+        };
+
+        assert!(matches!(close.target_type, CloseTarget::Portal));
+        assert_eq!(close.name, ""); // unnamed portal
+    }
+
+    #[tokio::test]
+    async fn test_read_sync_message() {
+        let buf = make_frontend_message(b'S', &[]).await;
+        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+        assert!(matches!(msg, FrontendMessage::Sync));
+    }
+
+    #[tokio::test]
+    async fn test_read_flush_message() {
+        let buf = make_frontend_message(b'H', &[]).await;
+        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+        assert!(matches!(msg, FrontendMessage::Flush));
     }
 }

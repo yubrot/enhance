@@ -3,6 +3,8 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::protocol::codec::write_cstring;
 
+// TODO: Reduce await by using BytesMut etc.
+
 /// Messages sent by the backend (server) to the client.
 #[derive(Debug)]
 pub enum BackendMessage {
@@ -39,96 +41,124 @@ pub enum BackendMessage {
 }
 
 impl BackendMessage {
+    /// Returns the message type byte.
+    fn ty(&self) -> u8 {
+        match self {
+            BackendMessage::AuthenticationOk => b'R',
+            BackendMessage::BackendKeyData { .. } => b'K',
+            BackendMessage::ParameterStatus { .. } => b'S',
+            BackendMessage::ReadyForQuery { .. } => b'Z',
+            BackendMessage::ErrorResponse { .. } => b'E',
+            BackendMessage::RowDescription { .. } => b'T',
+            BackendMessage::DataRow { .. } => b'D',
+            BackendMessage::CommandComplete { .. } => b'C',
+            BackendMessage::EmptyQueryResponse => b'I',
+            BackendMessage::ParseComplete => b'1',
+            BackendMessage::BindComplete => b'2',
+            BackendMessage::CloseComplete => b'3',
+            BackendMessage::NoData => b'n',
+            BackendMessage::PortalSuspended => b's',
+            BackendMessage::ParameterDescription { .. } => b't',
+        }
+    }
+
+    /// Returns the body length in bytes (excluding type byte and length field).
+    fn body_len(&self) -> usize {
+        match self {
+            BackendMessage::AuthenticationOk => 4,
+            BackendMessage::BackendKeyData { .. } => 8,
+            BackendMessage::ParameterStatus { name, value } => name.len() + 1 + value.len() + 1,
+            BackendMessage::ReadyForQuery { .. } => 1,
+            BackendMessage::ErrorResponse { fields } => {
+                fields.iter().map(|f| f.encoded_len()).sum::<usize>() + 1
+            }
+            BackendMessage::RowDescription { fields } => {
+                2 + fields.iter().map(|f| f.encoded_len()).sum::<usize>()
+            }
+            BackendMessage::DataRow { values } => {
+                2 + values.iter().map(|v| v.encoded_len()).sum::<usize>()
+            }
+            BackendMessage::CommandComplete { tag } => tag.len() + 1,
+            BackendMessage::EmptyQueryResponse => 0,
+            BackendMessage::ParseComplete => 0,
+            BackendMessage::BindComplete => 0,
+            BackendMessage::CloseComplete => 0,
+            BackendMessage::NoData => 0,
+            BackendMessage::PortalSuspended => 0,
+            BackendMessage::ParameterDescription { param_types } => 2 + (param_types.len() * 4),
+        }
+    }
+
     /// Writes message header (type byte and length) to the stream.
-    async fn write_head<W: AsyncWrite + Unpin>(
-        w: &mut W,
-        msg_type: u8,
-        body_len: usize,
-    ) -> io::Result<()> {
-        w.write_u8(msg_type).await?;
-        w.write_i32((4 + body_len) as i32).await?;
+    async fn write_head<W: AsyncWrite + Unpin>(&self, w: &mut W) -> io::Result<()> {
+        w.write_u8(self.ty()).await?;
+        w.write_i32((4 + self.body_len()) as i32).await?;
         Ok(())
     }
 
-    /// Write this message to the stream.
-    pub async fn write<W: AsyncWrite + Unpin>(&self, w: &mut W) -> io::Result<()> {
+    /// Writes message body to the stream.
+    async fn write_body<W: AsyncWrite + Unpin>(&self, w: &mut W) -> io::Result<()> {
         match self {
             BackendMessage::AuthenticationOk => {
-                Self::write_head(w, b'R', 4).await?;
                 w.write_i32(0).await?; // auth type 0 = Ok
             }
             BackendMessage::BackendKeyData {
                 process_id,
                 secret_key,
             } => {
-                Self::write_head(w, b'K', 8).await?;
                 w.write_i32(*process_id).await?;
                 w.write_i32(*secret_key).await?;
             }
             BackendMessage::ParameterStatus { name, value } => {
-                Self::write_head(w, b'S', name.len() + 1 + value.len() + 1).await?;
                 write_cstring(w, name).await?;
                 write_cstring(w, value).await?;
             }
             BackendMessage::ReadyForQuery { status } => {
-                Self::write_head(w, b'Z', 1).await?;
                 w.write_u8(status.as_byte()).await?;
             }
             BackendMessage::ErrorResponse { fields } => {
-                let body_len = fields.iter().map(|f| f.encoded_len()).sum::<usize>() + 1;
-                Self::write_head(w, b'E', body_len).await?;
                 for field in fields {
                     field.write(w).await?;
                 }
                 w.write_u8(0).await?; // terminator
             }
             BackendMessage::RowDescription { fields } => {
-                let body_len = 2 + fields.iter().map(|f| f.encoded_len()).sum::<usize>();
-                Self::write_head(w, b'T', body_len).await?;
                 w.write_i16(fields.len() as i16).await?;
                 for field in fields {
                     field.write(w).await?;
                 }
             }
             BackendMessage::DataRow { values } => {
-                let body_len = 2 + values.iter().map(|v| v.encoded_len()).sum::<usize>();
-                Self::write_head(w, b'D', body_len).await?;
                 w.write_i16(values.len() as i16).await?;
                 for value in values {
                     value.write(w).await?;
                 }
             }
             BackendMessage::CommandComplete { tag } => {
-                Self::write_head(w, b'C', tag.len() + 1).await?;
                 write_cstring(w, tag).await?;
             }
-            BackendMessage::EmptyQueryResponse => {
-                Self::write_head(w, b'I', 0).await?;
-            }
-            BackendMessage::ParseComplete => {
-                Self::write_head(w, b'1', 0).await?;
-            }
-            BackendMessage::BindComplete => {
-                Self::write_head(w, b'2', 0).await?;
-            }
-            BackendMessage::CloseComplete => {
-                Self::write_head(w, b'3', 0).await?;
-            }
-            BackendMessage::NoData => {
-                Self::write_head(w, b'n', 0).await?;
-            }
-            BackendMessage::PortalSuspended => {
-                Self::write_head(w, b's', 0).await?;
+            BackendMessage::EmptyQueryResponse
+            | BackendMessage::ParseComplete
+            | BackendMessage::BindComplete
+            | BackendMessage::CloseComplete
+            | BackendMessage::NoData
+            | BackendMessage::PortalSuspended => {
+                // No body for these messages
             }
             BackendMessage::ParameterDescription { param_types } => {
-                let body_len = 2 + (param_types.len() * 4);
-                Self::write_head(w, b't', body_len).await?;
                 w.write_i16(param_types.len() as i16).await?;
                 for oid in param_types {
                     w.write_i32(*oid).await?;
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Writes this message to the stream.
+    pub async fn write<W: AsyncWrite + Unpin>(&self, w: &mut W) -> io::Result<()> {
+        self.write_head(w).await?;
+        self.write_body(w).await?;
         Ok(())
     }
 }
@@ -245,15 +275,37 @@ impl FieldDescription {
         Ok(())
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Helper to write a message and return the buffer.
+    async fn write_message(msg: &BackendMessage) -> Vec<u8> {
+        let mut buf = Vec::new();
+        msg.write(&mut buf).await.unwrap();
+        buf
+    }
+
+    /// Helper to read i32 from buffer at offset.
+    fn read_i32(buf: &[u8], offset: usize) -> i32 {
+        i32::from_be_bytes([
+            buf[offset],
+            buf[offset + 1],
+            buf[offset + 2],
+            buf[offset + 3],
+        ])
+    }
+
+    /// Helper to read i16 from buffer at offset.
+    fn read_i16(buf: &[u8], offset: usize) -> i16 {
+        i16::from_be_bytes([buf[offset], buf[offset + 1]])
+    }
+
     #[tokio::test]
     async fn test_write_authentication_ok() {
         let msg = BackendMessage::AuthenticationOk;
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
+        let buf = write_message(&msg).await;
         assert_eq!(buf, vec![b'R', 0, 0, 0, 8, 0, 0, 0, 0]);
     }
 
@@ -263,16 +315,12 @@ mod tests {
             process_id: 12345,
             secret_key: 67890,
         };
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
+        let buf = write_message(&msg).await;
 
         assert_eq!(buf[0], b'K');
-        // length = 4 + 8 = 12
-        assert_eq!(&buf[1..5], &12i32.to_be_bytes());
-        // process_id = 12345
-        assert_eq!(&buf[5..9], &12345i32.to_be_bytes());
-        // secret_key = 67890
-        assert_eq!(&buf[9..13], &67890i32.to_be_bytes());
+        assert_eq!(read_i32(&buf, 1), 12); // length = 4 + 8 = 12
+        assert_eq!(read_i32(&buf, 5), 12345); // process_id
+        assert_eq!(read_i32(&buf, 9), 67890); // secret_key
     }
 
     #[tokio::test]
@@ -281,16 +329,11 @@ mod tests {
             name: "server_version".to_string(),
             value: "16.0".to_string(),
         };
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
-        // 'S' + length(4) + "server_version\0" + "16.0\0"
-        // length = 4 + 15 ("server_version\0") + 5 ("16.0\0") = 24
+        let buf = write_message(&msg).await;
+
         assert_eq!(buf[0], b'S');
-        assert_eq!(&buf[1..5], &[0, 0, 0, 24]); // length field
-        assert_eq!(
-            &buf[5..],
-            b"server_version\0\x31\x36\x2e\x30\0" // "server_version\016.0\0"
-        );
+        assert_eq!(read_i32(&buf, 1), 24); // length = 4 + 15 + 5 = 24
+        assert_eq!(&buf[5..], b"server_version\016.0\0");
     }
 
     #[tokio::test]
@@ -298,8 +341,7 @@ mod tests {
         let msg = BackendMessage::ReadyForQuery {
             status: TransactionStatus::Idle,
         };
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
+        let buf = write_message(&msg).await;
         assert_eq!(buf, vec![b'Z', 0, 0, 0, 5, b'I']);
     }
 
@@ -321,68 +363,58 @@ mod tests {
                 },
             ],
         };
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
+        let buf = write_message(&msg).await;
 
         assert_eq!(buf[0], b'E');
-        // Verify message type and check that fields are present
-        // Field 1: 'S' + "ERROR\0" = 1 + 6 = 7 bytes
-        // Field 2: 'C' + "42P01\0" = 1 + 6 = 7 bytes
-        // Field 3: 'M' + "table does not exist\0" = 1 + 21 = 22 bytes
-        // Terminator: 1 byte
-        // Total body length: 7 + 7 + 22 + 1 = 37 bytes
-        let body_len = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
-        assert_eq!(body_len, 4 + 37);
+        assert_eq!(read_i32(&buf, 1), 41); // 4 + (7 + 7 + 22 + 1)
 
-        // Verify first field
+        // Verify fields
         assert_eq!(buf[5], b'S');
         assert_eq!(&buf[6..12], b"ERROR\0");
-
-        // Verify second field
         assert_eq!(buf[12], b'C');
         assert_eq!(&buf[13..19], b"42P01\0");
-
-        // Verify third field
         assert_eq!(buf[19], b'M');
         assert_eq!(&buf[20..41], b"table does not exist\0");
-
-        // Verify terminator
-        assert_eq!(buf[41], 0);
+        assert_eq!(buf[41], 0); // terminator
     }
 
     #[tokio::test]
     async fn test_write_row_description() {
         let msg = BackendMessage::RowDescription {
-            fields: vec![FieldDescription {
-                name: "col".to_string(),
-                table_oid: 0,
-                column_id: 0,
-                type_oid: 23, // INT4
-                type_size: 4,
-                type_modifier: -1,
-                format_code: 0,
-            }],
+            fields: vec![
+                FieldDescription {
+                    name: "col".to_string(),
+                    table_oid: 0,
+                    column_id: 0,
+                    type_oid: 23, // INT4
+                    type_size: 4,
+                    type_modifier: -1,
+                    format_code: 0,
+                },
+                FieldDescription {
+                    name: "text_col".to_string(),
+                    table_oid: 16384,
+                    column_id: 2,
+                    type_oid: 25, // TEXT (variable length)
+                    type_size: -1,
+                    type_modifier: -1,
+                    format_code: 0,
+                },
+                FieldDescription {
+                    name: "binary_col".to_string(),
+                    table_oid: 16384,
+                    column_id: 3,
+                    type_oid: 17, // BYTEA
+                    type_size: -1,
+                    type_modifier: -1,
+                    format_code: 1, // binary format
+                },
+            ],
         };
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
+        let buf = write_message(&msg).await;
 
         assert_eq!(buf[0], b'T');
-        // Verify field count
-        let field_count = i16::from_be_bytes([buf[5], buf[6]]);
-        assert_eq!(field_count, 1);
-    }
-
-    #[tokio::test]
-    async fn test_write_empty_row_description() {
-        let msg = BackendMessage::RowDescription { fields: vec![] };
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
-
-        assert_eq!(buf[0], b'T');
-        // length = 4 + 2 (field count) = 6
-        assert_eq!(&buf[1..5], &6i32.to_be_bytes());
-        // field count = 0
-        assert_eq!(&buf[5..7], &0i16.to_be_bytes());
+        assert_eq!(read_i16(&buf, 5), 3); // field count
     }
 
     #[tokio::test]
@@ -394,26 +426,16 @@ mod tests {
                 DataValue::Null,                      // NULL
             ],
         };
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
+        let buf = write_message(&msg).await;
 
         assert_eq!(buf[0], b'D');
-        // Verify column count
-        let col_count = i16::from_be_bytes([buf[5], buf[6]]);
-        assert_eq!(col_count, 3);
+        assert_eq!(read_i16(&buf, 5), 3); // column count
 
-        // Verify first value: length=5, "hello"
-        let val1_len = i32::from_be_bytes([buf[7], buf[8], buf[9], buf[10]]);
-        assert_eq!(val1_len, 5);
+        // Verify values
+        assert_eq!(read_i32(&buf, 7), 5); // length of "hello"
         assert_eq!(&buf[11..16], b"hello");
-
-        // Verify second value: length=0 (empty)
-        let val2_len = i32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]);
-        assert_eq!(val2_len, 0);
-
-        // Verify third value: length=-1 (NULL)
-        let val3_len = i32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]);
-        assert_eq!(val3_len, -1);
+        assert_eq!(read_i32(&buf, 16), 0); // empty value
+        assert_eq!(read_i32(&buf, 20), -1); // NULL
     }
 
     #[tokio::test]
@@ -421,21 +443,67 @@ mod tests {
         let msg = BackendMessage::CommandComplete {
             tag: "SELECT 1".to_string(),
         };
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
+        let buf = write_message(&msg).await;
 
         assert_eq!(buf[0], b'C');
-        // length = 4 + 9 ("SELECT 1\0") = 13
-        assert_eq!(&buf[1..5], &13i32.to_be_bytes());
+        assert_eq!(read_i32(&buf, 1), 13); // 4 + 9
         assert_eq!(&buf[5..], b"SELECT 1\0");
     }
 
     #[tokio::test]
     async fn test_write_empty_query_response() {
         let msg = BackendMessage::EmptyQueryResponse;
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
-
+        let buf = write_message(&msg).await;
         assert_eq!(buf, vec![b'I', 0, 0, 0, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_write_parse_complete() {
+        let msg = BackendMessage::ParseComplete;
+        let buf = write_message(&msg).await;
+        assert_eq!(buf, vec![b'1', 0, 0, 0, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_write_bind_complete() {
+        let msg = BackendMessage::BindComplete;
+        let buf = write_message(&msg).await;
+        assert_eq!(buf, vec![b'2', 0, 0, 0, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_write_close_complete() {
+        let msg = BackendMessage::CloseComplete;
+        let buf = write_message(&msg).await;
+        assert_eq!(buf, vec![b'3', 0, 0, 0, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_write_no_data() {
+        let msg = BackendMessage::NoData;
+        let buf = write_message(&msg).await;
+        assert_eq!(buf, vec![b'n', 0, 0, 0, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_write_portal_suspended() {
+        let msg = BackendMessage::PortalSuspended;
+        let buf = write_message(&msg).await;
+        assert_eq!(buf, vec![b's', 0, 0, 0, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_write_parameter_description() {
+        let msg = BackendMessage::ParameterDescription {
+            param_types: vec![23, 25, 1043], // INT4, TEXT, VARCHAR
+        };
+        let buf = write_message(&msg).await;
+
+        assert_eq!(buf[0], b't');
+        assert_eq!(read_i32(&buf, 1), 18); // 4 + 2 + 3*4
+        assert_eq!(read_i16(&buf, 5), 3); // param count
+        assert_eq!(read_i32(&buf, 7), 23); // INT4
+        assert_eq!(read_i32(&buf, 11), 25); // TEXT
+        assert_eq!(read_i32(&buf, 15), 1043); // VARCHAR
     }
 }
