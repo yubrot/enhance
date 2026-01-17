@@ -69,10 +69,10 @@ impl Server {
 
             tokio::spawn(async move {
                 let handshake = Handshake::new(socket, pid);
-                let (socket, secret_key) = match handshake.run().await {
-                    Ok(HandshakeResult::Success { socket, secret_key }) => {
+                let (mut connection, secret_key) = match handshake.run().await {
+                    Ok(HandshakeResult::Success { framed, secret_key }) => {
                         println!("(pid={}) Connection ready", pid);
-                        (socket, secret_key)
+                        (Connection::new(framed, pid), secret_key)
                     }
                     Ok(HandshakeResult::CancelRequested {
                         pid: target_pid,
@@ -90,7 +90,6 @@ impl Server {
                 };
 
                 let cancel_token = registry.register(pid, secret_key);
-                let mut connection = Connection::new(socket, pid);
                 if let Err(e) = connection.run(cancel_token).await {
                     eprintln!("(pid={}) Connection error: {}", pid, e);
                 }

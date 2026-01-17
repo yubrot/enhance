@@ -1,90 +1,153 @@
-use std::io;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use bytes::{Buf, BufMut, BytesMut};
 
 use crate::protocol::ProtocolError;
 
-/// Read a null-terminated string from an async reader.
-/// Returns the string (without the null terminator).
+/// Maximum message size in bytes (16 MB).
+/// PostgreSQL uses up to 1 GB, but 16 MB is a reasonable default for most use cases.
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+/// Read a null-terminated string from a BytesMut buffer.
+/// Returns an error if there's not enough data (no null terminator found).
+/// Returns the string (without the null terminator) if successful.
 ///
-/// NOTE: Production improvements needed:
-/// - Add maximum length parameter to prevent unbounded memory allocation
-/// - A malicious client could send data without null terminator, causing OOM
-/// - Consider using a bounded buffer with explicit size limit (e.g., 64KB)
-pub async fn read_cstring<R: AsyncRead + Unpin>(r: &mut R) -> Result<String, ProtocolError> {
-    let mut bytes = Vec::new();
-    loop {
-        let byte = r.read_u8().await?;
-        if byte == 0 {
-            break;
-        }
-        bytes.push(byte);
-    }
-    String::from_utf8(bytes).map_err(ProtocolError::InvalidUtf8)
+/// This function will search for a null byte within the buffer up to a maximum
+/// length to prevent unbounded memory consumption from malicious input.
+pub fn get_cstring(src: &mut BytesMut) -> Result<String, ProtocolError> {
+    const MAX_CSTRING_LENGTH: usize = 64 * 1024; // 64KB limit
+
+    // Find the null terminator position
+    let Some(null_pos) = src.iter().take(MAX_CSTRING_LENGTH).position(|&b| b == 0) else {
+        return Err(ProtocolError::InvalidMessage);
+    };
+
+    let bytes = src.split_to(null_pos);
+    src.advance(1);
+    String::from_utf8(bytes.to_vec()).map_err(ProtocolError::InvalidUtf8)
 }
 
-/// Read a nullable byte array from an async reader.
-/// Returns None if the length is -1 (SQL NULL), otherwise reads the specified number of bytes.
+/// Read a nullable byte array from a BytesMut buffer.
+/// Returns an error if there's not enough data.
+/// Returns None if the value is SQL NULL (length = -1).
+/// Returns Some(Vec<u8>) if the value is present.
 ///
 /// Wire format: Int32 length (-1 for NULL, >= 0 for data), followed by data bytes if length >= 0
-pub async fn read_nullable_bytes<R: AsyncRead + Unpin>(
-    r: &mut R,
-) -> Result<Option<Vec<u8>>, ProtocolError> {
-    let len = r.read_i32().await?;
+pub fn get_nullable_bytes(src: &mut BytesMut) -> Result<Option<Vec<u8>>, ProtocolError> {
+    // Need at least 4 bytes for the length
+    if src.len() < 4 {
+        return Err(ProtocolError::InvalidMessage);
+    }
+
+    let len = src.get_i32();
     if len < 0 {
-        Ok(None)
-    } else {
-        let mut buf = vec![0u8; len as usize];
-        r.read_exact(&mut buf).await?;
-        Ok(Some(buf))
+        // SQL NULL
+        return Ok(None);
+    }
+
+    let len = len as usize;
+    if src.len() < len {
+        return Err(ProtocolError::InvalidMessage);
+    }
+    let bytes = src.split_to(len);
+    Ok(Some(bytes.to_vec()))
+}
+
+/// Write a null-terminated string to a BytesMut buffer.
+pub fn put_cstring(dst: &mut BytesMut, s: &str) {
+    dst.put_slice(s.as_bytes());
+    dst.put_u8(0);
+}
+
+/// Codec for the query phase of the PostgreSQL protocol.
+/// Encodes BackendMessage (in backend.rs) and decodes FrontendMessage (in frontend.rs).
+pub struct PostgresCodec {
+    pub(crate) max_message_size: usize,
+}
+
+impl PostgresCodec {
+    /// Creates a new PostgresCodec with the default maximum message size.
+    pub fn new() -> Self {
+        Self {
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        }
     }
 }
 
-/// Write a null-terminated string to an async writer.
-pub async fn write_cstring<W: AsyncWrite + Unpin>(w: &mut W, s: &str) -> io::Result<()> {
-    w.write_all(s.as_bytes()).await?;
-    w.write_u8(0).await?;
-    Ok(())
+impl Default for PostgresCodec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Codec for the startup phase of the PostgreSQL protocol.
+/// Decodes StartupMessage only (server doesn't receive backend messages during startup).
+pub struct StartupCodec {
+    pub(crate) max_message_size: usize,
+}
+
+impl StartupCodec {
+    /// Creates a new StartupCodec with the default maximum message size.
+    pub fn new() -> Self {
+        Self {
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        }
+    }
+
+    /// Transitions to query phase codec after successful startup.
+    pub fn ready(self) -> PostgresCodec {
+        PostgresCodec {
+            max_message_size: self.max_message_size,
+        }
+    }
+}
+
+impl Default for StartupCodec {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
-    #[tokio::test]
-    async fn test_read_cstring() {
-        let mut cursor = Cursor::new(b"hello\0world");
-        assert_eq!(read_cstring(&mut cursor).await.unwrap(), "hello");
+    #[test]
+    fn test_get_cstring() {
+        let mut buf = BytesMut::from(&b"hello\0world"[..]);
+        assert_eq!(get_cstring(&mut buf).unwrap(), "hello".to_string());
+        assert_eq!(buf, b"world"[..]);
     }
 
-    #[tokio::test]
-    async fn test_read_nullable_bytes_null() {
-        let mut cursor = Cursor::new(vec![0xFF, 0xFF, 0xFF, 0xFF]); // -1 in big-endian
-        assert_eq!(read_nullable_bytes(&mut cursor).await.unwrap(), None);
+    #[test]
+    fn test_get_cstring_incomplete() {
+        let mut buf = BytesMut::from(&b"hello"[..]);
+        assert!(get_cstring(&mut buf).is_err());
     }
 
-    #[tokio::test]
-    async fn test_read_nullable_bytes_data() {
-        let mut cursor = Cursor::new(vec![0, 0, 0, 5, b'h', b'e', b'l', b'l', b'o']); // length 5 + data
+    #[test]
+    fn test_get_nullable_bytes_null() {
+        let mut buf = BytesMut::from(&[0xFF, 0xFF, 0xFF, 0xFF][..]); // -1
+        assert_eq!(get_nullable_bytes(&mut buf).unwrap(), None);
+    }
+
+    #[test]
+    fn test_get_nullable_bytes_data() {
+        let mut buf = BytesMut::from(&[0, 0, 0, 5, b'h', b'e', b'l', b'l', b'o'][..]);
         assert_eq!(
-            read_nullable_bytes(&mut cursor).await.unwrap(),
+            get_nullable_bytes(&mut buf).unwrap(),
             Some(b"hello".to_vec())
         );
     }
 
-    #[tokio::test]
-    async fn test_read_nullable_bytes_empty() {
-        let mut cursor = Cursor::new(vec![0, 0, 0, 0]); // length 0
-        assert_eq!(
-            read_nullable_bytes(&mut cursor).await.unwrap(),
-            Some(vec![])
-        );
+    #[test]
+    fn test_get_nullable_bytes_incomplete() {
+        let mut buf = BytesMut::from(&[0, 0, 0, 10, b'h', b'i'][..]); // Says 10 bytes, only 2 available
+        assert!(get_nullable_bytes(&mut buf).is_err());
     }
 
-    #[tokio::test]
-    async fn test_write_cstring() {
-        let mut buf = Vec::new();
-        write_cstring(&mut buf, "test").await.unwrap();
-        assert_eq!(buf, b"test\0");
+    #[test]
+    fn test_put_cstring() {
+        let mut buf = BytesMut::new();
+        put_cstring(&mut buf, "test");
+        assert_eq!(buf, b"test\0"[..]);
     }
 }

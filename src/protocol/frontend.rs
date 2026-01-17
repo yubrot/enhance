@@ -1,17 +1,32 @@
+use bytes::{Buf, BytesMut};
 use std::collections::HashMap;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio_util::codec::Decoder;
 
-use crate::protocol::ProtocolError;
-use crate::protocol::codec::{read_cstring, read_nullable_bytes};
+use crate::protocol::codec::{PostgresCodec, StartupCodec, get_cstring, get_nullable_bytes};
+use crate::protocol::error::ProtocolError;
+
+/// Ensures that the buffer has at least `n` bytes remaining.
+/// Returns `ProtocolError::InvalidMessage` if not enough bytes are available.
+macro_rules! ensure_remaining {
+    ($buf:expr, $n:expr) => {
+        if $buf.len() < $n {
+            return Err(ProtocolError::InvalidMessage);
+        }
+    };
+}
 
 /// SSLRequest magic number
-pub const SSL_REQUEST_CODE: i32 = (1234 << 16) | 5679; // 80877103
+const SSL_REQUEST_CODE: i32 = (1234 << 16) | 5679; // 80877103
 
 /// GSSENCRequest magic number
-pub const GSSENC_REQUEST_CODE: i32 = (1234 << 16) | 5680; // 80877104
+const GSSENC_REQUEST_CODE: i32 = (1234 << 16) | 5680; // 80877104
 
 /// CancelRequest magic number
-pub const CANCEL_REQUEST_CODE: i32 = (1234 << 16) | 5678; // 80877102
+const CANCEL_REQUEST_CODE: i32 = (1234 << 16) | 5678; // 80877102
+
+const MAX_PARAMS: usize = 10000;
+const MAX_FORMAT_CODES: usize = 10000;
+const MAX_RESULT_FORMATS: usize = 10000;
 
 /// Messages sent by the frontend (client) during startup phase.
 #[derive(Debug)]
@@ -29,6 +44,38 @@ pub enum StartupMessage {
     },
 }
 
+impl StartupMessage {
+    /// Decodes a startup message from the buffer.
+    /// The buffer should contain a complete message (length and code already validated).
+    fn decode(src: &mut BytesMut) -> Result<Self, ProtocolError> {
+        // Read length and code
+        let _len = src.get_i32();
+        let code = src.get_i32();
+
+        match code {
+            SSL_REQUEST_CODE => Ok(StartupMessage::SslRequest),
+            GSSENC_REQUEST_CODE => Ok(StartupMessage::GssEncRequest),
+            CANCEL_REQUEST_CODE => {
+                ensure_remaining!(src, 8);
+                let process_id = src.get_i32();
+                let secret_key = src.get_i32();
+                Ok(StartupMessage::CancelRequest {
+                    process_id,
+                    secret_key,
+                })
+            }
+            version if (version >> 16) == 3 => {
+                let parameters = StartupParameters::decode(src)?;
+                Ok(StartupMessage::Startup {
+                    protocol_version: version,
+                    parameters,
+                })
+            }
+            _ => Err(ProtocolError::UnsupportedProtocolVersion(code)),
+        }
+    }
+}
+
 /// Startup parameters from the client
 #[derive(Debug, Clone, Default)]
 pub struct StartupParameters {
@@ -39,88 +86,27 @@ pub struct StartupParameters {
     pub other: HashMap<String, String>,
 }
 
-impl StartupMessage {
-    /// Parse a startup message from a byte buffer.
-    pub async fn from_bytes(buf: &[u8]) -> Result<Self, ProtocolError> {
-        use std::io::Cursor;
-        let mut cursor = Cursor::new(buf);
-        Self::read(&mut cursor).await
-    }
-
-    /// Read a startup-phase message from the stream (including length prefix).
-    ///
-    /// NOTE: Production improvements needed:
-    /// - Add maximum message size limit (PostgreSQL uses 1GB max)
-    /// - Implement read timeout to prevent slow-loris attacks
-    /// - Consider using a pre-allocated buffer pool for parsing
-    pub async fn read<R: AsyncRead + Unpin>(r: &mut R) -> Result<Self, ProtocolError> {
-        let len = r.read_i32().await?;
-
-        // Minimum length is 8 (length + code)
-        // NOTE: Production should also enforce maximum length (e.g., 10KB for startup)
-        if len < 8 {
-            return Err(ProtocolError::InvalidMessage);
-        }
-
-        let code = r.read_i32().await?;
-
-        // Remaining bytes after length and code
-        let remaining = (len - 8) as usize;
-
-        match code {
-            SSL_REQUEST_CODE if remaining == 0 => Ok(StartupMessage::SslRequest),
-            GSSENC_REQUEST_CODE if remaining == 0 => Ok(StartupMessage::GssEncRequest),
-            CANCEL_REQUEST_CODE if remaining == 8 => {
-                let process_id = r.read_i32().await?;
-                let secret_key = r.read_i32().await?;
-                Ok(StartupMessage::CancelRequest {
-                    process_id,
-                    secret_key,
-                })
-            }
-            SSL_REQUEST_CODE | GSSENC_REQUEST_CODE | CANCEL_REQUEST_CODE => {
-                Err(ProtocolError::InvalidMessage)
-            }
-            version if (version >> 16) == 3 => {
-                let parameters = Self::read_startup_parameters(r, remaining).await?;
-                Ok(StartupMessage::Startup {
-                    protocol_version: version,
-                    parameters,
-                })
-            }
-            _ => Err(ProtocolError::UnsupportedProtocolVersion(code)),
-        }
-    }
-
-    /// NOTE: Production improvements needed:
-    /// - Limit maximum parameter name/value lengths
-    /// - Limit total number of parameters (prevent DoS via memory exhaustion)
-    /// - Sanitize/validate parameter values (e.g., encoding names)
-    async fn read_startup_parameters<R: AsyncRead + Unpin>(
-        r: &mut R,
-        mut remaining: usize,
-    ) -> Result<StartupParameters, ProtocolError> {
+impl StartupParameters {
+    /// Decodes startup parameters from the message buffer.
+    fn decode(src: &mut BytesMut) -> Result<Self, ProtocolError> {
         let mut params = StartupParameters::default();
 
         loop {
-            if remaining == 0 {
+            // Check if we have more data
+            if src.is_empty() {
                 break;
             }
 
-            let name = read_cstring(r).await?;
-
-            // Account for name + null terminator
-            remaining = remaining.saturating_sub(name.len() + 1);
+            // Read parameter name
+            let name = get_cstring(src)?;
 
             // Empty name signals end of parameters
             if name.is_empty() {
                 break;
             }
 
-            let value = read_cstring(r).await?;
-
-            // Account for value + null terminator
-            remaining = remaining.saturating_sub(value.len() + 1);
+            // Read parameter value
+            let value = get_cstring(src)?;
 
             match name.as_str() {
                 "user" => params.user = value,
@@ -138,6 +124,34 @@ impl StartupMessage {
         }
 
         Ok(params)
+    }
+}
+
+impl Decoder for StartupCodec {
+    type Item = StartupMessage;
+    type Error = ProtocolError;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // Need at least 8 bytes (length + code)
+        if src.len() < 8 {
+            return Ok(None);
+        }
+
+        // Peek at the length (don't consume yet)
+        let len = i32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize;
+        if len < 8 || len > self.max_message_size {
+            return Err(ProtocolError::InvalidMessage);
+        }
+
+        // Wait for complete message
+        if src.len() < len {
+            return Ok(None);
+        }
+
+        // Ready to decode - consume the message and decode it
+        let mut msg_buf = src.split_to(len);
+        let msg = StartupMessage::decode(&mut msg_buf)?;
+        Ok(Some(msg))
     }
 }
 
@@ -168,6 +182,30 @@ pub enum FrontendMessage {
     Flush,
 }
 
+impl FrontendMessage {
+    /// Decodes a frontend message from the buffer.
+    /// The buffer should contain the message body (type and length already consumed).
+    fn decode(src: &mut BytesMut) -> Result<Self, ProtocolError> {
+        let msg_type = src.get_u8();
+        let _length = src.get_i32();
+        match msg_type {
+            b'Q' => {
+                let query = get_cstring(src)?;
+                Ok(FrontendMessage::Query(query))
+            }
+            b'X' => Ok(FrontendMessage::Terminate),
+            b'P' => Ok(FrontendMessage::Parse(ParseMessage::decode(src)?)),
+            b'B' => Ok(FrontendMessage::Bind(BindMessage::decode(src)?)),
+            b'D' => Ok(FrontendMessage::Describe(DescribeMessage::decode(src)?)),
+            b'E' => Ok(FrontendMessage::Execute(ExecuteMessage::decode(src)?)),
+            b'C' => Ok(FrontendMessage::Close(CloseMessage::decode(src)?)),
+            b'S' => Ok(FrontendMessage::Sync),
+            b'H' => Ok(FrontendMessage::Flush),
+            _ => Err(ProtocolError::UnknownMessageType(msg_type)),
+        }
+    }
+}
+
 /// Parse message - creates a prepared statement
 #[derive(Debug, Clone)]
 pub struct ParseMessage {
@@ -177,6 +215,32 @@ pub struct ParseMessage {
     pub query: String,
     /// Parameter type OIDs (may be empty, server infers types)
     pub param_types: Vec<i32>,
+}
+
+impl ParseMessage {
+    /// Decodes a Parse message from the buffer.
+    fn decode(src: &mut BytesMut) -> Result<Self, ProtocolError> {
+        let statement_name = get_cstring(src)?;
+        let query = get_cstring(src)?;
+
+        ensure_remaining!(src, 2);
+        let param_count = src.get_i16() as usize;
+        if param_count > MAX_PARAMS {
+            return Err(ProtocolError::InvalidMessage);
+        }
+
+        ensure_remaining!(src, param_count * 4);
+        let mut param_types = Vec::with_capacity(param_count);
+        for _ in 0..param_count {
+            param_types.push(src.get_i32());
+        }
+
+        Ok(ParseMessage {
+            statement_name,
+            query,
+            param_types,
+        })
+    }
 }
 
 /// Bind message - binds parameters to create a portal
@@ -194,6 +258,57 @@ pub struct BindMessage {
     pub result_format_codes: Vec<i16>,
 }
 
+impl BindMessage {
+    /// Decodes a Bind message from the buffer.
+    fn decode(src: &mut BytesMut) -> Result<Self, ProtocolError> {
+        let portal_name = get_cstring(src)?;
+        let statement_name = get_cstring(src)?;
+
+        // Parameter format codes
+        ensure_remaining!(src, 2);
+        let format_count = src.get_i16() as usize;
+        if format_count > MAX_FORMAT_CODES {
+            return Err(ProtocolError::InvalidMessage);
+        }
+
+        ensure_remaining!(src, format_count * 2);
+        let mut param_format_codes = Vec::with_capacity(format_count);
+        for _ in 0..format_count {
+            param_format_codes.push(src.get_i16());
+        }
+
+        // Parameter values
+        ensure_remaining!(src, 2);
+        let param_count = src.get_i16() as usize;
+        let mut param_values = Vec::with_capacity(param_count);
+        for _ in 0..param_count {
+            let value = get_nullable_bytes(src)?;
+            param_values.push(value);
+        }
+
+        // Result format codes
+        ensure_remaining!(src, 2);
+        let result_format_count = src.get_i16() as usize;
+        if result_format_count > MAX_RESULT_FORMATS {
+            return Err(ProtocolError::InvalidMessage);
+        }
+
+        ensure_remaining!(src, result_format_count * 2);
+        let mut result_format_codes = Vec::with_capacity(result_format_count);
+        for _ in 0..result_format_count {
+            result_format_codes.push(src.get_i16());
+        }
+
+        Ok(BindMessage {
+            portal_name,
+            statement_name,
+            param_format_codes,
+            param_values,
+            result_format_codes,
+        })
+    }
+}
+
 /// Describe message - request metadata about statement or portal
 #[derive(Debug, Clone)]
 pub struct DescribeMessage {
@@ -201,6 +316,21 @@ pub struct DescribeMessage {
     pub target_type: DescribeTarget,
     /// Name of the statement or portal
     pub name: String,
+}
+
+impl DescribeMessage {
+    /// Decodes a Describe message from the buffer.
+    fn decode(src: &mut BytesMut) -> Result<Self, ProtocolError> {
+        ensure_remaining!(src, 1);
+        let target_byte = src.get_u8();
+        let target_type = match target_byte {
+            b'S' => DescribeTarget::Statement,
+            b'P' => DescribeTarget::Portal,
+            _ => return Err(ProtocolError::InvalidMessage),
+        };
+        let name = get_cstring(src)?;
+        Ok(DescribeMessage { target_type, name })
+    }
 }
 
 /// Describe message target type
@@ -221,6 +351,19 @@ pub struct ExecuteMessage {
     pub max_rows: i32,
 }
 
+impl ExecuteMessage {
+    /// Decodes an Execute message from the buffer.
+    fn decode(src: &mut BytesMut) -> Result<Self, ProtocolError> {
+        let portal_name = get_cstring(src)?;
+        ensure_remaining!(src, 4);
+        let max_rows = src.get_i32();
+        Ok(ExecuteMessage {
+            portal_name,
+            max_rows,
+        })
+    }
+}
+
 /// Close message - close a statement or portal
 #[derive(Debug, Clone)]
 pub struct CloseMessage {
@@ -228,6 +371,21 @@ pub struct CloseMessage {
     pub target_type: CloseTarget,
     /// Name of the statement or portal
     pub name: String,
+}
+
+impl CloseMessage {
+    /// Decodes a Close message from the buffer.
+    fn decode(src: &mut BytesMut) -> Result<Self, ProtocolError> {
+        ensure_remaining!(src, 1);
+        let target_byte = src.get_u8();
+        let target_type = match target_byte {
+            b'S' => CloseTarget::Statement,
+            b'P' => CloseTarget::Portal,
+            _ => return Err(ProtocolError::InvalidMessage),
+        };
+        let name = get_cstring(src)?;
+        Ok(CloseMessage { target_type, name })
+    }
 }
 
 /// Close message target type
@@ -239,190 +397,98 @@ pub enum CloseTarget {
     Portal,
 }
 
-impl FrontendMessage {
-    /// Parse a frontend message from a byte buffer.
-    pub async fn from_bytes(buf: &[u8]) -> Result<Option<Self>, ProtocolError> {
-        use std::io::Cursor;
-        let mut cursor = Cursor::new(buf);
-        Self::read(&mut cursor).await
-    }
+impl Decoder for PostgresCodec {
+    type Item = FrontendMessage;
+    type Error = ProtocolError;
 
-    /// Read a query-phase message from the stream.
-    /// Returns None on EOF (clean disconnect).
-    ///
-    /// NOTE: Production improvements needed:
-    /// - Add timeout to prevent slow-loris attacks
-    /// - Limit query size (PostgreSQL: 1GB max)
-    pub async fn read<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Self>, ProtocolError> {
-        // Read message type byte
-        let msg_type = match r.read_u8().await {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // Need at least 5 bytes (type + length)
+        if src.len() < 5 {
+            return Ok(None);
+        }
 
-        // Read length (includes self but not type byte)
-        // TODO: this should be passed to read_cstring or else
-        let length = r.read_i32().await?;
-        if length < 4 {
+        // Peek at the length (bytes 1-4, don't consume yet)
+        let len = i32::from_be_bytes([src[1], src[2], src[3], src[4]]) as usize;
+        if len < 4 || len > self.max_message_size {
             return Err(ProtocolError::InvalidMessage);
         }
 
-        match msg_type {
-            b'Q' => {
-                // Query: read null-terminated string
-                let query = read_cstring(r).await?;
-                Ok(Some(FrontendMessage::Query(query)))
-            }
-            b'X' => {
-                // Terminate: no body (just length=4)
-                Ok(Some(FrontendMessage::Terminate))
-            }
-            b'P' => {
-                // Parse: statement_name, query, param_count, param_types[]
-                let statement_name = read_cstring(r).await?;
-                let query = read_cstring(r).await?;
-                let param_count = r.read_i16().await? as usize;
-                let mut param_types = Vec::with_capacity(param_count);
-                for _ in 0..param_count {
-                    param_types.push(r.read_i32().await?);
-                }
-                Ok(Some(FrontendMessage::Parse(ParseMessage {
-                    statement_name,
-                    query,
-                    param_types,
-                })))
-            }
-            b'B' => {
-                // Bind: portal_name, statement_name, format_codes, params, result_formats
-                let portal_name = read_cstring(r).await?;
-                let statement_name = read_cstring(r).await?;
+        // Total message size = 1 (type byte) + length
+        let len = 1 + len;
 
-                // Parameter format codes
-                let format_count = r.read_i16().await? as usize;
-                let mut param_format_codes = Vec::with_capacity(format_count);
-                for _ in 0..format_count {
-                    param_format_codes.push(r.read_i16().await?);
-                }
-
-                // Parameter values
-                let param_count = r.read_i16().await? as usize;
-                let mut param_values = Vec::with_capacity(param_count);
-                for _ in 0..param_count {
-                    param_values.push(read_nullable_bytes(r).await?);
-                }
-
-                // Result format codes
-                let result_format_count = r.read_i16().await? as usize;
-                let mut result_format_codes = Vec::with_capacity(result_format_count);
-                for _ in 0..result_format_count {
-                    result_format_codes.push(r.read_i16().await?);
-                }
-
-                Ok(Some(FrontendMessage::Bind(BindMessage {
-                    portal_name,
-                    statement_name,
-                    param_format_codes,
-                    param_values,
-                    result_format_codes,
-                })))
-            }
-            b'D' => {
-                // Describe: type ('S' or 'P'), name
-                let target_byte = r.read_u8().await?;
-                let target_type = match target_byte {
-                    b'S' => DescribeTarget::Statement,
-                    b'P' => DescribeTarget::Portal,
-                    _ => return Err(ProtocolError::InvalidMessage),
-                };
-                let name = read_cstring(r).await?;
-                Ok(Some(FrontendMessage::Describe(DescribeMessage {
-                    target_type,
-                    name,
-                })))
-            }
-            b'E' => {
-                // Execute: portal_name, max_rows
-                let portal_name = read_cstring(r).await?;
-                let max_rows = r.read_i32().await?;
-                Ok(Some(FrontendMessage::Execute(ExecuteMessage {
-                    portal_name,
-                    max_rows,
-                })))
-            }
-            b'C' => {
-                // Close: type ('S' or 'P'), name
-                let target_byte = r.read_u8().await?;
-                let target_type = match target_byte {
-                    b'S' => CloseTarget::Statement,
-                    b'P' => CloseTarget::Portal,
-                    _ => return Err(ProtocolError::InvalidMessage),
-                };
-                let name = read_cstring(r).await?;
-                Ok(Some(FrontendMessage::Close(CloseMessage {
-                    target_type,
-                    name,
-                })))
-            }
-            b'S' => {
-                // Sync: no body (just length=4)
-                Ok(Some(FrontendMessage::Sync))
-            }
-            b'H' => {
-                // Flush: no body (just length=4)
-                Ok(Some(FrontendMessage::Flush))
-            }
-            _ => Err(ProtocolError::UnknownMessageType(msg_type)),
+        // Wait for complete message
+        if src.len() < len {
+            return Ok(None);
         }
+
+        // Ready to decode - consume the message and decode it
+        let mut msg_buf = src.split_to(len);
+        let msg = FrontendMessage::decode(&mut msg_buf)?;
+        Ok(Some(msg))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use bytes::{BufMut, BytesMut};
+    use tokio_util::codec::Decoder;
 
     /// Helper to create a startup message with given code and body
-    async fn make_startup_message(code: i32, body: &[u8]) -> Vec<u8> {
+    fn make_startup_message(code: i32, body: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
         let len = 4 + 4 + body.len(); // length + code + body
-        buf.write_i32(len as i32).await.unwrap();
-        buf.write_i32(code).await.unwrap();
+        buf.put_i32(len as i32);
+        buf.put_i32(code);
         buf.extend_from_slice(body);
         buf
     }
 
     /// Helper to create a frontend message with given type and body
-    async fn make_frontend_message(msg_type: u8, body: &[u8]) -> Vec<u8> {
+    fn make_frontend_message(msg_type: u8, body: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.push(msg_type);
         let len = 4 + body.len(); // length includes self (4 bytes) + body
-        buf.write_i32(len as i32).await.unwrap();
+        buf.put_i32(len as i32);
         buf.extend_from_slice(body);
         buf
     }
 
-    #[tokio::test]
-    async fn test_read_ssl_request() {
-        let buf = make_startup_message(SSL_REQUEST_CODE, &[]).await;
-        let msg = StartupMessage::from_bytes(&buf).await.unwrap();
-        assert!(matches!(msg, StartupMessage::SslRequest));
+    /// Helper to decode a StartupMessage from bytes
+    fn decode_startup_message(buf: &[u8]) -> Result<Option<StartupMessage>, ProtocolError> {
+        let mut codec = StartupCodec::new();
+        let mut bytes = BytesMut::from(buf);
+        codec.decode(&mut bytes)
     }
 
-    #[tokio::test]
-    async fn test_read_startup_message() {
+    /// Helper to decode a FrontendMessage from bytes
+    fn decode_frontend_message(buf: &[u8]) -> Result<Option<FrontendMessage>, ProtocolError> {
+        let mut codec = PostgresCodec::new();
+        let mut bytes = BytesMut::from(buf);
+        codec.decode(&mut bytes)
+    }
+
+    #[test]
+    fn test_read_ssl_request() {
+        let buf = make_startup_message(SSL_REQUEST_CODE, &[]);
+        let msg = decode_startup_message(&buf).unwrap();
+        assert!(matches!(msg, Some(StartupMessage::SslRequest)));
+    }
+
+    #[test]
+    fn test_read_startup_message() {
         let mut body = Vec::new();
         body.extend_from_slice(b"user\0postgres\0");
         body.extend_from_slice(b"database\0testdb\0");
         body.push(0); // terminator
 
-        let buf = make_startup_message(3 << 16, &body).await;
-        let msg = StartupMessage::from_bytes(&buf).await.unwrap();
+        let buf = make_startup_message(3 << 16, &body);
+        let msg = decode_startup_message(&buf).unwrap();
 
-        let StartupMessage::Startup {
+        let Some(StartupMessage::Startup {
             protocol_version,
             parameters,
-        } = msg
+        }) = msg
         else {
             panic!("expected Startup message, got {msg:?}")
         };
@@ -432,14 +498,14 @@ mod tests {
         assert_eq!(parameters.database, Some("testdb".to_string()));
     }
 
-    #[tokio::test]
-    async fn test_read_startup_message_missing_user() {
+    #[test]
+    fn test_read_startup_message_missing_user() {
         let mut body = Vec::new();
         body.extend_from_slice(b"database\0testdb\0");
         body.push(0); // terminator
 
-        let buf = make_startup_message(3 << 16, &body).await;
-        let result = StartupMessage::from_bytes(&buf).await;
+        let buf = make_startup_message(3 << 16, &body);
+        let result = decode_startup_message(&buf);
 
         assert!(matches!(
             result,
@@ -447,26 +513,26 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn test_read_gssenc_request() {
-        let buf = make_startup_message(GSSENC_REQUEST_CODE, &[]).await;
-        let msg = StartupMessage::from_bytes(&buf).await.unwrap();
-        assert!(matches!(msg, StartupMessage::GssEncRequest));
+    #[test]
+    fn test_read_gssenc_request() {
+        let buf = make_startup_message(GSSENC_REQUEST_CODE, &[]);
+        let msg = decode_startup_message(&buf).unwrap();
+        assert!(matches!(msg, Some(StartupMessage::GssEncRequest)));
     }
 
-    #[tokio::test]
-    async fn test_read_cancel_request() {
+    #[test]
+    fn test_read_cancel_request() {
         let mut body = Vec::new();
-        body.write_i32(12345).await.unwrap(); // process_id
-        body.write_i32(67890).await.unwrap(); // secret_key
+        body.put_i32(12345); // process_id
+        body.put_i32(67890); // secret_key
 
-        let buf = make_startup_message(CANCEL_REQUEST_CODE, &body).await;
-        let msg = StartupMessage::from_bytes(&buf).await.unwrap();
+        let buf = make_startup_message(CANCEL_REQUEST_CODE, &body);
+        let msg = decode_startup_message(&buf).unwrap();
 
-        let StartupMessage::CancelRequest {
+        let Some(StartupMessage::CancelRequest {
             process_id,
             secret_key,
-        } = msg
+        }) = msg
         else {
             panic!("expected CancelRequest message, got {msg:?}")
         };
@@ -475,30 +541,30 @@ mod tests {
         assert_eq!(secret_key, 67890);
     }
 
-    #[tokio::test]
-    async fn test_read_eof() {
+    #[test]
+    fn test_read_eof() {
         let buf = Vec::new();
-        let msg = FrontendMessage::from_bytes(&buf).await.unwrap();
+        let msg = decode_frontend_message(&buf).unwrap();
         assert!(msg.is_none());
     }
 
-    #[tokio::test]
-    async fn test_read_unknown_message_type() {
+    #[test]
+    fn test_read_unknown_message_type() {
         let mut buf = Vec::new();
         buf.push(b'Z'); // Unknown type
-        buf.write_i32(4).await.unwrap();
+        buf.put_i32(4);
 
-        let result = FrontendMessage::from_bytes(&buf).await;
+        let result = decode_frontend_message(&buf);
         assert!(matches!(
             result,
             Err(ProtocolError::UnknownMessageType(b'Z'))
         ));
     }
 
-    #[tokio::test]
-    async fn test_read_query_message() {
-        let buf = make_frontend_message(b'Q', b"SELECT 1\0").await;
-        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+    #[test]
+    fn test_read_query_message() {
+        let buf = make_frontend_message(b'Q', b"SELECT 1\0");
+        let msg = decode_frontend_message(&buf).unwrap().unwrap();
 
         let FrontendMessage::Query(q) = msg else {
             panic!("expected Query message, got {msg:?}")
@@ -507,24 +573,24 @@ mod tests {
         assert_eq!(q, "SELECT 1");
     }
 
-    #[tokio::test]
-    async fn test_read_terminate_message() {
-        let buf = make_frontend_message(b'X', &[]).await;
-        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+    #[test]
+    fn test_read_terminate_message() {
+        let buf = make_frontend_message(b'X', &[]);
+        let msg = decode_frontend_message(&buf).unwrap().unwrap();
         assert!(matches!(msg, FrontendMessage::Terminate));
     }
 
-    #[tokio::test]
-    async fn test_read_parse_message() {
+    #[test]
+    fn test_read_parse_message() {
         let mut body = Vec::new();
         body.push(0); // empty (unnamed) statement - commonly used in PostgreSQL
         body.extend_from_slice(b"SELECT $1, $2\0");
-        body.write_i16(2).await.unwrap(); // 2 parameters
-        body.write_i32(23).await.unwrap(); // INT4 OID
-        body.write_i32(25).await.unwrap(); // TEXT OID
+        body.put_i16(2); // 2 parameters
+        body.put_i32(23); // INT4 OID
+        body.put_i32(25); // TEXT OID
 
-        let buf = make_frontend_message(b'P', &body).await;
-        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+        let buf = make_frontend_message(b'P', &body);
+        let msg = decode_frontend_message(&buf).unwrap().unwrap();
 
         let FrontendMessage::Parse(parse) = msg else {
             panic!("expected Parse message, got {msg:?}")
@@ -535,16 +601,16 @@ mod tests {
         assert_eq!(parse.param_types, vec![23, 25]);
     }
 
-    #[tokio::test]
-    async fn test_read_parse_message_named() {
+    #[test]
+    fn test_read_parse_message_named() {
         let mut body = Vec::new();
         body.extend_from_slice(b"portal\0");
         body.extend_from_slice(b"SELECT $1\0");
-        body.write_i16(1).await.unwrap();
-        body.write_i32(23).await.unwrap();
+        body.put_i16(1);
+        body.put_i32(23);
 
-        let buf = make_frontend_message(b'P', &body).await;
-        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+        let buf = make_frontend_message(b'P', &body);
+        let msg = decode_frontend_message(&buf).unwrap().unwrap();
 
         let FrontendMessage::Parse(parse) = msg else {
             panic!("expected Parse message, got {msg:?}")
@@ -555,24 +621,24 @@ mod tests {
         assert_eq!(parse.param_types, vec![23]);
     }
 
-    #[tokio::test]
-    async fn test_read_bind_message() {
+    #[test]
+    fn test_read_bind_message() {
         let mut body = Vec::new();
         body.extend_from_slice(b"portal\0"); // portal_name
         body.extend_from_slice(b"stmt\0"); // statement_name
-        body.write_i16(1).await.unwrap(); // format_count
-        body.write_i16(0).await.unwrap(); // format code (text)
-        body.write_i16(3).await.unwrap(); // param_count: 3 params (non-NULL, NULL, non-NULL)
-        body.write_i32(2).await.unwrap(); // first param length
+        body.put_i16(1); // format_count
+        body.put_i16(0); // format code (text)
+        body.put_i16(3); // param_count: 3 params (non-NULL, NULL, non-NULL)
+        body.put_i32(2); // first param length
         body.extend_from_slice(b"42"); // first param value
-        body.write_i32(-1).await.unwrap(); // second param is NULL (-1)
-        body.write_i32(5).await.unwrap(); // third param length
+        body.put_i32(-1); // second param is NULL (-1)
+        body.put_i32(5); // third param length
         body.extend_from_slice(b"hello"); // third param value
-        body.write_i16(1).await.unwrap(); // result_format_count
-        body.write_i16(0).await.unwrap(); // result format code
+        body.put_i16(1); // result_format_count
+        body.put_i16(0); // result format code
 
-        let buf = make_frontend_message(b'B', &body).await;
-        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+        let buf = make_frontend_message(b'B', &body);
+        let msg = decode_frontend_message(&buf).unwrap().unwrap();
 
         let FrontendMessage::Bind(bind) = msg else {
             panic!("expected Bind message, got {msg:?}")
@@ -588,14 +654,14 @@ mod tests {
         assert_eq!(bind.result_format_codes, vec![0]);
     }
 
-    #[tokio::test]
-    async fn test_read_describe_statement() {
+    #[test]
+    fn test_read_describe_statement() {
         let mut body = Vec::new();
         body.push(b'S'); // Statement
         body.push(0); // empty (unnamed) statement
 
-        let buf = make_frontend_message(b'D', &body).await;
-        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+        let buf = make_frontend_message(b'D', &body);
+        let msg = decode_frontend_message(&buf).unwrap().unwrap();
 
         let FrontendMessage::Describe(desc) = msg else {
             panic!("expected Describe message, got {msg:?}")
@@ -605,14 +671,14 @@ mod tests {
         assert_eq!(desc.name, ""); // unnamed statement
     }
 
-    #[tokio::test]
-    async fn test_read_describe_portal() {
+    #[test]
+    fn test_read_describe_portal() {
         let mut body = Vec::new();
         body.push(b'P'); // Portal
         body.extend_from_slice(b"portal\0");
 
-        let buf = make_frontend_message(b'D', &body).await;
-        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+        let buf = make_frontend_message(b'D', &body);
+        let msg = decode_frontend_message(&buf).unwrap().unwrap();
 
         let FrontendMessage::Describe(desc) = msg else {
             panic!("expected Describe message, got {msg:?}")
@@ -622,14 +688,14 @@ mod tests {
         assert_eq!(desc.name, "portal");
     }
 
-    #[tokio::test]
-    async fn test_read_execute_message() {
+    #[test]
+    fn test_read_execute_message() {
         let mut body = Vec::new();
         body.push(0); // empty (unnamed) portal - commonly used in PostgreSQL
-        body.write_i32(100).await.unwrap(); // max_rows
+        body.put_i32(100); // max_rows
 
-        let buf = make_frontend_message(b'E', &body).await;
-        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+        let buf = make_frontend_message(b'E', &body);
+        let msg = decode_frontend_message(&buf).unwrap().unwrap();
 
         let FrontendMessage::Execute(exec) = msg else {
             panic!("expected Execute message, got {msg:?}")
@@ -639,14 +705,14 @@ mod tests {
         assert_eq!(exec.max_rows, 100);
     }
 
-    #[tokio::test]
-    async fn test_read_close_statement() {
+    #[test]
+    fn test_read_close_statement() {
         let mut body = Vec::new();
         body.push(b'S'); // Statement
         body.push(0); // empty (unnamed) statement
 
-        let buf = make_frontend_message(b'C', &body).await;
-        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+        let buf = make_frontend_message(b'C', &body);
+        let msg = decode_frontend_message(&buf).unwrap().unwrap();
 
         let FrontendMessage::Close(close) = msg else {
             panic!("expected Close message, got {msg:?}")
@@ -656,14 +722,14 @@ mod tests {
         assert_eq!(close.name, ""); // unnamed statement
     }
 
-    #[tokio::test]
-    async fn test_read_close_portal() {
+    #[test]
+    fn test_read_close_portal() {
         let mut body = Vec::new();
         body.push(b'P'); // Portal
         body.push(0); // empty (unnamed) portal
 
-        let buf = make_frontend_message(b'C', &body).await;
-        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+        let buf = make_frontend_message(b'C', &body);
+        let msg = decode_frontend_message(&buf).unwrap().unwrap();
 
         let FrontendMessage::Close(close) = msg else {
             panic!("expected Close message, got {msg:?}")
@@ -673,17 +739,17 @@ mod tests {
         assert_eq!(close.name, ""); // unnamed portal
     }
 
-    #[tokio::test]
-    async fn test_read_sync_message() {
-        let buf = make_frontend_message(b'S', &[]).await;
-        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+    #[test]
+    fn test_read_sync_message() {
+        let buf = make_frontend_message(b'S', &[]);
+        let msg = decode_frontend_message(&buf).unwrap().unwrap();
         assert!(matches!(msg, FrontendMessage::Sync));
     }
 
-    #[tokio::test]
-    async fn test_read_flush_message() {
-        let buf = make_frontend_message(b'H', &[]).await;
-        let msg = FrontendMessage::from_bytes(&buf).await.unwrap().unwrap();
+    #[test]
+    fn test_read_flush_message() {
+        let buf = make_frontend_message(b'H', &[]);
+        let msg = decode_frontend_message(&buf).unwrap().unwrap();
         assert!(matches!(msg, FrontendMessage::Flush));
     }
 }

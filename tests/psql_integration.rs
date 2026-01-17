@@ -259,7 +259,7 @@ async fn test_extended_query_describe() {
 
     // Parse a statement with params
     stream.write_u8(b'P').await.unwrap();
-    stream.write_i32(4 + 6 + 18 + 2 + 4 + 4).await.unwrap(); // length
+    stream.write_i32(4 + 5 + 14 + 2 + 4 + 4).await.unwrap(); // length: "test\0"(5) + "SELECT $1, $2\0"(14) + count(2) + 2*oid(8)
     stream.write_all(b"test\0").await.unwrap(); // statement name
     stream.write_all(b"SELECT $1, $2\0").await.unwrap(); // query
     stream.write_i16(2).await.unwrap(); // param count
@@ -346,7 +346,7 @@ async fn test_extended_query_close() {
 
     // Parse a statement
     stream.write_u8(b'P').await.unwrap();
-    stream.write_i32(4 + 6 + 9 + 2).await.unwrap();
+    stream.write_i32(4 + 5 + 9 + 2).await.unwrap(); // length: "stmt\0"(5) + "SELECT 1\0"(9) + count(2)
     stream.write_all(b"stmt\0").await.unwrap();
     stream.write_all(b"SELECT 1\0").await.unwrap();
     stream.write_i16(0).await.unwrap();

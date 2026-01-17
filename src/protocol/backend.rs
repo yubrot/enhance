@@ -1,9 +1,7 @@
+use crate::protocol::codec::{PostgresCodec, StartupCodec, put_cstring};
+use bytes::{BufMut, BytesMut};
 use std::io;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
-
-use crate::protocol::codec::write_cstring;
-
-// TODO: Reduce await by using BytesMut etc.
+use tokio_util::codec::Encoder;
 
 /// Messages sent by the backend (server) to the client.
 #[derive(Debug)]
@@ -62,80 +60,59 @@ impl BackendMessage {
         }
     }
 
-    /// Returns the body length in bytes (excluding type byte and length field).
-    fn body_len(&self) -> usize {
-        match self {
-            BackendMessage::AuthenticationOk => 4,
-            BackendMessage::BackendKeyData { .. } => 8,
-            BackendMessage::ParameterStatus { name, value } => name.len() + 1 + value.len() + 1,
-            BackendMessage::ReadyForQuery { .. } => 1,
-            BackendMessage::ErrorResponse { fields } => {
-                fields.iter().map(|f| f.encoded_len()).sum::<usize>() + 1
-            }
-            BackendMessage::RowDescription { fields } => {
-                2 + fields.iter().map(|f| f.encoded_len()).sum::<usize>()
-            }
-            BackendMessage::DataRow { values } => {
-                2 + values.iter().map(|v| v.encoded_len()).sum::<usize>()
-            }
-            BackendMessage::CommandComplete { tag } => tag.len() + 1,
-            BackendMessage::EmptyQueryResponse => 0,
-            BackendMessage::ParseComplete => 0,
-            BackendMessage::BindComplete => 0,
-            BackendMessage::CloseComplete => 0,
-            BackendMessage::NoData => 0,
-            BackendMessage::PortalSuspended => 0,
-            BackendMessage::ParameterDescription { param_types } => 2 + (param_types.len() * 4),
-        }
+    /// Encodes this message into the given BytesMut buffer.
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u8(self.ty());
+
+        let len_pos = dst.len();
+        dst.put_i32(0); // placeholder
+
+        self.encode_body(dst);
+
+        let total_len = (dst.len() - len_pos) as i32;
+        dst[len_pos..][..4].copy_from_slice(&total_len.to_be_bytes());
     }
 
-    /// Writes message header (type byte and length) to the stream.
-    async fn write_head<W: AsyncWrite + Unpin>(&self, w: &mut W) -> io::Result<()> {
-        w.write_u8(self.ty()).await?;
-        w.write_i32((4 + self.body_len()) as i32).await?;
-        Ok(())
-    }
-
-    /// Writes message body to the stream.
-    async fn write_body<W: AsyncWrite + Unpin>(&self, w: &mut W) -> io::Result<()> {
+    /// Encodes the body of this message into the given BytesMut buffer.
+    fn encode_body(&self, dst: &mut BytesMut) {
         match self {
             BackendMessage::AuthenticationOk => {
-                w.write_i32(0).await?; // auth type 0 = Ok
+                dst.put_i32(0); // auth type 0 = Ok
             }
             BackendMessage::BackendKeyData {
                 process_id,
                 secret_key,
             } => {
-                w.write_i32(*process_id).await?;
-                w.write_i32(*secret_key).await?;
+                dst.put_i32(*process_id);
+                dst.put_i32(*secret_key);
             }
             BackendMessage::ParameterStatus { name, value } => {
-                write_cstring(w, name).await?;
-                write_cstring(w, value).await?;
+                put_cstring(dst, name);
+                put_cstring(dst, value);
             }
             BackendMessage::ReadyForQuery { status } => {
-                w.write_u8(status.as_byte()).await?;
+                dst.put_u8(status.as_byte());
             }
             BackendMessage::ErrorResponse { fields } => {
                 for field in fields {
-                    field.write(w).await?;
+                    field.encode(dst);
                 }
-                w.write_u8(0).await?; // terminator
+                dst.put_u8(0); // terminator
             }
             BackendMessage::RowDescription { fields } => {
-                w.write_i16(fields.len() as i16).await?;
+                dst.put_i16(fields.len() as i16);
                 for field in fields {
-                    field.write(w).await?;
+                    field.encode(dst);
                 }
             }
             BackendMessage::DataRow { values } => {
-                w.write_i16(values.len() as i16).await?;
+                dst.put_i16(values.len() as i16);
                 for value in values {
-                    value.write(w).await?;
+                    value.encode(dst);
                 }
             }
             BackendMessage::CommandComplete { tag } => {
-                write_cstring(w, tag).await?;
+                put_cstring(dst, tag);
             }
             BackendMessage::EmptyQueryResponse
             | BackendMessage::ParseComplete
@@ -146,19 +123,29 @@ impl BackendMessage {
                 // No body for these messages
             }
             BackendMessage::ParameterDescription { param_types } => {
-                w.write_i16(param_types.len() as i16).await?;
+                dst.put_i16(param_types.len() as i16);
                 for oid in param_types {
-                    w.write_i32(*oid).await?;
+                    dst.put_i32(*oid);
                 }
             }
         }
+    }
+}
+
+impl Encoder<BackendMessage> for StartupCodec {
+    type Error = io::Error;
+
+    fn encode(&mut self, msg: BackendMessage, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        msg.encode(dst);
         Ok(())
     }
+}
 
-    /// Writes this message to the stream.
-    pub async fn write<W: AsyncWrite + Unpin>(&self, w: &mut W) -> io::Result<()> {
-        self.write_head(w).await?;
-        self.write_body(w).await?;
+impl Encoder<BackendMessage> for PostgresCodec {
+    type Error = io::Error;
+
+    fn encode(&mut self, msg: BackendMessage, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        msg.encode(dst);
         Ok(())
     }
 }
@@ -192,16 +179,10 @@ pub struct ErrorField {
 }
 
 impl ErrorField {
-    /// Returns the encoded length of this field in bytes (code + value + null terminator).
-    fn encoded_len(&self) -> usize {
-        1 + self.value.len() + 1
-    }
-
-    /// Writes this field to the stream.
-    async fn write<W: AsyncWrite + Unpin>(&self, w: &mut W) -> io::Result<()> {
-        w.write_u8(self.code).await?;
-        write_cstring(w, &self.value).await?;
-        Ok(())
+    /// Encodes this error field into the given BytesMut buffer.
+    fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u8(self.code);
+        put_cstring(dst, &self.value);
     }
 }
 
@@ -215,26 +196,15 @@ pub enum DataValue {
 }
 
 impl DataValue {
-    /// Returns the encoded length of this value in bytes (length field + data).
-    fn encoded_len(&self) -> usize {
+    /// Encodes this data value into the given BytesMut buffer.
+    fn encode(&self, dst: &mut BytesMut) {
         match self {
-            DataValue::Null => 4,                        // length field only
-            DataValue::Binary(bytes) => 4 + bytes.len(), // length + data
-        }
-    }
-
-    /// Writes this value to the stream.
-    async fn write<W: AsyncWrite + Unpin>(&self, w: &mut W) -> io::Result<()> {
-        match self {
-            DataValue::Null => {
-                w.write_i32(-1).await?;
-            }
+            DataValue::Null => dst.put_i32(-1),
             DataValue::Binary(bytes) => {
-                w.write_i32(bytes.len() as i32).await?;
-                w.write_all(bytes).await?;
+                dst.put_i32(bytes.len() as i32);
+                dst.put_slice(bytes);
             }
         }
-        Ok(())
     }
 }
 
@@ -258,33 +228,30 @@ pub struct FieldDescription {
 }
 
 impl FieldDescription {
-    /// Returns the encoded length of this field in bytes.
-    fn encoded_len(&self) -> usize {
-        self.name.len() + 1 + 4 + 2 + 4 + 2 + 4 + 2
-    }
-
-    /// Writes this field to the stream.
-    async fn write<W: AsyncWrite + Unpin>(&self, w: &mut W) -> io::Result<()> {
-        write_cstring(w, &self.name).await?;
-        w.write_i32(self.table_oid).await?;
-        w.write_i16(self.column_id).await?;
-        w.write_i32(self.type_oid).await?;
-        w.write_i16(self.type_size).await?;
-        w.write_i32(self.type_modifier).await?;
-        w.write_i16(self.format_code).await?;
-        Ok(())
+    /// Encodes this field description into the given BytesMut buffer.
+    fn encode(&self, dst: &mut BytesMut) {
+        put_cstring(dst, &self.name);
+        dst.put_i32(self.table_oid);
+        dst.put_i16(self.column_id);
+        dst.put_i32(self.type_oid);
+        dst.put_i16(self.type_size);
+        dst.put_i32(self.type_modifier);
+        dst.put_i16(self.format_code);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BytesMut;
+    use tokio_util::codec::Encoder;
 
-    /// Helper to write a message and return the buffer.
-    async fn write_message(msg: &BackendMessage) -> Vec<u8> {
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
-        buf
+    /// Helper to encode a message and return the buffer.
+    fn encode_message(msg: BackendMessage) -> Vec<u8> {
+        let mut codec = PostgresCodec::new();
+        let mut buf = BytesMut::new();
+        codec.encode(msg, &mut buf).unwrap();
+        buf.to_vec()
     }
 
     /// Helper to read i32 from buffer at offset.
@@ -302,20 +269,20 @@ mod tests {
         i16::from_be_bytes([buf[offset], buf[offset + 1]])
     }
 
-    #[tokio::test]
-    async fn test_write_authentication_ok() {
+    #[test]
+    fn test_write_authentication_ok() {
         let msg = BackendMessage::AuthenticationOk;
-        let buf = write_message(&msg).await;
+        let buf = encode_message(msg);
         assert_eq!(buf, vec![b'R', 0, 0, 0, 8, 0, 0, 0, 0]);
     }
 
-    #[tokio::test]
-    async fn test_write_backend_key_data() {
+    #[test]
+    fn test_write_backend_key_data() {
         let msg = BackendMessage::BackendKeyData {
             process_id: 12345,
             secret_key: 67890,
         };
-        let buf = write_message(&msg).await;
+        let buf = encode_message(msg);
 
         assert_eq!(buf[0], b'K');
         assert_eq!(read_i32(&buf, 1), 12); // length = 4 + 8 = 12
@@ -323,30 +290,30 @@ mod tests {
         assert_eq!(read_i32(&buf, 9), 67890); // secret_key
     }
 
-    #[tokio::test]
-    async fn test_write_parameter_status() {
+    #[test]
+    fn test_write_parameter_status() {
         let msg = BackendMessage::ParameterStatus {
             name: "server_version".to_string(),
             value: "16.0".to_string(),
         };
-        let buf = write_message(&msg).await;
+        let buf = encode_message(msg);
 
         assert_eq!(buf[0], b'S');
         assert_eq!(read_i32(&buf, 1), 24); // length = 4 + 15 + 5 = 24
-        assert_eq!(&buf[5..], b"server_version\016.0\0");
+        assert_eq!(&buf[5..], b"server_version\x0016.0\x00");
     }
 
-    #[tokio::test]
-    async fn test_write_ready_for_query() {
+    #[test]
+    fn test_write_ready_for_query() {
         let msg = BackendMessage::ReadyForQuery {
             status: TransactionStatus::Idle,
         };
-        let buf = write_message(&msg).await;
+        let buf = encode_message(msg);
         assert_eq!(buf, vec![b'Z', 0, 0, 0, 5, b'I']);
     }
 
-    #[tokio::test]
-    async fn test_write_error_response() {
+    #[test]
+    fn test_write_error_response() {
         let msg = BackendMessage::ErrorResponse {
             fields: vec![
                 ErrorField {
@@ -363,23 +330,23 @@ mod tests {
                 },
             ],
         };
-        let buf = write_message(&msg).await;
+        let buf = encode_message(msg);
 
         assert_eq!(buf[0], b'E');
         assert_eq!(read_i32(&buf, 1), 41); // 4 + (7 + 7 + 22 + 1)
 
         // Verify fields
         assert_eq!(buf[5], b'S');
-        assert_eq!(&buf[6..12], b"ERROR\0");
+        assert_eq!(&buf[6..12], b"ERROR\x00");
         assert_eq!(buf[12], b'C');
-        assert_eq!(&buf[13..19], b"42P01\0");
+        assert_eq!(&buf[13..19], b"42P01\x00");
         assert_eq!(buf[19], b'M');
-        assert_eq!(&buf[20..41], b"table does not exist\0");
+        assert_eq!(&buf[20..41], b"table does not exist\x00");
         assert_eq!(buf[41], 0); // terminator
     }
 
-    #[tokio::test]
-    async fn test_write_row_description() {
+    #[test]
+    fn test_write_row_description() {
         let msg = BackendMessage::RowDescription {
             fields: vec![
                 FieldDescription {
@@ -411,14 +378,14 @@ mod tests {
                 },
             ],
         };
-        let buf = write_message(&msg).await;
+        let buf = encode_message(msg);
 
         assert_eq!(buf[0], b'T');
         assert_eq!(read_i16(&buf, 5), 3); // field count
     }
 
-    #[tokio::test]
-    async fn test_write_data_row() {
+    #[test]
+    fn test_write_data_row() {
         let msg = BackendMessage::DataRow {
             values: vec![
                 DataValue::Binary(b"hello".to_vec()), // non-empty value
@@ -426,7 +393,7 @@ mod tests {
                 DataValue::Null,                      // NULL
             ],
         };
-        let buf = write_message(&msg).await;
+        let buf = encode_message(msg);
 
         assert_eq!(buf[0], b'D');
         assert_eq!(read_i16(&buf, 5), 3); // column count
@@ -438,66 +405,66 @@ mod tests {
         assert_eq!(read_i32(&buf, 20), -1); // NULL
     }
 
-    #[tokio::test]
-    async fn test_write_command_complete() {
+    #[test]
+    fn test_write_command_complete() {
         let msg = BackendMessage::CommandComplete {
             tag: "SELECT 1".to_string(),
         };
-        let buf = write_message(&msg).await;
+        let buf = encode_message(msg);
 
         assert_eq!(buf[0], b'C');
         assert_eq!(read_i32(&buf, 1), 13); // 4 + 9
-        assert_eq!(&buf[5..], b"SELECT 1\0");
+        assert_eq!(&buf[5..], b"SELECT 1\x00");
     }
 
-    #[tokio::test]
-    async fn test_write_empty_query_response() {
+    #[test]
+    fn test_write_empty_query_response() {
         let msg = BackendMessage::EmptyQueryResponse;
-        let buf = write_message(&msg).await;
+        let buf = encode_message(msg);
         assert_eq!(buf, vec![b'I', 0, 0, 0, 4]);
     }
 
-    #[tokio::test]
-    async fn test_write_parse_complete() {
+    #[test]
+    fn test_write_parse_complete() {
         let msg = BackendMessage::ParseComplete;
-        let buf = write_message(&msg).await;
+        let buf = encode_message(msg);
         assert_eq!(buf, vec![b'1', 0, 0, 0, 4]);
     }
 
-    #[tokio::test]
-    async fn test_write_bind_complete() {
+    #[test]
+    fn test_write_bind_complete() {
         let msg = BackendMessage::BindComplete;
-        let buf = write_message(&msg).await;
+        let buf = encode_message(msg);
         assert_eq!(buf, vec![b'2', 0, 0, 0, 4]);
     }
 
-    #[tokio::test]
-    async fn test_write_close_complete() {
+    #[test]
+    fn test_write_close_complete() {
         let msg = BackendMessage::CloseComplete;
-        let buf = write_message(&msg).await;
+        let buf = encode_message(msg);
         assert_eq!(buf, vec![b'3', 0, 0, 0, 4]);
     }
 
-    #[tokio::test]
-    async fn test_write_no_data() {
+    #[test]
+    fn test_write_no_data() {
         let msg = BackendMessage::NoData;
-        let buf = write_message(&msg).await;
+        let buf = encode_message(msg);
         assert_eq!(buf, vec![b'n', 0, 0, 0, 4]);
     }
 
-    #[tokio::test]
-    async fn test_write_portal_suspended() {
+    #[test]
+    fn test_write_portal_suspended() {
         let msg = BackendMessage::PortalSuspended;
-        let buf = write_message(&msg).await;
+        let buf = encode_message(msg);
         assert_eq!(buf, vec![b's', 0, 0, 0, 4]);
     }
 
-    #[tokio::test]
-    async fn test_write_parameter_description() {
+    #[test]
+    fn test_write_parameter_description() {
         let msg = BackendMessage::ParameterDescription {
             param_types: vec![23, 25, 1043], // INT4, TEXT, VARCHAR
         };
-        let buf = write_message(&msg).await;
+        let buf = encode_message(msg);
 
         assert_eq!(buf[0], b't');
         assert_eq!(read_i32(&buf, 1), 18); // 4 + 2 + 3*4
