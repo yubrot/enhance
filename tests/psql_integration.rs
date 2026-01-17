@@ -150,3 +150,62 @@ async fn test_psql_empty_query() {
     let result = server.run_psql(";\\q");
     result.assert_success();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_extended_parse_bind_execute() {
+    let server = PsqlTestServer::start().await;
+
+    let result = server.run_psql(
+        r#"
+SELECT $1::int \parse stmt1
+\bind_named stmt1 42 \g
+\q"#,
+    );
+    result.assert_success();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_extended_rebind_execute() {
+    let server = PsqlTestServer::start().await;
+
+    let result = server.run_psql(
+        r#"
+SELECT $1::int \parse stmt1
+\bind_named stmt1 1 \g
+\bind_named stmt1 2 \g
+\bind_named stmt1 3 \g
+\q"#,
+    );
+    result.assert_success();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_extended_close_prepared() {
+    let server = PsqlTestServer::start().await;
+
+    let result = server.run_psql(
+        r#"
+SELECT 1 \parse stmt1
+\close_prepared stmt1
+\q"#,
+    );
+    result.assert_success();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_extended_error_recovery() {
+    let server = PsqlTestServer::start().await;
+
+    // Cause an error by binding to nonexistent statement,
+    // then verify that subsequent commands work after Sync
+    let result = server.run_psql(
+        r#"
+\bind_named nonexistent 42 \g
+SELECT 1 \parse stmt1
+\bind_named stmt1 \g
+\q"#,
+    );
+    // The first bind fails with error, but Sync resets error state,
+    // so subsequent parse/bind/execute succeed
+    result.assert_success();
+}

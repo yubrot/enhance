@@ -1,7 +1,41 @@
-use crate::protocol::codec::{PostgresCodec, StartupCodec, put_cstring};
 use bytes::{BufMut, BytesMut};
 use std::io;
 use tokio_util::codec::Encoder;
+
+use crate::protocol::codec::{PostgresCodec, StartupCodec, put_cstring};
+use crate::protocol::types::{ErrorFieldCode, FormatCode};
+
+/// SQL State codes for error responses.
+///
+/// References:
+/// - <https://www.postgresql.org/docs/current/errcodes-appendix.html>
+pub mod sql_state {
+    // Class 08 - Connection Exception
+    /// Connection exception (generic)
+    pub const CONNECTION_EXCEPTION: &str = "08000";
+
+    // Class 26 - Invalid SQL Statement Name
+    /// Invalid SQL statement name (e.g., prepared statement does not exist)
+    pub const INVALID_SQL_STATEMENT_NAME: &str = "26000";
+
+    // Class 34 - Invalid Cursor Name
+    /// Invalid cursor name (e.g., portal/cursor does not exist)
+    pub const INVALID_CURSOR_NAME: &str = "34000";
+
+    // Class 42 - Syntax Error or Access Rule Violation
+    /// Syntax error
+    pub const SYNTAX_ERROR: &str = "42601";
+    /// Undefined table
+    pub const UNDEFINED_TABLE: &str = "42P01";
+    /// Undefined column
+    pub const UNDEFINED_COLUMN: &str = "42703";
+    /// Undefined function
+    pub const UNDEFINED_FUNCTION: &str = "42883";
+
+    // Class XX - Internal Error
+    /// Internal error
+    pub const INTERNAL_ERROR: &str = "XX000";
+}
 
 /// Messages sent by the backend (server) to the client.
 #[derive(Debug)]
@@ -24,9 +58,56 @@ pub enum BackendMessage {
     CommandComplete { tag: String },
     /// 'I' - Empty query response
     EmptyQueryResponse,
+    /// '1' - Parse complete
+    ParseComplete,
+    /// '2' - Bind complete
+    BindComplete,
+    /// '3' - Close complete
+    CloseComplete,
+    /// 'n' - No data
+    NoData,
+    /// 's' - Portal suspended
+    PortalSuspended,
+    /// 't' - Parameter description
+    ParameterDescription { param_types: Vec<i32> },
 }
 
 impl BackendMessage {
+    /// Creates an error response with the given SQL state code and message.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use crate::protocol::{BackendMessage, sql_state};
+    ///
+    /// let msg = BackendMessage::error(
+    ///     sql_state::SYNTAX_ERROR,
+    ///     format!("Unrecognized query type: {}", query)
+    /// );
+    /// ```
+    pub fn error(sql_state: &str, message: impl Into<String>) -> Self {
+        BackendMessage::ErrorResponse {
+            fields: vec![
+                ErrorField {
+                    code: ErrorFieldCode::Severity,
+                    value: "ERROR".to_string(),
+                },
+                ErrorField {
+                    code: ErrorFieldCode::SeverityNonLocalized,
+                    value: "ERROR".to_string(),
+                },
+                ErrorField {
+                    code: ErrorFieldCode::SqlState,
+                    value: sql_state.to_string(),
+                },
+                ErrorField {
+                    code: ErrorFieldCode::Message,
+                    value: message.into(),
+                },
+            ],
+        }
+    }
+
     /// Returns the message type byte.
     fn ty(&self) -> u8 {
         match self {
@@ -39,6 +120,12 @@ impl BackendMessage {
             BackendMessage::DataRow { .. } => b'D',
             BackendMessage::CommandComplete { .. } => b'C',
             BackendMessage::EmptyQueryResponse => b'I',
+            BackendMessage::ParseComplete => b'1',
+            BackendMessage::BindComplete => b'2',
+            BackendMessage::CloseComplete => b'3',
+            BackendMessage::NoData => b'n',
+            BackendMessage::PortalSuspended => b's',
+            BackendMessage::ParameterDescription { .. } => b't',
         }
     }
 
@@ -96,8 +183,19 @@ impl BackendMessage {
             BackendMessage::CommandComplete { tag } => {
                 put_cstring(dst, tag);
             }
-            BackendMessage::EmptyQueryResponse => {
+            BackendMessage::EmptyQueryResponse
+            | BackendMessage::ParseComplete
+            | BackendMessage::BindComplete
+            | BackendMessage::CloseComplete
+            | BackendMessage::NoData
+            | BackendMessage::PortalSuspended => {
                 // No body for these messages
+            }
+            BackendMessage::ParameterDescription { param_types } => {
+                dst.put_i16(param_types.len() as i16);
+                for oid in param_types {
+                    dst.put_i32(*oid);
+                }
             }
         }
     }
@@ -142,17 +240,17 @@ impl TransactionStatus {
     }
 }
 
-/// Error/Notice field codes.
+/// Error/Notice field.
 #[derive(Debug)]
 pub struct ErrorField {
-    pub code: u8,
+    pub code: ErrorFieldCode,
     pub value: String,
 }
 
 impl ErrorField {
     /// Encodes this error field into the given BytesMut buffer.
     fn encode(&self, dst: &mut BytesMut) {
-        dst.put_u8(self.code);
+        dst.put_u8(self.code.as_u8());
         put_cstring(dst, &self.value);
     }
 }
@@ -194,8 +292,8 @@ pub struct FieldDescription {
     pub type_size: i16,
     /// Type modifier (-1 if not applicable)
     pub type_modifier: i32,
-    /// Format code (0 = text, 1 = binary)
-    pub format_code: i16,
+    /// Format code
+    pub format_code: FormatCode,
 }
 
 impl FieldDescription {
@@ -207,7 +305,7 @@ impl FieldDescription {
         dst.put_i32(self.type_oid);
         dst.put_i16(self.type_size);
         dst.put_i32(self.type_modifier);
-        dst.put_i16(self.format_code);
+        dst.put_i16(self.format_code.as_i16());
     }
 }
 
@@ -216,6 +314,8 @@ mod tests {
     use super::*;
     use bytes::BytesMut;
     use tokio_util::codec::Encoder;
+
+    use crate::protocol::type_oid;
 
     /// Helper to encode a message and return the buffer.
     fn encode_message(msg: BackendMessage) -> Vec<u8> {
@@ -285,35 +385,22 @@ mod tests {
 
     #[test]
     fn test_write_error_response() {
-        let msg = BackendMessage::ErrorResponse {
-            fields: vec![
-                ErrorField {
-                    code: b'S',
-                    value: "ERROR".to_string(),
-                },
-                ErrorField {
-                    code: b'C',
-                    value: "42P01".to_string(),
-                },
-                ErrorField {
-                    code: b'M',
-                    value: "table does not exist".to_string(),
-                },
-            ],
-        };
+        let msg = BackendMessage::error(sql_state::UNDEFINED_TABLE, "table does not exist");
         let buf = encode_message(msg);
 
         assert_eq!(buf[0], b'E');
-        assert_eq!(read_i32(&buf, 1), 41); // 4 + (7 + 7 + 22 + 1)
+        assert_eq!(read_i32(&buf, 1), 48); // 4 + (7 + 7 + 7 + 22 + 1)
 
         // Verify fields
-        assert_eq!(buf[5], b'S');
+        assert_eq!(buf[5], b'S'); // Severity
         assert_eq!(&buf[6..12], b"ERROR\x00");
-        assert_eq!(buf[12], b'C');
-        assert_eq!(&buf[13..19], b"42P01\x00");
-        assert_eq!(buf[19], b'M');
-        assert_eq!(&buf[20..41], b"table does not exist\x00");
-        assert_eq!(buf[41], 0); // terminator
+        assert_eq!(buf[12], b'V'); // SeverityNonLocalized
+        assert_eq!(&buf[13..19], b"ERROR\x00");
+        assert_eq!(buf[19], b'C'); // SqlState
+        assert_eq!(&buf[20..26], b"42P01\x00");
+        assert_eq!(buf[26], b'M'); // Message
+        assert_eq!(&buf[27..48], b"table does not exist\x00");
+        assert_eq!(buf[48], 0); // terminator
     }
 
     #[test]
@@ -324,28 +411,28 @@ mod tests {
                     name: "col".to_string(),
                     table_oid: 0,
                     column_id: 0,
-                    type_oid: 23, // INT4
+                    type_oid: type_oid::INT4,
                     type_size: 4,
                     type_modifier: -1,
-                    format_code: 0,
+                    format_code: FormatCode::Text,
                 },
                 FieldDescription {
                     name: "text_col".to_string(),
                     table_oid: 16384,
                     column_id: 2,
-                    type_oid: 25, // TEXT (variable length)
+                    type_oid: type_oid::TEXT,
                     type_size: -1,
                     type_modifier: -1,
-                    format_code: 0,
+                    format_code: FormatCode::Text,
                 },
                 FieldDescription {
                     name: "binary_col".to_string(),
                     table_oid: 16384,
                     column_id: 3,
-                    type_oid: 17, // BYTEA
+                    type_oid: type_oid::BYTEA,
                     type_size: -1,
                     type_modifier: -1,
-                    format_code: 1, // binary format
+                    format_code: FormatCode::Binary,
                 },
             ],
         };
@@ -393,5 +480,55 @@ mod tests {
         let msg = BackendMessage::EmptyQueryResponse;
         let buf = encode_message(msg);
         assert_eq!(buf, vec![b'I', 0, 0, 0, 4]);
+    }
+
+    #[test]
+    fn test_write_parse_complete() {
+        let msg = BackendMessage::ParseComplete;
+        let buf = encode_message(msg);
+        assert_eq!(buf, vec![b'1', 0, 0, 0, 4]);
+    }
+
+    #[test]
+    fn test_write_bind_complete() {
+        let msg = BackendMessage::BindComplete;
+        let buf = encode_message(msg);
+        assert_eq!(buf, vec![b'2', 0, 0, 0, 4]);
+    }
+
+    #[test]
+    fn test_write_close_complete() {
+        let msg = BackendMessage::CloseComplete;
+        let buf = encode_message(msg);
+        assert_eq!(buf, vec![b'3', 0, 0, 0, 4]);
+    }
+
+    #[test]
+    fn test_write_no_data() {
+        let msg = BackendMessage::NoData;
+        let buf = encode_message(msg);
+        assert_eq!(buf, vec![b'n', 0, 0, 0, 4]);
+    }
+
+    #[test]
+    fn test_write_portal_suspended() {
+        let msg = BackendMessage::PortalSuspended;
+        let buf = encode_message(msg);
+        assert_eq!(buf, vec![b's', 0, 0, 0, 4]);
+    }
+
+    #[test]
+    fn test_write_parameter_description() {
+        let msg = BackendMessage::ParameterDescription {
+            param_types: vec![type_oid::INT4, type_oid::TEXT, type_oid::VARCHAR],
+        };
+        let buf = encode_message(msg);
+
+        assert_eq!(buf[0], b't');
+        assert_eq!(read_i32(&buf, 1), 18); // 4 + 2 + 3*4
+        assert_eq!(read_i16(&buf, 5), 3); // param count
+        assert_eq!(read_i32(&buf, 7), type_oid::INT4);
+        assert_eq!(read_i32(&buf, 11), type_oid::TEXT);
+        assert_eq!(read_i32(&buf, 15), type_oid::VARCHAR);
     }
 }

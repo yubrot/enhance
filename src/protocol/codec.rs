@@ -25,6 +25,32 @@ pub fn get_cstring(src: &mut BytesMut) -> Result<String, ProtocolError> {
     String::from_utf8(bytes.to_vec()).map_err(ProtocolError::InvalidUtf8)
 }
 
+/// Read a nullable byte array from a BytesMut buffer.
+/// Returns an error if there's not enough data.
+/// Returns None if the value is SQL NULL (length = -1).
+/// Returns Some(Vec<u8>) if the value is present.
+///
+/// Wire format: Int32 length (-1 for NULL, >= 0 for data), followed by data bytes if length >= 0
+pub fn get_nullable_bytes(src: &mut BytesMut) -> Result<Option<Vec<u8>>, ProtocolError> {
+    // Need at least 4 bytes for the length
+    if src.len() < 4 {
+        return Err(ProtocolError::InvalidMessage);
+    }
+
+    let len = src.get_i32();
+    if len < 0 {
+        // SQL NULL
+        return Ok(None);
+    }
+
+    let len = len as usize;
+    if src.len() < len {
+        return Err(ProtocolError::InvalidMessage);
+    }
+    let bytes = src.split_to(len);
+    Ok(Some(bytes.to_vec()))
+}
+
 /// Write a null-terminated string to a BytesMut buffer.
 pub fn put_cstring(dst: &mut BytesMut, s: &str) {
     dst.put_slice(s.as_bytes());
@@ -95,6 +121,27 @@ mod tests {
     fn test_get_cstring_incomplete() {
         let mut buf = BytesMut::from(&b"hello"[..]);
         assert!(get_cstring(&mut buf).is_err());
+    }
+
+    #[test]
+    fn test_get_nullable_bytes_null() {
+        let mut buf = BytesMut::from(&[0xFF, 0xFF, 0xFF, 0xFF][..]); // -1
+        assert_eq!(get_nullable_bytes(&mut buf).unwrap(), None);
+    }
+
+    #[test]
+    fn test_get_nullable_bytes_data() {
+        let mut buf = BytesMut::from(&[0, 0, 0, 5, b'h', b'e', b'l', b'l', b'o'][..]);
+        assert_eq!(
+            get_nullable_bytes(&mut buf).unwrap(),
+            Some(b"hello".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_get_nullable_bytes_incomplete() {
+        let mut buf = BytesMut::from(&[0, 0, 0, 10, b'h', b'i'][..]); // Says 10 bytes, only 2 available
+        assert!(get_nullable_bytes(&mut buf).is_err());
     }
 
     #[test]
