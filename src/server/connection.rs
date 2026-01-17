@@ -159,50 +159,60 @@ impl Connection {
             Some("SELECT 0") => {
                 // SELECT: return empty result set
                 // https://www.postgresql.org/docs/current/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-COMMANDCOMPLETE
-                self.framed.send(BackendMessage::RowDescription { fields: vec![] }).await?;
-                self.framed.send(BackendMessage::CommandComplete {
-                    tag: "SELECT 0".to_string(),
-                }).await?;
+                self.framed
+                    .send(BackendMessage::RowDescription { fields: vec![] })
+                    .await?;
+                self.framed
+                    .send(BackendMessage::CommandComplete {
+                        tag: "SELECT 0".to_string(),
+                    })
+                    .await?;
             }
             Some("OK") => {
                 // Unknown query type - return error
                 // https://www.postgresql.org/docs/current/protocol-error-fields.html
-                self.framed.send(BackendMessage::ErrorResponse {
-                    fields: vec![
-                        ErrorField {
-                            code: b'S',
-                            value: "ERROR".to_string(),
-                        },
-                        ErrorField {
-                            code: b'V',
-                            value: "ERROR".to_string(),
-                        },
-                        ErrorField {
-                            code: b'C',
-                            value: "42601".to_string(), // syntax_error
-                        },
-                        ErrorField {
-                            code: b'M',
-                            value: format!(
-                                "Unrecognized query type: {}",
-                                query.chars().take(50).collect::<String>()
-                            ),
-                        },
-                    ],
-                }).await?;
+                self.framed
+                    .send(BackendMessage::ErrorResponse {
+                        fields: vec![
+                            ErrorField {
+                                code: b'S',
+                                value: "ERROR".to_string(),
+                            },
+                            ErrorField {
+                                code: b'V',
+                                value: "ERROR".to_string(),
+                            },
+                            ErrorField {
+                                code: b'C',
+                                value: "42601".to_string(), // syntax_error
+                            },
+                            ErrorField {
+                                code: b'M',
+                                value: format!(
+                                    "Unrecognized query type: {}",
+                                    query.chars().take(50).collect::<String>()
+                                ),
+                            },
+                        ],
+                    })
+                    .await?;
             }
             Some(tag) => {
                 // All other recognized query types
-                self.framed.send(BackendMessage::CommandComplete {
-                    tag: tag.to_string(),
-                }).await?;
+                self.framed
+                    .send(BackendMessage::CommandComplete {
+                        tag: tag.to_string(),
+                    })
+                    .await?;
             }
         }
 
         // Always send ReadyForQuery after response
-        self.framed.send(BackendMessage::ReadyForQuery {
-            status: TransactionStatus::Idle,
-        }).await?;
+        self.framed
+            .send(BackendMessage::ReadyForQuery {
+                status: TransactionStatus::Idle,
+            })
+            .await?;
 
         self.framed.flush().await?;
         Ok(())
@@ -272,9 +282,11 @@ impl Connection {
             DescribeTarget::Statement => {
                 if let Some(stmt) = self.state.get_statement(&msg.name) {
                     // Send ParameterDescription
-                    self.framed.send(BackendMessage::ParameterDescription {
-                        param_types: stmt.param_types.clone(),
-                    }).await?;
+                    self.framed
+                        .send(BackendMessage::ParameterDescription {
+                            param_types: stmt.param_types.clone(),
+                        })
+                        .await?;
 
                     // For stub: Send NoData (no result columns yet)
                     // NOTE: Real implementation analyzes query to determine columns
@@ -339,9 +351,11 @@ impl Connection {
             }
             Some(tag) => {
                 // All query types return CommandComplete (errors ignored in extended protocol)
-                self.framed.send(BackendMessage::CommandComplete {
-                    tag: tag.to_string(),
-                }).await?;
+                self.framed
+                    .send(BackendMessage::CommandComplete {
+                        tag: tag.to_string(),
+                    })
+                    .await?;
             }
         }
 
@@ -376,9 +390,11 @@ impl Connection {
         self.state.clear_unnamed();
 
         // Send ReadyForQuery
-        self.framed.send(BackendMessage::ReadyForQuery {
-            status: TransactionStatus::Idle,
-        }).await?;
+        self.framed
+            .send(BackendMessage::ReadyForQuery {
+                status: TransactionStatus::Idle,
+            })
+            .await?;
 
         self.framed.flush().await?;
         Ok(())
@@ -390,26 +406,28 @@ impl Connection {
         code: &str,
         message: impl Into<String>,
     ) -> Result<(), ConnectionError> {
-        self.framed.send(BackendMessage::ErrorResponse {
-            fields: vec![
-                ErrorField {
-                    code: b'S',
-                    value: "ERROR".to_string(),
-                },
-                ErrorField {
-                    code: b'V',
-                    value: "ERROR".to_string(),
-                },
-                ErrorField {
-                    code: b'C',
-                    value: code.to_string(),
-                },
-                ErrorField {
-                    code: b'M',
-                    value: message.into(),
-                },
-            ],
-        }).await?;
+        self.framed
+            .send(BackendMessage::ErrorResponse {
+                fields: vec![
+                    ErrorField {
+                        code: b'S',
+                        value: "ERROR".to_string(),
+                    },
+                    ErrorField {
+                        code: b'V',
+                        value: "ERROR".to_string(),
+                    },
+                    ErrorField {
+                        code: b'C',
+                        value: code.to_string(),
+                    },
+                    ErrorField {
+                        code: b'M',
+                        value: message.into(),
+                    },
+                ],
+            })
+            .await?;
         Ok(())
     }
 }
