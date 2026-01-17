@@ -57,43 +57,12 @@ sequenceDiagram
 
 Extended Query Protocol adds 6 new message types from the client:
 
-#### 'P' - Parse
-
-Creates a prepared statement from an SQL query string. Contains the statement name (empty string = unnamed), SQL query (may contain `$1`, `$2`... placeholders), and optional parameter type OIDs.
-
-**Key insight**: The unnamed statement (`""`) is automatically closed at the next `Sync` message, while named statements persist across queries until explicitly closed.
-
-#### 'B' - Bind
-
-Binds parameter values to a prepared statement to create a portal (execution-ready cursor). Contains portal name, statement name, parameter format codes, parameter values, and result format codes.
-
-**Key insight**: Parameters can be sent in text or binary format per-parameter. A length of `-1` indicates SQL NULL.
-
-#### 'D' - Describe
-
-Requests metadata about a prepared statement (`'S'`) or portal (`'P'`).
-
-**Response**: For statements, server sends `ParameterDescription` (param types) + `RowDescription` or `NoData`. For portals, just `RowDescription` or `NoData`. Notice that current implementation always sends `NoData` (stub). Real implementation (Week 13-14) will analyze the query and send `RowDescription` for SELECT queries, `NoData` for INSERT/UPDATE/DELETE.
-
-#### 'E' - Execute
-
-Executes a portal and returns results. Contains portal name and maximum rows to return (0 = unlimited).
-
-**Key insight**: `max_rows` enables partial execution. The server sends `PortalSuspended` if more rows remain, allowing clients to fetch results incrementally.
-
-#### 'C' - Close
-
-Explicitly closes a prepared statement (`'S'`) or portal (`'P'`).
-
-#### 'S' - Sync
-
-Marks the end of an extended query cycle. The server:
-
-1. Clears the unnamed statement and portal
-2. Sends `ReadyForQuery` to signal completion
-3. Flushes the output buffer
-
-This is the synchronization point where errors are guaranteed to be reported.
+- **'P' (Parse)**: Creates a prepared statement from SQL query. Contains statement name (empty = unnamed), query text (may contain `$1`, `$2`... placeholders), and parameter type OIDs. Unnamed statements are cleared at `Sync`.
+- **'B' (Bind)**: Binds parameter values to a prepared statement, creating a portal. Contains portal name, statement name, parameter formats/values, and result formats. Parameter length `-1` indicates NULL.
+- **'D' (Describe)**: Requests metadata about a prepared statement (`'S'`) or portal (`'P'`). Server responds with `ParameterDescription` + `RowDescription`/`NoData` for statements, or just `RowDescription`/`NoData` for portals.
+- **'E' (Execute)**: Executes a portal and returns results. Contains portal name and `max_rows` (0 = unlimited). Server sends `PortalSuspended` if more rows remain.
+- **'C' (Close)**: Explicitly closes a prepared statement (`'S'`) or portal (`'P'`).
+- **'S' (Sync)**: Marks end of extended query cycle. Server clears unnamed statement/portal, sends `ReadyForQuery`, and flushes output. Synchronization point where errors are guaranteed to be reported.
 
 ### Backend Messages Implemented
 
@@ -111,14 +80,6 @@ Implemented per-connection state management with `ConnectionState` that tracks:
 
 - **PreparedStatement**: Stores the SQL query and parameter type OIDs
 - **Portal**: Stores the bound statement name, parameter values, and format codes
-
-### Type-Safe Protocol Values
-
-Refactored wire protocol constants into type-safe enums (`FormatCode`, `ErrorFieldCode`, `DescribeTarget`, `CloseTarget`):
-
-- **Compile-time safety**: Can't accidentally use invalid format codes
-- **Pattern matching**: Exhaustive match checks prevent missing cases
-- **Clear intent**: `FormatCode::Binary` is more readable than `1`
 
 ### Testing with psql
 
@@ -159,7 +120,7 @@ This design allows drivers to optimize simple queries (use unnamed) while suppor
 The Extended Query Protocol has different error semantics than Simple Query:
 
 - **Errors don't auto-flush**: Multiple commands can be pipelined before `Sync`
-- **Errors skip remaining messages**: If `Parse` fails, subsequent `Bind`/`Execute` are ignored until `Sync`
+- **Errors skip remaining messages**: If any message (e.g., `Parse`, `Bind`) fails, subsequent messages in the pipeline are ignored until `Sync`
 - **Sync resets state**: After `Sync`, the connection returns to `ReadyForQuery` even if earlier errors occurred
 
 This enables clients to pipeline multiple operations and handle errors in batch.
