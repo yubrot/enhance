@@ -10,3 +10,6 @@ futures-util = { version = "0.3", features = ["sink"] }
 rand = "0.8"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+
+[dev-dependencies]
+tempfile = "3"
