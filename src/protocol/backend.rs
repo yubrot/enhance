@@ -1,8 +1,41 @@
-use crate::protocol::codec::{PostgresCodec, StartupCodec, put_cstring};
-use crate::protocol::types::{ErrorFieldCode, FormatCode};
 use bytes::{BufMut, BytesMut};
 use std::io;
 use tokio_util::codec::Encoder;
+
+use crate::protocol::codec::{PostgresCodec, StartupCodec, put_cstring};
+use crate::protocol::types::{ErrorFieldCode, FormatCode};
+
+/// SQL State codes for error responses.
+///
+/// References:
+/// - <https://www.postgresql.org/docs/current/errcodes-appendix.html>
+pub mod sql_state {
+    // Class 08 - Connection Exception
+    /// Connection exception (generic)
+    pub const CONNECTION_EXCEPTION: &str = "08000";
+
+    // Class 26 - Invalid SQL Statement Name
+    /// Invalid SQL statement name (e.g., prepared statement does not exist)
+    pub const INVALID_SQL_STATEMENT_NAME: &str = "26000";
+
+    // Class 34 - Invalid Cursor Name
+    /// Invalid cursor name (e.g., portal/cursor does not exist)
+    pub const INVALID_CURSOR_NAME: &str = "34000";
+
+    // Class 42 - Syntax Error or Access Rule Violation
+    /// Syntax error
+    pub const SYNTAX_ERROR: &str = "42601";
+    /// Undefined table
+    pub const UNDEFINED_TABLE: &str = "42P01";
+    /// Undefined column
+    pub const UNDEFINED_COLUMN: &str = "42703";
+    /// Undefined function
+    pub const UNDEFINED_FUNCTION: &str = "42883";
+
+    // Class XX - Internal Error
+    /// Internal error
+    pub const INTERNAL_ERROR: &str = "XX000";
+}
 
 /// Messages sent by the backend (server) to the client.
 #[derive(Debug)]
@@ -40,6 +73,41 @@ pub enum BackendMessage {
 }
 
 impl BackendMessage {
+    /// Creates an error response with the given SQL state code and message.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use crate::protocol::{BackendMessage, sql_state};
+    ///
+    /// let msg = BackendMessage::error(
+    ///     sql_state::SYNTAX_ERROR,
+    ///     format!("Unrecognized query type: {}", query)
+    /// );
+    /// ```
+    pub fn error(sql_state: &str, message: impl Into<String>) -> Self {
+        BackendMessage::ErrorResponse {
+            fields: vec![
+                ErrorField {
+                    code: ErrorFieldCode::Severity,
+                    value: "ERROR".to_string(),
+                },
+                ErrorField {
+                    code: ErrorFieldCode::SeverityNonLocalized,
+                    value: "ERROR".to_string(),
+                },
+                ErrorField {
+                    code: ErrorFieldCode::SqlState,
+                    value: sql_state.to_string(),
+                },
+                ErrorField {
+                    code: ErrorFieldCode::Message,
+                    value: message.into(),
+                },
+            ],
+        }
+    }
+
     /// Returns the message type byte.
     fn ty(&self) -> u8 {
         match self {
@@ -317,35 +385,22 @@ mod tests {
 
     #[test]
     fn test_write_error_response() {
-        let msg = BackendMessage::ErrorResponse {
-            fields: vec![
-                ErrorField {
-                    code: ErrorFieldCode::Severity,
-                    value: "ERROR".to_string(),
-                },
-                ErrorField {
-                    code: ErrorFieldCode::SqlState,
-                    value: "42P01".to_string(),
-                },
-                ErrorField {
-                    code: ErrorFieldCode::Message,
-                    value: "table does not exist".to_string(),
-                },
-            ],
-        };
+        let msg = BackendMessage::error(sql_state::UNDEFINED_TABLE, "table does not exist");
         let buf = encode_message(msg);
 
         assert_eq!(buf[0], b'E');
-        assert_eq!(read_i32(&buf, 1), 41); // 4 + (7 + 7 + 22 + 1)
+        assert_eq!(read_i32(&buf, 1), 48); // 4 + (7 + 7 + 7 + 22 + 1)
 
         // Verify fields
-        assert_eq!(buf[5], b'S');
+        assert_eq!(buf[5], b'S'); // Severity
         assert_eq!(&buf[6..12], b"ERROR\x00");
-        assert_eq!(buf[12], b'C');
-        assert_eq!(&buf[13..19], b"42P01\x00");
-        assert_eq!(buf[19], b'M');
-        assert_eq!(&buf[20..41], b"table does not exist\x00");
-        assert_eq!(buf[41], 0); // terminator
+        assert_eq!(buf[12], b'V'); // SeverityNonLocalized
+        assert_eq!(&buf[13..19], b"ERROR\x00");
+        assert_eq!(buf[19], b'C'); // SqlState
+        assert_eq!(&buf[20..26], b"42P01\x00");
+        assert_eq!(buf[26], b'M'); // Message
+        assert_eq!(&buf[27..48], b"table does not exist\x00");
+        assert_eq!(buf[48], 0); // terminator
     }
 
     #[test]

@@ -11,8 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::protocol::{
     BackendMessage, BindMessage, CloseMessage, CloseTarget, DescribeMessage, DescribeTarget,
-    ErrorField, ErrorFieldCode, ExecuteMessage, FrontendMessage, ParseMessage, PostgresCodec,
-    TransactionStatus,
+    ExecuteMessage, FrontendMessage, ParseMessage, PostgresCodec, TransactionStatus, sql_state,
 };
 
 /// A single client connection.
@@ -26,7 +25,7 @@ use crate::protocol::{
 ///    - Support graceful shutdown notification from listener
 ///
 /// 2. Protocol Completeness:
-///    - Handle all frontend message types (currently only startup + terminate)
+///    - Handle all frontend message types
 ///    - Support COPY protocol for bulk data transfer
 pub struct Connection {
     framed: Framed<TcpStream, PostgresCodec>,
@@ -79,7 +78,7 @@ impl Connection {
             Some("ROLLBACK")
         } else {
             // Unknown query type
-            Some("OK")
+            Some("UNKNOWN")
         }
     }
 
@@ -111,38 +110,31 @@ impl Connection {
         match message {
             FrontendMessage::Query(query) => {
                 self.handle_query(query.trim()).await?;
-                Ok(false)
             }
-            FrontendMessage::Terminate => Ok(true),
+            FrontendMessage::Terminate => return Ok(true),
             FrontendMessage::Parse(msg) => {
                 self.handle_parse(msg).await?;
-                Ok(false)
             }
             FrontendMessage::Bind(msg) => {
                 self.handle_bind(msg).await?;
-                Ok(false)
             }
             FrontendMessage::Describe(msg) => {
                 self.handle_describe(msg).await?;
-                Ok(false)
             }
             FrontendMessage::Execute(msg) => {
                 self.handle_execute(msg).await?;
-                Ok(false)
             }
             FrontendMessage::Close(msg) => {
                 self.handle_close(msg).await?;
-                Ok(false)
             }
             FrontendMessage::Sync => {
                 self.handle_sync().await?;
-                Ok(false)
             }
             FrontendMessage::Flush => {
                 self.framed.flush().await?;
-                Ok(false)
             }
         }
+        Ok(false)
     }
 
     /// Handle a query from the client.
@@ -169,33 +161,17 @@ impl Connection {
                     })
                     .await?;
             }
-            Some("OK") => {
+            Some("UNKNOWN") => {
                 // Unknown query type - return error
                 // https://www.postgresql.org/docs/current/protocol-error-fields.html
                 self.framed
-                    .send(BackendMessage::ErrorResponse {
-                        fields: vec![
-                            ErrorField {
-                                code: ErrorFieldCode::Severity,
-                                value: "ERROR".to_string(),
-                            },
-                            ErrorField {
-                                code: ErrorFieldCode::SeverityNonLocalized,
-                                value: "ERROR".to_string(),
-                            },
-                            ErrorField {
-                                code: ErrorFieldCode::SqlState,
-                                value: "42601".to_string(), // syntax_error
-                            },
-                            ErrorField {
-                                code: ErrorFieldCode::Message,
-                                value: format!(
-                                    "Unrecognized query type: {}",
-                                    query.chars().take(50).collect::<String>()
-                                ),
-                            },
-                        ],
-                    })
+                    .send(BackendMessage::error(
+                        sql_state::SYNTAX_ERROR,
+                        format!(
+                            "Unrecognized query type: {}",
+                            query.chars().take(50).collect::<String>()
+                        ),
+                    ))
                     .await?;
             }
             Some(tag) => {
@@ -248,15 +224,16 @@ impl Connection {
 
         // Verify statement exists
         if self.state.get_statement(&msg.statement_name).is_none() {
-            return self
-                .send_error(
-                    "26000",
+            self.framed
+                .send(BackendMessage::error(
+                    sql_state::INVALID_SQL_STATEMENT_NAME,
                     format!(
                         "prepared statement \"{}\" does not exist",
                         msg.statement_name
                     ),
-                )
-                .await;
+                ))
+                .await?;
+            return Ok(());
         }
 
         // Create portal
@@ -281,35 +258,40 @@ impl Connection {
 
         match msg.target_type {
             DescribeTarget::Statement => {
-                if let Some(stmt) = self.state.get_statement(&msg.name) {
-                    // Send ParameterDescription
+                let Some(stmt) = self.state.get_statement(&msg.name) else {
                     self.framed
-                        .send(BackendMessage::ParameterDescription {
-                            param_types: stmt.param_types.clone(),
-                        })
-                        .await?;
-
-                    // For stub: Send NoData (no result columns yet)
-                    // NOTE: Real implementation analyzes query to determine columns
-                    self.framed.send(BackendMessage::NoData).await?;
-                } else {
-                    return self
-                        .send_error(
-                            "26000",
+                        .send(BackendMessage::error(
+                            sql_state::INVALID_SQL_STATEMENT_NAME,
                             format!("prepared statement \"{}\" does not exist", msg.name),
-                        )
-                        .await;
-                }
+                        ))
+                        .await?;
+                    return Ok(());
+                };
+
+                // Send ParameterDescription
+                self.framed
+                    .send(BackendMessage::ParameterDescription {
+                        param_types: stmt.param_types.clone(),
+                    })
+                    .await?;
+
+                // For stub: Send NoData (no result columns yet)
+                // NOTE: Real implementation analyzes query to determine columns
+                self.framed.send(BackendMessage::NoData).await?;
             }
             DescribeTarget::Portal => {
-                if self.state.get_portal(&msg.name).is_some() {
-                    // For stub: Send NoData (no result columns yet)
-                    self.framed.send(BackendMessage::NoData).await?;
-                } else {
-                    return self
-                        .send_error("34000", format!("portal \"{}\" does not exist", msg.name))
-                        .await;
-                }
+                let Some(_portal) = self.state.get_portal(&msg.name) else {
+                    self.framed
+                        .send(BackendMessage::error(
+                            sql_state::INVALID_CURSOR_NAME,
+                            format!("portal \"{}\" does not exist", msg.name),
+                        ))
+                        .await?;
+                    return Ok(());
+                };
+
+                // For stub: Send NoData (no result columns yet)
+                self.framed.send(BackendMessage::NoData).await?;
             }
         }
         Ok(())
@@ -322,25 +304,24 @@ impl Connection {
             self.pid, msg.portal_name, msg.max_rows
         );
 
-        let portal = match self.state.get_portal(&msg.portal_name) {
-            Some(p) => p,
-            None => {
-                return self
-                    .send_error(
-                        "34000",
-                        format!("portal \"{}\" does not exist", msg.portal_name),
-                    )
-                    .await;
-            }
+        let Some(portal) = self.state.get_portal(&msg.portal_name) else {
+            self.framed
+                .send(BackendMessage::error(
+                    sql_state::INVALID_CURSOR_NAME,
+                    format!("portal \"{}\" does not exist", msg.portal_name),
+                ))
+                .await?;
+            return Ok(());
         };
 
-        let stmt = match self.state.get_statement(&portal.statement_name) {
-            Some(s) => s,
-            None => {
-                return self
-                    .send_error("26000", "statement for portal does not exist")
-                    .await;
-            }
+        let Some(stmt) = self.state.get_statement(&portal.statement_name) else {
+            self.framed
+                .send(BackendMessage::error(
+                    sql_state::INVALID_SQL_STATEMENT_NAME,
+                    "statement for portal does not exist".to_string(),
+                ))
+                .await?;
+            return Ok(());
         };
 
         // Stub execution - classify query and return appropriate response
@@ -398,37 +379,6 @@ impl Connection {
             .await?;
 
         self.framed.flush().await?;
-        Ok(())
-    }
-
-    /// Send an error response to the client.
-    async fn send_error(
-        &mut self,
-        code: &str,
-        message: impl Into<String>,
-    ) -> Result<(), ConnectionError> {
-        self.framed
-            .send(BackendMessage::ErrorResponse {
-                fields: vec![
-                    ErrorField {
-                        code: ErrorFieldCode::Severity,
-                        value: "ERROR".to_string(),
-                    },
-                    ErrorField {
-                        code: ErrorFieldCode::SeverityNonLocalized,
-                        value: "ERROR".to_string(),
-                    },
-                    ErrorField {
-                        code: ErrorFieldCode::SqlState,
-                        value: code.to_string(),
-                    },
-                    ErrorField {
-                        code: ErrorFieldCode::Message,
-                        value: message.into(),
-                    },
-                ],
-            })
-            .await?;
         Ok(())
     }
 }

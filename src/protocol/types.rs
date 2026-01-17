@@ -1,8 +1,9 @@
 /// Format code for parameter and result values in the PostgreSQL protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(i16)]
 pub enum FormatCode {
     /// Text format (0)
+    #[default]
     Text = 0,
     /// Binary format (1)
     Binary = 1,
@@ -22,12 +23,6 @@ impl FormatCode {
     /// Converts the FormatCode to an i16 value.
     pub fn as_i16(self) -> i16 {
         self as i16
-    }
-}
-
-impl Default for FormatCode {
-    fn default() -> Self {
-        FormatCode::Text
     }
 }
 

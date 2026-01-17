@@ -2,28 +2,6 @@ use std::collections::HashMap;
 
 use crate::protocol::FormatCode;
 
-/// A prepared statement stored on the connection.
-#[derive(Debug, Clone)]
-pub struct PreparedStatement {
-    /// The original SQL query
-    pub query: String,
-    /// Parameter type OIDs (may be inferred later)
-    pub param_types: Vec<i32>,
-}
-
-/// A portal (bound prepared statement) stored on the connection.
-#[derive(Debug, Clone)]
-pub struct Portal {
-    /// Name of the source prepared statement
-    pub statement_name: String,
-    /// Bound parameter values (None = NULL)
-    pub _param_values: Vec<Option<Vec<u8>>>,
-    /// Parameter format codes
-    pub _param_format_codes: Vec<FormatCode>,
-    /// Result column format codes
-    pub _result_format_codes: Vec<FormatCode>,
-}
-
 /// Per-connection state for Extended Query Protocol.
 ///
 /// NOTE: No synchronization needed - this state is owned by a single connection.
@@ -44,10 +22,7 @@ impl ConnectionState {
     /// Store a prepared statement. Replaces any existing statement with same name.
     /// If name is empty (""), this is the unnamed statement.
     pub fn put_statement(&mut self, name: String, stmt: PreparedStatement) {
-        // Unnamed statement replaces any existing one and closes unnamed portal
-        if name.is_empty() {
-            self.portals.remove("");
-        }
+        self.close_statement(&name);
         self.statements.insert(name, stmt);
     }
 
@@ -58,9 +33,10 @@ impl ConnectionState {
 
     /// Close a prepared statement. Also closes all portals referencing it.
     pub fn close_statement(&mut self, name: &str) {
-        self.statements.remove(name);
-        // Close all portals that reference this statement
-        self.portals.retain(|_, p| p.statement_name != name);
+        if self.statements.remove(name).is_some() {
+            // Close all portals that reference this statement
+            self.portals.retain(|_, p| p.statement_name != name);
+        }
     }
 
     /// Store a portal. Replaces any existing portal with same name.
@@ -83,9 +59,31 @@ impl ConnectionState {
     pub fn clear_unnamed(&mut self) {
         // Per PostgreSQL: unnamed statement is closed at Sync
         // Named statements persist until explicitly closed
-        self.statements.remove("");
-        self.portals.remove("");
+        self.close_statement("");
+        self.close_portal("");
     }
+}
+
+/// A prepared statement stored on the connection.
+#[derive(Debug, Clone)]
+pub struct PreparedStatement {
+    /// The original SQL query
+    pub query: String,
+    /// Parameter type OIDs (may be inferred later)
+    pub param_types: Vec<i32>,
+}
+
+/// A portal (bound prepared statement) stored on the connection.
+#[derive(Debug, Clone)]
+pub struct Portal {
+    /// Name of the source prepared statement
+    pub statement_name: String,
+    /// Bound parameter values (None = NULL)
+    pub _param_values: Vec<Option<Vec<u8>>>,
+    /// Parameter format codes
+    pub _param_format_codes: Vec<FormatCode>,
+    /// Result column format codes
+    pub _result_format_codes: Vec<FormatCode>,
 }
 
 #[cfg(test)]
@@ -114,47 +112,10 @@ mod tests {
     }
 
     #[test]
-    fn test_unnamed_statement_replacement() {
+    fn test_statement_replacement() {
         let mut state = ConnectionState::new();
 
-        // Create unnamed statement
-        state.put_statement(
-            "".to_string(),
-            PreparedStatement {
-                query: "SELECT 1".to_string(),
-                param_types: vec![],
-            },
-        );
-
-        // Create portal from unnamed statement
-        state.put_portal(
-            "".to_string(),
-            Portal {
-                statement_name: "".to_string(),
-                _param_values: vec![],
-                _param_format_codes: vec![],
-                _result_format_codes: vec![],
-            },
-        );
-
-        assert!(state.get_portal("").is_some());
-
-        // Replace unnamed statement - should also close unnamed portal
-        state.put_statement(
-            "".to_string(),
-            PreparedStatement {
-                query: "SELECT 2".to_string(),
-                param_types: vec![],
-            },
-        );
-
-        assert!(state.get_portal("").is_none());
-    }
-
-    #[test]
-    fn test_portal_cascade_close() {
-        let mut state = ConnectionState::new();
-
+        // Create named statement
         state.put_statement(
             "stmt".to_string(),
             PreparedStatement {
@@ -163,6 +124,7 @@ mod tests {
             },
         );
 
+        // Create portal from named statement
         state.put_portal(
             "portal1".to_string(),
             Portal {
@@ -173,8 +135,17 @@ mod tests {
             },
         );
 
-        // Closing statement should close dependent portals
-        state.close_statement("stmt");
+        assert!(state.get_portal("portal1").is_some());
+
+        // Replace named statement - should also close dependent portals
+        state.put_statement(
+            "stmt".to_string(),
+            PreparedStatement {
+                query: "SELECT 2".to_string(),
+                param_types: vec![],
+            },
+        );
+
         assert!(state.get_portal("portal1").is_none());
     }
 
