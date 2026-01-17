@@ -1,17 +1,28 @@
+use bytes::{Buf, BytesMut};
 use std::collections::HashMap;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio_util::codec::Decoder;
 
-use crate::protocol::ProtocolError;
-use crate::protocol::codec::read_cstring;
+use crate::protocol::codec::{PostgresCodec, StartupCodec, get_cstring};
+use crate::protocol::error::ProtocolError;
+
+/// Ensures that the buffer has at least `n` bytes remaining.
+/// Returns `ProtocolError::InvalidMessage` if not enough bytes are available.
+macro_rules! ensure_remaining {
+    ($buf:expr, $n:expr) => {
+        if $buf.len() < $n {
+            return Err(ProtocolError::InvalidMessage);
+        }
+    };
+}
 
 /// SSLRequest magic number
-pub const SSL_REQUEST_CODE: i32 = (1234 << 16) | 5679; // 80877103
+const SSL_REQUEST_CODE: i32 = (1234 << 16) | 5679; // 80877103
 
 /// GSSENCRequest magic number
-pub const GSSENC_REQUEST_CODE: i32 = (1234 << 16) | 5680; // 80877104
+const GSSENC_REQUEST_CODE: i32 = (1234 << 16) | 5680; // 80877104
 
 /// CancelRequest magic number
-pub const CANCEL_REQUEST_CODE: i32 = (1234 << 16) | 5678; // 80877102
+const CANCEL_REQUEST_CODE: i32 = (1234 << 16) | 5678; // 80877102
 
 /// Messages sent by the frontend (client) during startup phase.
 #[derive(Debug)]
@@ -29,6 +40,38 @@ pub enum StartupMessage {
     },
 }
 
+impl StartupMessage {
+    /// Decodes a startup message from the buffer.
+    /// The buffer should contain a complete message (length and code already validated).
+    fn decode(src: &mut BytesMut) -> Result<Self, ProtocolError> {
+        // Read length and code
+        let _len = src.get_i32();
+        let code = src.get_i32();
+
+        match code {
+            SSL_REQUEST_CODE => Ok(StartupMessage::SslRequest),
+            GSSENC_REQUEST_CODE => Ok(StartupMessage::GssEncRequest),
+            CANCEL_REQUEST_CODE => {
+                ensure_remaining!(src, 8);
+                let process_id = src.get_i32();
+                let secret_key = src.get_i32();
+                Ok(StartupMessage::CancelRequest {
+                    process_id,
+                    secret_key,
+                })
+            }
+            version if (version >> 16) == 3 => {
+                let parameters = StartupParameters::decode(src)?;
+                Ok(StartupMessage::Startup {
+                    protocol_version: version,
+                    parameters,
+                })
+            }
+            _ => Err(ProtocolError::UnsupportedProtocolVersion(code)),
+        }
+    }
+}
+
 /// Startup parameters from the client
 #[derive(Debug, Clone, Default)]
 pub struct StartupParameters {
@@ -39,89 +82,27 @@ pub struct StartupParameters {
     pub other: HashMap<String, String>,
 }
 
-impl StartupMessage {
-    /// Read a startup-phase message from the stream (including length prefix).
-    ///
-    /// NOTE: Production improvements needed:
-    /// - Add maximum message size limit (PostgreSQL uses 1GB max)
-    /// - Implement read timeout to prevent slow-loris attacks
-    /// - Consider using a pre-allocated buffer pool for parsing
-    pub async fn read<R: AsyncRead + Unpin>(r: &mut R) -> Result<Self, ProtocolError> {
-        let len = r.read_i32().await?;
-
-        // Minimum length is 8 (length + code)
-        // NOTE: Production should also enforce maximum length (e.g., 10KB for startup)
-        if len < 8 {
-            return Err(ProtocolError::InvalidMessage);
-        }
-
-        let code = r.read_i32().await?;
-
-        // Remaining bytes after length and code
-        let remaining = (len - 8) as usize;
-
-        match code {
-            SSL_REQUEST_CODE if remaining == 0 => Ok(StartupMessage::SslRequest),
-            GSSENC_REQUEST_CODE if remaining == 0 => Ok(StartupMessage::GssEncRequest),
-            CANCEL_REQUEST_CODE if remaining == 8 => {
-                let process_id = r.read_i32().await?;
-                let secret_key = r.read_i32().await?;
-                Ok(StartupMessage::CancelRequest {
-                    process_id,
-                    secret_key,
-                })
-            }
-            SSL_REQUEST_CODE | GSSENC_REQUEST_CODE | CANCEL_REQUEST_CODE => {
-                Err(ProtocolError::InvalidMessage)
-            }
-            version if (version >> 16) == 3 => {
-                let parameters = Self::read_startup_parameters(r, remaining).await?;
-                Ok(StartupMessage::Startup {
-                    protocol_version: version,
-                    parameters,
-                })
-            }
-            _ => Err(ProtocolError::UnsupportedProtocolVersion(code)),
-        }
-    }
-
-    /// NOTE: Production improvements needed:
-    /// - Limit maximum parameter name/value lengths
-    /// - Limit total number of parameters (prevent DoS via memory exhaustion)
-    /// - Sanitize/validate parameter values (e.g., encoding names)
-    async fn read_startup_parameters<R: AsyncRead + Unpin>(
-        r: &mut R,
-        mut remaining: usize,
-    ) -> Result<StartupParameters, ProtocolError> {
+impl StartupParameters {
+    /// Decodes startup parameters from the message buffer.
+    fn decode(src: &mut BytesMut) -> Result<Self, ProtocolError> {
         let mut params = StartupParameters::default();
 
         loop {
-            if remaining == 0 {
+            // Check if we have more data
+            if src.is_empty() {
                 break;
             }
 
-            let name = read_cstring(r).await.map_err(|e| {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    ProtocolError::InsufficientData
-                } else {
-                    ProtocolError::InvalidUtf8
-                }
-            })?;
-
-            // Account for name + null terminator
-            remaining = remaining.saturating_sub(name.len() + 1);
+            // Read parameter name
+            let name = get_cstring(src)?;
 
             // Empty name signals end of parameters
             if name.is_empty() {
                 break;
             }
 
-            let value = read_cstring(r)
-                .await
-                .map_err(|_| ProtocolError::InvalidUtf8)?;
-
-            // Account for value + null terminator
-            remaining = remaining.saturating_sub(value.len() + 1);
+            // Read parameter value
+            let value = get_cstring(src)?;
 
             match name.as_str() {
                 "user" => params.user = value,
@@ -142,6 +123,34 @@ impl StartupMessage {
     }
 }
 
+impl Decoder for StartupCodec {
+    type Item = StartupMessage;
+    type Error = ProtocolError;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // Need at least 8 bytes (length + code)
+        if src.len() < 8 {
+            return Ok(None);
+        }
+
+        // Peek at the length (don't consume yet)
+        let len = i32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize;
+        if len < 8 || len > self.max_message_size {
+            return Err(ProtocolError::InvalidMessage);
+        }
+
+        // Wait for complete message
+        if src.len() < len {
+            return Ok(None);
+        }
+
+        // Ready to decode - consume the message and decode it
+        let mut msg_buf = src.split_to(len);
+        let msg = StartupMessage::decode(&mut msg_buf)?;
+        Ok(Some(msg))
+    }
+}
+
 /// Messages sent by the frontend (client) during query phase.
 ///
 /// NOTE: Production improvements needed:
@@ -156,141 +165,202 @@ pub enum FrontendMessage {
 }
 
 impl FrontendMessage {
-    /// Read a query-phase message from the stream.
-    /// Returns None on EOF (clean disconnect).
-    ///
-    /// NOTE: Production improvements needed:
-    /// - Add timeout to prevent slow-loris attacks
-    /// - Limit query size (PostgreSQL: 1GB max)
-    /// - Support more message types (Parse, Bind, Execute, etc.)
-    pub async fn read<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Self>, ProtocolError> {
-        // Read message type byte
-        let msg_type = match r.read_u8().await {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
+    /// Decodes a frontend message from the buffer.
+    /// The buffer should contain the message body (type and length already consumed).
+    fn decode(src: &mut BytesMut) -> Result<Self, ProtocolError> {
+        let msg_type = src.get_u8();
+        let _length = src.get_i32();
+        match msg_type {
+            b'Q' => {
+                let query = get_cstring(src)?;
+                Ok(FrontendMessage::Query(query))
+            }
+            b'X' => Ok(FrontendMessage::Terminate),
+            _ => Err(ProtocolError::UnknownMessageType(msg_type)),
+        }
+    }
+}
 
-        // Read length (includes self but not type byte)
-        // TODO: this should be passed to read_cstring or else
-        let length = r.read_i32().await?;
-        if length < 4 {
+impl Decoder for PostgresCodec {
+    type Item = FrontendMessage;
+    type Error = ProtocolError;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // Need at least 5 bytes (type + length)
+        if src.len() < 5 {
+            return Ok(None);
+        }
+
+        // Peek at the length (bytes 1-4, don't consume yet)
+        let len = i32::from_be_bytes([src[1], src[2], src[3], src[4]]) as usize;
+        if len < 4 || len > self.max_message_size {
             return Err(ProtocolError::InvalidMessage);
         }
 
-        match msg_type {
-            b'Q' => {
-                // Query: read null-terminated string
-                let query = read_cstring(r)
-                    .await
-                    .map_err(|_| ProtocolError::InvalidUtf8)?;
-                Ok(Some(FrontendMessage::Query(query)))
-            }
-            b'X' => {
-                // Terminate: no body (just length=4)
-                Ok(Some(FrontendMessage::Terminate))
-            }
-            _ => Err(ProtocolError::UnknownMessageType(msg_type)),
+        // Total message size = 1 (type byte) + length
+        let len = 1 + len;
+
+        // Wait for complete message
+        if src.len() < len {
+            return Ok(None);
         }
+
+        // Ready to decode - consume the message and decode it
+        let mut msg_buf = src.split_to(len);
+        let msg = FrontendMessage::decode(&mut msg_buf)?;
+        Ok(Some(msg))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
-    use tokio::io::AsyncWriteExt;
+    use bytes::{BufMut, BytesMut};
+    use tokio_util::codec::Decoder;
 
-    async fn make_startup_message(code: i32, body: &[u8]) -> Vec<u8> {
+    /// Helper to create a startup message with given code and body
+    fn make_startup_message(code: i32, body: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
         let len = 4 + 4 + body.len(); // length + code + body
-        buf.write_i32(len as i32).await.unwrap();
-        buf.write_i32(code).await.unwrap();
+        buf.put_i32(len as i32);
+        buf.put_i32(code);
         buf.extend_from_slice(body);
         buf
     }
 
-    #[tokio::test]
-    async fn test_read_ssl_request() {
-        let buf = make_startup_message(SSL_REQUEST_CODE, &[]).await;
-        let mut cursor = Cursor::new(buf);
-        let msg = StartupMessage::read(&mut cursor).await.unwrap();
-        assert!(matches!(msg, StartupMessage::SslRequest));
+    /// Helper to create a frontend message with given type and body
+    fn make_frontend_message(msg_type: u8, body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(msg_type);
+        let len = 4 + body.len(); // length includes self (4 bytes) + body
+        buf.put_i32(len as i32);
+        buf.extend_from_slice(body);
+        buf
     }
 
-    #[tokio::test]
-    async fn test_read_startup_message() {
+    /// Helper to decode a StartupMessage from bytes
+    fn decode_startup_message(buf: &[u8]) -> Result<Option<StartupMessage>, ProtocolError> {
+        let mut codec = StartupCodec::new();
+        let mut bytes = BytesMut::from(buf);
+        codec.decode(&mut bytes)
+    }
+
+    /// Helper to decode a FrontendMessage from bytes
+    fn decode_frontend_message(buf: &[u8]) -> Result<Option<FrontendMessage>, ProtocolError> {
+        let mut codec = PostgresCodec::new();
+        let mut bytes = BytesMut::from(buf);
+        codec.decode(&mut bytes)
+    }
+
+    #[test]
+    fn test_read_ssl_request() {
+        let buf = make_startup_message(SSL_REQUEST_CODE, &[]);
+        let msg = decode_startup_message(&buf).unwrap();
+        assert!(matches!(msg, Some(StartupMessage::SslRequest)));
+    }
+
+    #[test]
+    fn test_read_startup_message() {
         let mut body = Vec::new();
         body.extend_from_slice(b"user\0postgres\0");
         body.extend_from_slice(b"database\0testdb\0");
         body.push(0); // terminator
 
-        let buf = make_startup_message(3 << 16, &body).await;
-        let mut cursor = Cursor::new(buf);
-        let msg = StartupMessage::read(&mut cursor).await.unwrap();
+        let buf = make_startup_message(3 << 16, &body);
+        let msg = decode_startup_message(&buf).unwrap();
 
-        match msg {
-            StartupMessage::Startup {
-                protocol_version,
-                parameters,
-            } => {
-                assert_eq!(protocol_version, 3 << 16);
-                assert_eq!(parameters.user, "postgres");
-                assert_eq!(parameters.database, Some("testdb".to_string()));
-            }
-            _ => panic!("expected Startup message"),
-        }
+        let Some(StartupMessage::Startup {
+            protocol_version,
+            parameters,
+        }) = msg
+        else {
+            panic!("expected Startup message, got {msg:?}")
+        };
+
+        assert_eq!(protocol_version, 3 << 16);
+        assert_eq!(parameters.user, "postgres");
+        assert_eq!(parameters.database, Some("testdb".to_string()));
     }
 
-    #[tokio::test]
-    async fn test_read_query_message() {
-        let mut buf = Vec::new();
-        buf.push(b'Q');
-        buf.write_i32(13).await.unwrap(); // length = 4 + 9 ("SELECT 1\0")
-        buf.extend_from_slice(b"SELECT 1\0");
+    #[test]
+    fn test_read_startup_message_missing_user() {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"database\0testdb\0");
+        body.push(0); // terminator
 
-        let mut cursor = Cursor::new(buf);
-        let msg = FrontendMessage::read(&mut cursor).await.unwrap().unwrap();
+        let buf = make_startup_message(3 << 16, &body);
+        let result = decode_startup_message(&buf);
 
-        match msg {
-            FrontendMessage::Query(q) => assert_eq!(q, "SELECT 1"),
-            _ => panic!("expected Query message"),
-        }
+        assert!(matches!(
+            result,
+            Err(ProtocolError::MissingParameter("user"))
+        ));
     }
 
-    #[tokio::test]
-    async fn test_read_terminate_message() {
-        let mut buf = Vec::new();
-        buf.push(b'X');
-        buf.write_i32(4).await.unwrap(); // length (no body)
-
-        let mut cursor = Cursor::new(buf);
-        let msg = FrontendMessage::read(&mut cursor).await.unwrap().unwrap();
-
-        assert!(matches!(msg, FrontendMessage::Terminate));
+    #[test]
+    fn test_read_gssenc_request() {
+        let buf = make_startup_message(GSSENC_REQUEST_CODE, &[]);
+        let msg = decode_startup_message(&buf).unwrap();
+        assert!(matches!(msg, Some(StartupMessage::GssEncRequest)));
     }
 
-    #[tokio::test]
-    async fn test_read_eof() {
+    #[test]
+    fn test_read_cancel_request() {
+        let mut body = Vec::new();
+        body.put_i32(12345); // process_id
+        body.put_i32(67890); // secret_key
+
+        let buf = make_startup_message(CANCEL_REQUEST_CODE, &body);
+        let msg = decode_startup_message(&buf).unwrap();
+
+        let Some(StartupMessage::CancelRequest {
+            process_id,
+            secret_key,
+        }) = msg
+        else {
+            panic!("expected CancelRequest message, got {msg:?}")
+        };
+
+        assert_eq!(process_id, 12345);
+        assert_eq!(secret_key, 67890);
+    }
+
+    #[test]
+    fn test_read_eof() {
         let buf = Vec::new();
-        let mut cursor = Cursor::new(buf);
-        let msg = FrontendMessage::read(&mut cursor).await.unwrap();
-
+        let msg = decode_frontend_message(&buf).unwrap();
         assert!(msg.is_none());
     }
 
-    #[tokio::test]
-    async fn test_read_unknown_message_type() {
+    #[test]
+    fn test_read_unknown_message_type() {
         let mut buf = Vec::new();
         buf.push(b'Z'); // Unknown type
-        buf.write_i32(4).await.unwrap();
+        buf.put_i32(4);
 
-        let mut cursor = Cursor::new(buf);
-        let result = FrontendMessage::read(&mut cursor).await;
-
+        let result = decode_frontend_message(&buf);
         assert!(matches!(
             result,
             Err(ProtocolError::UnknownMessageType(b'Z'))
         ));
+    }
+
+    #[test]
+    fn test_read_query_message() {
+        let buf = make_frontend_message(b'Q', b"SELECT 1\0");
+        let msg = decode_frontend_message(&buf).unwrap().unwrap();
+
+        let FrontendMessage::Query(q) = msg else {
+            panic!("expected Query message, got {msg:?}")
+        };
+
+        assert_eq!(q, "SELECT 1");
+    }
+
+    #[test]
+    fn test_read_terminate_message() {
+        let buf = make_frontend_message(b'X', &[]);
+        let msg = decode_frontend_message(&buf).unwrap().unwrap();
+        assert!(matches!(msg, FrontendMessage::Terminate));
     }
 }
