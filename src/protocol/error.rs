@@ -1,11 +1,10 @@
 /// Protocol parsing errors
 #[derive(Debug)]
 pub enum ProtocolError {
-    InsufficientData,
     InvalidMessage,
     UnsupportedProtocolVersion(i32),
     MissingParameter(&'static str),
-    InvalidUtf8,
+    InvalidUtf8(std::string::FromUtf8Error),
     UnknownMessageType(u8),
     Io(std::io::Error),
 }
@@ -13,13 +12,12 @@ pub enum ProtocolError {
 impl std::fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ProtocolError::InsufficientData => write!(f, "insufficient data"),
             ProtocolError::InvalidMessage => write!(f, "invalid message"),
             ProtocolError::UnsupportedProtocolVersion(v) => {
                 write!(f, "unsupported protocol version: {}", v)
             }
             ProtocolError::MissingParameter(p) => write!(f, "missing parameter: {}", p),
-            ProtocolError::InvalidUtf8 => write!(f, "invalid UTF-8"),
+            ProtocolError::InvalidUtf8(e) => write!(f, "invalid UTF-8: {}", e),
             ProtocolError::UnknownMessageType(t) => {
                 write!(f, "unknown message type: 0x{:02x}", t)
             }

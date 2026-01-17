@@ -1,7 +1,7 @@
+use crate::protocol::codec::{PostgresCodec, StartupCodec, put_cstring};
+use bytes::{BufMut, BytesMut};
 use std::io;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
-
-use crate::protocol::codec::write_cstring;
+use tokio_util::codec::Encoder;
 
 /// Messages sent by the backend (server) to the client.
 #[derive(Debug)]
@@ -27,73 +27,96 @@ pub enum BackendMessage {
 }
 
 impl BackendMessage {
-    /// Writes message header (type byte and length) to the stream.
-    async fn write_head<W: AsyncWrite + Unpin>(
-        w: &mut W,
-        msg_type: u8,
-        body_len: usize,
-    ) -> io::Result<()> {
-        w.write_u8(msg_type).await?;
-        w.write_i32((4 + body_len) as i32).await?;
-        Ok(())
+    /// Returns the message type byte.
+    fn ty(&self) -> u8 {
+        match self {
+            BackendMessage::AuthenticationOk => b'R',
+            BackendMessage::BackendKeyData { .. } => b'K',
+            BackendMessage::ParameterStatus { .. } => b'S',
+            BackendMessage::ReadyForQuery { .. } => b'Z',
+            BackendMessage::ErrorResponse { .. } => b'E',
+            BackendMessage::RowDescription { .. } => b'T',
+            BackendMessage::DataRow { .. } => b'D',
+            BackendMessage::CommandComplete { .. } => b'C',
+            BackendMessage::EmptyQueryResponse => b'I',
+        }
     }
 
-    /// Write this message to the stream.
-    pub async fn write<W: AsyncWrite + Unpin>(&self, w: &mut W) -> io::Result<()> {
+    /// Encodes this message into the given BytesMut buffer.
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u8(self.ty());
+
+        let len_pos = dst.len();
+        dst.put_i32(0); // placeholder
+
+        self.encode_body(dst);
+
+        let total_len = (dst.len() - len_pos) as i32;
+        dst[len_pos..][..4].copy_from_slice(&total_len.to_be_bytes());
+    }
+
+    /// Encodes the body of this message into the given BytesMut buffer.
+    fn encode_body(&self, dst: &mut BytesMut) {
         match self {
             BackendMessage::AuthenticationOk => {
-                Self::write_head(w, b'R', 4).await?;
-                w.write_i32(0).await?; // auth type 0 = Ok
+                dst.put_i32(0); // auth type 0 = Ok
             }
             BackendMessage::BackendKeyData {
                 process_id,
                 secret_key,
             } => {
-                Self::write_head(w, b'K', 8).await?;
-                w.write_i32(*process_id).await?;
-                w.write_i32(*secret_key).await?;
+                dst.put_i32(*process_id);
+                dst.put_i32(*secret_key);
             }
             BackendMessage::ParameterStatus { name, value } => {
-                Self::write_head(w, b'S', name.len() + 1 + value.len() + 1).await?;
-                write_cstring(w, name).await?;
-                write_cstring(w, value).await?;
+                put_cstring(dst, name);
+                put_cstring(dst, value);
             }
             BackendMessage::ReadyForQuery { status } => {
-                Self::write_head(w, b'Z', 1).await?;
-                w.write_u8(status.as_byte()).await?;
+                dst.put_u8(status.as_byte());
             }
             BackendMessage::ErrorResponse { fields } => {
-                let body_len = fields.iter().map(|f| f.encoded_len()).sum::<usize>() + 1;
-                Self::write_head(w, b'E', body_len).await?;
                 for field in fields {
-                    field.write(w).await?;
+                    field.encode(dst);
                 }
-                w.write_u8(0).await?; // terminator
+                dst.put_u8(0); // terminator
             }
             BackendMessage::RowDescription { fields } => {
-                let body_len = 2 + fields.iter().map(|f| f.encoded_len()).sum::<usize>();
-                Self::write_head(w, b'T', body_len).await?;
-                w.write_i16(fields.len() as i16).await?;
+                dst.put_i16(fields.len() as i16);
                 for field in fields {
-                    field.write(w).await?;
+                    field.encode(dst);
                 }
             }
             BackendMessage::DataRow { values } => {
-                let body_len = 2 + values.iter().map(|v| v.encoded_len()).sum::<usize>();
-                Self::write_head(w, b'D', body_len).await?;
-                w.write_i16(values.len() as i16).await?;
+                dst.put_i16(values.len() as i16);
                 for value in values {
-                    value.write(w).await?;
+                    value.encode(dst);
                 }
             }
             BackendMessage::CommandComplete { tag } => {
-                Self::write_head(w, b'C', tag.len() + 1).await?;
-                write_cstring(w, tag).await?;
+                put_cstring(dst, tag);
             }
             BackendMessage::EmptyQueryResponse => {
-                Self::write_head(w, b'I', 0).await?;
+                // No body for these messages
             }
         }
+    }
+}
+
+impl Encoder<BackendMessage> for StartupCodec {
+    type Error = io::Error;
+
+    fn encode(&mut self, msg: BackendMessage, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        msg.encode(dst);
+        Ok(())
+    }
+}
+
+impl Encoder<BackendMessage> for PostgresCodec {
+    type Error = io::Error;
+
+    fn encode(&mut self, msg: BackendMessage, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        msg.encode(dst);
         Ok(())
     }
 }
@@ -127,16 +150,10 @@ pub struct ErrorField {
 }
 
 impl ErrorField {
-    /// Returns the encoded length of this field in bytes (code + value + null terminator).
-    fn encoded_len(&self) -> usize {
-        1 + self.value.len() + 1
-    }
-
-    /// Writes this field to the stream.
-    async fn write<W: AsyncWrite + Unpin>(&self, w: &mut W) -> io::Result<()> {
-        w.write_u8(self.code).await?;
-        write_cstring(w, &self.value).await?;
-        Ok(())
+    /// Encodes this error field into the given BytesMut buffer.
+    fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u8(self.code);
+        put_cstring(dst, &self.value);
     }
 }
 
@@ -150,26 +167,15 @@ pub enum DataValue {
 }
 
 impl DataValue {
-    /// Returns the encoded length of this value in bytes (length field + data).
-    fn encoded_len(&self) -> usize {
+    /// Encodes this data value into the given BytesMut buffer.
+    fn encode(&self, dst: &mut BytesMut) {
         match self {
-            DataValue::Null => 4,                        // length field only
-            DataValue::Binary(bytes) => 4 + bytes.len(), // length + data
-        }
-    }
-
-    /// Writes this value to the stream.
-    async fn write<W: AsyncWrite + Unpin>(&self, w: &mut W) -> io::Result<()> {
-        match self {
-            DataValue::Null => {
-                w.write_i32(-1).await?;
-            }
+            DataValue::Null => dst.put_i32(-1),
             DataValue::Binary(bytes) => {
-                w.write_i32(bytes.len() as i32).await?;
-                w.write_all(bytes).await?;
+                dst.put_i32(bytes.len() as i32);
+                dst.put_slice(bytes);
             }
         }
-        Ok(())
     }
 }
 
@@ -193,83 +199,92 @@ pub struct FieldDescription {
 }
 
 impl FieldDescription {
-    /// Returns the encoded length of this field in bytes.
-    fn encoded_len(&self) -> usize {
-        self.name.len() + 1 + 4 + 2 + 4 + 2 + 4 + 2
-    }
-
-    /// Writes this field to the stream.
-    async fn write<W: AsyncWrite + Unpin>(&self, w: &mut W) -> io::Result<()> {
-        write_cstring(w, &self.name).await?;
-        w.write_i32(self.table_oid).await?;
-        w.write_i16(self.column_id).await?;
-        w.write_i32(self.type_oid).await?;
-        w.write_i16(self.type_size).await?;
-        w.write_i32(self.type_modifier).await?;
-        w.write_i16(self.format_code).await?;
-        Ok(())
+    /// Encodes this field description into the given BytesMut buffer.
+    fn encode(&self, dst: &mut BytesMut) {
+        put_cstring(dst, &self.name);
+        dst.put_i32(self.table_oid);
+        dst.put_i16(self.column_id);
+        dst.put_i32(self.type_oid);
+        dst.put_i16(self.type_size);
+        dst.put_i32(self.type_modifier);
+        dst.put_i16(self.format_code);
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BytesMut;
+    use tokio_util::codec::Encoder;
 
-    #[tokio::test]
-    async fn test_write_authentication_ok() {
+    /// Helper to encode a message and return the buffer.
+    fn encode_message(msg: BackendMessage) -> Vec<u8> {
+        let mut codec = PostgresCodec::new();
+        let mut buf = BytesMut::new();
+        codec.encode(msg, &mut buf).unwrap();
+        buf.to_vec()
+    }
+
+    /// Helper to read i32 from buffer at offset.
+    fn read_i32(buf: &[u8], offset: usize) -> i32 {
+        i32::from_be_bytes([
+            buf[offset],
+            buf[offset + 1],
+            buf[offset + 2],
+            buf[offset + 3],
+        ])
+    }
+
+    /// Helper to read i16 from buffer at offset.
+    fn read_i16(buf: &[u8], offset: usize) -> i16 {
+        i16::from_be_bytes([buf[offset], buf[offset + 1]])
+    }
+
+    #[test]
+    fn test_write_authentication_ok() {
         let msg = BackendMessage::AuthenticationOk;
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
+        let buf = encode_message(msg);
         assert_eq!(buf, vec![b'R', 0, 0, 0, 8, 0, 0, 0, 0]);
     }
 
-    #[tokio::test]
-    async fn test_write_backend_key_data() {
+    #[test]
+    fn test_write_backend_key_data() {
         let msg = BackendMessage::BackendKeyData {
             process_id: 12345,
             secret_key: 67890,
         };
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
+        let buf = encode_message(msg);
 
         assert_eq!(buf[0], b'K');
-        // length = 4 + 8 = 12
-        assert_eq!(&buf[1..5], &12i32.to_be_bytes());
-        // process_id = 12345
-        assert_eq!(&buf[5..9], &12345i32.to_be_bytes());
-        // secret_key = 67890
-        assert_eq!(&buf[9..13], &67890i32.to_be_bytes());
+        assert_eq!(read_i32(&buf, 1), 12); // length = 4 + 8 = 12
+        assert_eq!(read_i32(&buf, 5), 12345); // process_id
+        assert_eq!(read_i32(&buf, 9), 67890); // secret_key
     }
 
-    #[tokio::test]
-    async fn test_write_parameter_status() {
+    #[test]
+    fn test_write_parameter_status() {
         let msg = BackendMessage::ParameterStatus {
             name: "server_version".to_string(),
             value: "16.0".to_string(),
         };
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
-        // 'S' + length(4) + "server_version\0" + "16.0\0"
-        // length = 4 + 15 ("server_version\0") + 5 ("16.0\0") = 24
+        let buf = encode_message(msg);
+
         assert_eq!(buf[0], b'S');
-        assert_eq!(&buf[1..5], &[0, 0, 0, 24]); // length field
-        assert_eq!(
-            &buf[5..],
-            b"server_version\0\x31\x36\x2e\x30\0" // "server_version\016.0\0"
-        );
+        assert_eq!(read_i32(&buf, 1), 24); // length = 4 + 15 + 5 = 24
+        assert_eq!(&buf[5..], b"server_version\x0016.0\x00");
     }
 
-    #[tokio::test]
-    async fn test_write_ready_for_query() {
+    #[test]
+    fn test_write_ready_for_query() {
         let msg = BackendMessage::ReadyForQuery {
             status: TransactionStatus::Idle,
         };
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
+        let buf = encode_message(msg);
         assert_eq!(buf, vec![b'Z', 0, 0, 0, 5, b'I']);
     }
 
-    #[tokio::test]
-    async fn test_write_error_response() {
+    #[test]
+    fn test_write_error_response() {
         let msg = BackendMessage::ErrorResponse {
             fields: vec![
                 ErrorField {
@@ -286,72 +301,62 @@ mod tests {
                 },
             ],
         };
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
+        let buf = encode_message(msg);
 
         assert_eq!(buf[0], b'E');
-        // Verify message type and check that fields are present
-        // Field 1: 'S' + "ERROR\0" = 1 + 6 = 7 bytes
-        // Field 2: 'C' + "42P01\0" = 1 + 6 = 7 bytes
-        // Field 3: 'M' + "table does not exist\0" = 1 + 21 = 22 bytes
-        // Terminator: 1 byte
-        // Total body length: 7 + 7 + 22 + 1 = 37 bytes
-        let body_len = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
-        assert_eq!(body_len, 4 + 37);
+        assert_eq!(read_i32(&buf, 1), 41); // 4 + (7 + 7 + 22 + 1)
 
-        // Verify first field
+        // Verify fields
         assert_eq!(buf[5], b'S');
-        assert_eq!(&buf[6..12], b"ERROR\0");
-
-        // Verify second field
+        assert_eq!(&buf[6..12], b"ERROR\x00");
         assert_eq!(buf[12], b'C');
-        assert_eq!(&buf[13..19], b"42P01\0");
-
-        // Verify third field
+        assert_eq!(&buf[13..19], b"42P01\x00");
         assert_eq!(buf[19], b'M');
-        assert_eq!(&buf[20..41], b"table does not exist\0");
-
-        // Verify terminator
-        assert_eq!(buf[41], 0);
+        assert_eq!(&buf[20..41], b"table does not exist\x00");
+        assert_eq!(buf[41], 0); // terminator
     }
 
-    #[tokio::test]
-    async fn test_write_row_description() {
+    #[test]
+    fn test_write_row_description() {
         let msg = BackendMessage::RowDescription {
-            fields: vec![FieldDescription {
-                name: "col".to_string(),
-                table_oid: 0,
-                column_id: 0,
-                type_oid: 23, // INT4
-                type_size: 4,
-                type_modifier: -1,
-                format_code: 0,
-            }],
+            fields: vec![
+                FieldDescription {
+                    name: "col".to_string(),
+                    table_oid: 0,
+                    column_id: 0,
+                    type_oid: 23, // INT4
+                    type_size: 4,
+                    type_modifier: -1,
+                    format_code: 0,
+                },
+                FieldDescription {
+                    name: "text_col".to_string(),
+                    table_oid: 16384,
+                    column_id: 2,
+                    type_oid: 25, // TEXT (variable length)
+                    type_size: -1,
+                    type_modifier: -1,
+                    format_code: 0,
+                },
+                FieldDescription {
+                    name: "binary_col".to_string(),
+                    table_oid: 16384,
+                    column_id: 3,
+                    type_oid: 17, // BYTEA
+                    type_size: -1,
+                    type_modifier: -1,
+                    format_code: 1, // binary format
+                },
+            ],
         };
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
+        let buf = encode_message(msg);
 
         assert_eq!(buf[0], b'T');
-        // Verify field count
-        let field_count = i16::from_be_bytes([buf[5], buf[6]]);
-        assert_eq!(field_count, 1);
+        assert_eq!(read_i16(&buf, 5), 3); // field count
     }
 
-    #[tokio::test]
-    async fn test_write_empty_row_description() {
-        let msg = BackendMessage::RowDescription { fields: vec![] };
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
-
-        assert_eq!(buf[0], b'T');
-        // length = 4 + 2 (field count) = 6
-        assert_eq!(&buf[1..5], &6i32.to_be_bytes());
-        // field count = 0
-        assert_eq!(&buf[5..7], &0i16.to_be_bytes());
-    }
-
-    #[tokio::test]
-    async fn test_write_data_row() {
+    #[test]
+    fn test_write_data_row() {
         let msg = BackendMessage::DataRow {
             values: vec![
                 DataValue::Binary(b"hello".to_vec()), // non-empty value
@@ -359,48 +364,34 @@ mod tests {
                 DataValue::Null,                      // NULL
             ],
         };
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
+        let buf = encode_message(msg);
 
         assert_eq!(buf[0], b'D');
-        // Verify column count
-        let col_count = i16::from_be_bytes([buf[5], buf[6]]);
-        assert_eq!(col_count, 3);
+        assert_eq!(read_i16(&buf, 5), 3); // column count
 
-        // Verify first value: length=5, "hello"
-        let val1_len = i32::from_be_bytes([buf[7], buf[8], buf[9], buf[10]]);
-        assert_eq!(val1_len, 5);
+        // Verify values
+        assert_eq!(read_i32(&buf, 7), 5); // length of "hello"
         assert_eq!(&buf[11..16], b"hello");
-
-        // Verify second value: length=0 (empty)
-        let val2_len = i32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]);
-        assert_eq!(val2_len, 0);
-
-        // Verify third value: length=-1 (NULL)
-        let val3_len = i32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]);
-        assert_eq!(val3_len, -1);
+        assert_eq!(read_i32(&buf, 16), 0); // empty value
+        assert_eq!(read_i32(&buf, 20), -1); // NULL
     }
 
-    #[tokio::test]
-    async fn test_write_command_complete() {
+    #[test]
+    fn test_write_command_complete() {
         let msg = BackendMessage::CommandComplete {
             tag: "SELECT 1".to_string(),
         };
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
+        let buf = encode_message(msg);
 
         assert_eq!(buf[0], b'C');
-        // length = 4 + 9 ("SELECT 1\0") = 13
-        assert_eq!(&buf[1..5], &13i32.to_be_bytes());
-        assert_eq!(&buf[5..], b"SELECT 1\0");
+        assert_eq!(read_i32(&buf, 1), 13); // 4 + 9
+        assert_eq!(&buf[5..], b"SELECT 1\x00");
     }
 
-    #[tokio::test]
-    async fn test_write_empty_query_response() {
+    #[test]
+    fn test_write_empty_query_response() {
         let msg = BackendMessage::EmptyQueryResponse;
-        let mut buf = Vec::new();
-        msg.write(&mut buf).await.unwrap();
-
+        let buf = encode_message(msg);
         assert_eq!(buf, vec![b'I', 0, 0, 0, 4]);
     }
 }

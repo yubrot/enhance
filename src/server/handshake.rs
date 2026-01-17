@@ -1,13 +1,17 @@
-use tokio::io::{AsyncWriteExt, BufWriter};
+use futures_util::{SinkExt, StreamExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio_util::codec::Framed;
 
-use crate::protocol::{BackendMessage, StartupMessage, TransactionStatus};
+use crate::protocol::{
+    BackendMessage, PostgresCodec, StartupCodec, StartupMessage, TransactionStatus,
+};
 use crate::server::connection::ConnectionError;
 
 pub enum HandshakeResult {
     /// Handshake completed successfully, transitioning to query phase.
     Success {
-        socket: BufWriter<TcpStream>,
+        framed: Framed<TcpStream, PostgresCodec>,
         secret_key: i32,
     },
     /// Handshake was a CancelRequest.
@@ -28,27 +32,32 @@ pub enum HandshakeResult {
 ///    - Implement SSL/TLS support (currently rejected)
 ///    - Add rate limiting for failed authentication attempts
 pub struct Handshake {
-    socket: BufWriter<TcpStream>,
+    framed: Framed<TcpStream, StartupCodec>,
     pid: i32,
 }
 
 impl Handshake {
     pub fn new(socket: TcpStream, pid: i32) -> Self {
         Self {
-            socket: BufWriter::new(socket),
+            framed: Framed::new(socket, StartupCodec::new()),
             pid,
         }
     }
 
     pub async fn run(mut self) -> Result<HandshakeResult, ConnectionError> {
         loop {
-            let message = StartupMessage::read(&mut self.socket).await?;
+            let message = self.framed.next().await.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Connection closed during handshake",
+                )
+            })??;
 
             match message {
                 StartupMessage::SslRequest | StartupMessage::GssEncRequest => {
-                    // Reject SSL/GSSAPI with 'N'
-                    self.socket.write_all(b"N").await?;
-                    self.socket.flush().await?;
+                    // Reject SSL/GSSAPI with 'N' - write directly to socket
+                    self.framed.get_mut().write_all(b"N").await?;
+                    self.framed.get_mut().flush().await?;
                 }
                 StartupMessage::Startup { parameters, .. } => {
                     // TODO: proper auth
@@ -58,12 +67,13 @@ impl Handshake {
                     );
 
                     let secret_key = rand::random::<i32>();
+
+                    // Send startup info using StartupCodec
                     self.send_startup_info(secret_key).await?;
 
-                    return Ok(HandshakeResult::Success {
-                        socket: self.socket,
-                        secret_key,
-                    });
+                    // Transition to query phase
+                    let framed = self.framed.map_codec(|c| c.ready());
+                    return Ok(HandshakeResult::Success { framed, secret_key });
                 }
                 StartupMessage::CancelRequest {
                     process_id,
@@ -78,17 +88,16 @@ impl Handshake {
         }
     }
 
+    /// Sends the startup information to the client.
     async fn send_startup_info(&mut self, secret_key: i32) -> Result<(), ConnectionError> {
-        BackendMessage::AuthenticationOk
-            .write(&mut self.socket)
-            .await?;
+        self.framed.send(BackendMessage::AuthenticationOk).await?;
 
-        BackendMessage::BackendKeyData {
-            process_id: self.pid,
-            secret_key,
-        }
-        .write(&mut self.socket)
-        .await?;
+        self.framed
+            .send(BackendMessage::BackendKeyData {
+                process_id: self.pid,
+                secret_key,
+            })
+            .await?;
 
         let params = [
             ("server_version", "16.0"),
@@ -101,21 +110,21 @@ impl Handshake {
         ];
 
         for (name, value) in params {
-            BackendMessage::ParameterStatus {
-                name: name.to_string(),
-                value: value.to_string(),
-            }
-            .write(&mut self.socket)
+            self.framed
+                .send(BackendMessage::ParameterStatus {
+                    name: name.to_string(),
+                    value: value.to_string(),
+                })
+                .await?;
+        }
+
+        self.framed
+            .send(BackendMessage::ReadyForQuery {
+                status: TransactionStatus::Idle,
+            })
             .await?;
-        }
 
-        BackendMessage::ReadyForQuery {
-            status: TransactionStatus::Idle,
-        }
-        .write(&mut self.socket)
-        .await?;
-
-        self.socket.flush().await?;
+        self.framed.flush().await?;
         Ok(())
     }
 }

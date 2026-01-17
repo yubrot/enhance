@@ -4,5 +4,6 @@ pub mod error;
 pub mod frontend;
 
 pub use backend::{BackendMessage, ErrorField, FieldDescription, TransactionStatus};
+pub use codec::{PostgresCodec, StartupCodec};
 pub use error::ProtocolError;
 pub use frontend::{FrontendMessage, StartupMessage, StartupParameters};
