@@ -191,3 +191,21 @@ SELECT 1 \parse stmt1
     );
     result.assert_success();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_extended_error_recovery() {
+    let server = PsqlTestServer::start().await;
+
+    // Cause an error by binding to nonexistent statement,
+    // then verify that subsequent commands work after Sync
+    let result = server.run_psql(
+        r#"
+\bind_named nonexistent 42 \g
+SELECT 1 \parse stmt1
+\bind_named stmt1 \g
+\q"#,
+    );
+    // The first bind fails with error, but Sync resets error state,
+    // so subsequent parse/bind/execute succeed
+    result.assert_success();
+}

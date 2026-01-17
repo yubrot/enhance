@@ -11,6 +11,8 @@ pub struct ConnectionState {
     statements: HashMap<String, PreparedStatement>,
     /// Named portals. Key "" is the unnamed portal.
     portals: HashMap<String, Portal>,
+    /// Error state flag. When true, extended query messages are skipped until Sync.
+    pub in_error: bool,
 }
 
 impl ConnectionState {

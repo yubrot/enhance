@@ -112,6 +112,15 @@ impl Connection {
                 self.handle_query(query.trim()).await?;
             }
             FrontendMessage::Terminate => return Ok(true),
+            FrontendMessage::Parse(_)
+            | FrontendMessage::Bind(_)
+            | FrontendMessage::Describe(_)
+            | FrontendMessage::Execute(_)
+            | FrontendMessage::Close(_)
+                if self.state.in_error =>
+            {
+                // Skip extended query messages when in error state
+            }
             FrontendMessage::Parse(msg) => {
                 self.handle_parse(msg).await?;
             }
@@ -164,15 +173,15 @@ impl Connection {
             Some("UNKNOWN") => {
                 // Unknown query type - return error
                 // https://www.postgresql.org/docs/current/protocol-error-fields.html
-                self.framed
-                    .send(BackendMessage::error(
-                        sql_state::SYNTAX_ERROR,
-                        format!(
-                            "Unrecognized query type: {}",
-                            query.chars().take(50).collect::<String>()
-                        ),
-                    ))
-                    .await?;
+                self.send_error(
+                    sql_state::SYNTAX_ERROR,
+                    format!(
+                        "Unrecognized query type: {}",
+                        query.chars().take(50).collect::<String>()
+                    ),
+                    false,
+                )
+                .await?;
             }
             Some(tag) => {
                 // All other recognized query types
@@ -224,16 +233,16 @@ impl Connection {
 
         // Verify statement exists
         if self.state.get_statement(&msg.statement_name).is_none() {
-            self.framed
-                .send(BackendMessage::error(
+            return self
+                .send_error(
                     sql_state::INVALID_SQL_STATEMENT_NAME,
                     format!(
                         "prepared statement \"{}\" does not exist",
                         msg.statement_name
                     ),
-                ))
-                .await?;
-            return Ok(());
+                    true,
+                )
+                .await;
         }
 
         // Create portal
@@ -259,13 +268,13 @@ impl Connection {
         match msg.target_type {
             DescribeTarget::Statement => {
                 let Some(stmt) = self.state.get_statement(&msg.name) else {
-                    self.framed
-                        .send(BackendMessage::error(
+                    return self
+                        .send_error(
                             sql_state::INVALID_SQL_STATEMENT_NAME,
                             format!("prepared statement \"{}\" does not exist", msg.name),
-                        ))
-                        .await?;
-                    return Ok(());
+                            true,
+                        )
+                        .await;
                 };
 
                 // Send ParameterDescription
@@ -281,13 +290,13 @@ impl Connection {
             }
             DescribeTarget::Portal => {
                 let Some(_portal) = self.state.get_portal(&msg.name) else {
-                    self.framed
-                        .send(BackendMessage::error(
+                    return self
+                        .send_error(
                             sql_state::INVALID_CURSOR_NAME,
                             format!("portal \"{}\" does not exist", msg.name),
-                        ))
-                        .await?;
-                    return Ok(());
+                            true,
+                        )
+                        .await;
                 };
 
                 // For stub: Send NoData (no result columns yet)
@@ -305,23 +314,23 @@ impl Connection {
         );
 
         let Some(portal) = self.state.get_portal(&msg.portal_name) else {
-            self.framed
-                .send(BackendMessage::error(
+            return self
+                .send_error(
                     sql_state::INVALID_CURSOR_NAME,
                     format!("portal \"{}\" does not exist", msg.portal_name),
-                ))
-                .await?;
-            return Ok(());
+                    true,
+                )
+                .await;
         };
 
         let Some(stmt) = self.state.get_statement(&portal.statement_name) else {
-            self.framed
-                .send(BackendMessage::error(
+            return self
+                .send_error(
                     sql_state::INVALID_SQL_STATEMENT_NAME,
                     "statement for portal does not exist".to_string(),
-                ))
-                .await?;
-            return Ok(());
+                    true,
+                )
+                .await;
         };
 
         // Stub execution - classify query and return appropriate response
@@ -368,10 +377,9 @@ impl Connection {
     async fn handle_sync(&mut self) -> Result<(), ConnectionError> {
         println!("(pid={}) Sync", self.pid);
 
-        // Clear unnamed statement/portal (per PostgreSQL spec)
+        self.state.in_error = false;
         self.state.clear_unnamed();
 
-        // Send ReadyForQuery
         self.framed
             .send(BackendMessage::ReadyForQuery {
                 status: TransactionStatus::Idle,
@@ -379,6 +387,23 @@ impl Connection {
             .await?;
 
         self.framed.flush().await?;
+        Ok(())
+    }
+
+    /// Send an error response and mark the connection as in-error state.
+    ///
+    /// In error state, subsequent extended query messages (Parse, Bind, Describe,
+    /// Execute, Close) are skipped until Sync.
+    async fn send_error(
+        &mut self,
+        code: &str,
+        message: String,
+        into_error_state: bool,
+    ) -> Result<(), ConnectionError> {
+        self.framed
+            .send(BackendMessage::error(code, message))
+            .await?;
+        self.state.in_error = into_error_state;
         Ok(())
     }
 }
