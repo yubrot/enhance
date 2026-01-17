@@ -4,6 +4,7 @@ use tokio_util::codec::Decoder;
 
 use crate::protocol::codec::{PostgresCodec, StartupCodec, get_cstring, get_nullable_bytes};
 use crate::protocol::error::ProtocolError;
+use crate::protocol::types::FormatCode;
 
 /// Ensures that the buffer has at least `n` bytes remaining.
 /// Returns `ProtocolError::InvalidMessage` if not enough bytes are available.
@@ -250,12 +251,12 @@ pub struct BindMessage {
     pub portal_name: String,
     /// Source prepared statement name
     pub statement_name: String,
-    /// Parameter format codes (0=text, 1=binary)
-    pub param_format_codes: Vec<i16>,
+    /// Parameter format codes
+    pub param_format_codes: Vec<FormatCode>,
     /// Parameter values (None = NULL)
     pub param_values: Vec<Option<Vec<u8>>>,
     /// Result column format codes
-    pub result_format_codes: Vec<i16>,
+    pub result_format_codes: Vec<FormatCode>,
 }
 
 impl BindMessage {
@@ -274,7 +275,9 @@ impl BindMessage {
         ensure_remaining!(src, format_count * 2);
         let mut param_format_codes = Vec::with_capacity(format_count);
         for _ in 0..format_count {
-            param_format_codes.push(src.get_i16());
+            let code = src.get_i16();
+            let format = FormatCode::from_i16(code).ok_or(ProtocolError::InvalidMessage)?;
+            param_format_codes.push(format);
         }
 
         // Parameter values
@@ -296,7 +299,9 @@ impl BindMessage {
         ensure_remaining!(src, result_format_count * 2);
         let mut result_format_codes = Vec::with_capacity(result_format_count);
         for _ in 0..result_format_count {
-            result_format_codes.push(src.get_i16());
+            let code = src.get_i16();
+            let format = FormatCode::from_i16(code).ok_or(ProtocolError::InvalidMessage)?;
+            result_format_codes.push(format);
         }
 
         Ok(BindMessage {
@@ -433,6 +438,8 @@ mod tests {
     use super::*;
     use bytes::{BufMut, BytesMut};
     use tokio_util::codec::Decoder;
+
+    use crate::protocol::type_oid;
 
     /// Helper to create a startup message with given code and body
     fn make_startup_message(code: i32, body: &[u8]) -> Vec<u8> {
@@ -586,8 +593,8 @@ mod tests {
         body.push(0); // empty (unnamed) statement - commonly used in PostgreSQL
         body.extend_from_slice(b"SELECT $1, $2\0");
         body.put_i16(2); // 2 parameters
-        body.put_i32(23); // INT4 OID
-        body.put_i32(25); // TEXT OID
+        body.put_i32(type_oid::INT4);
+        body.put_i32(type_oid::TEXT);
 
         let buf = make_frontend_message(b'P', &body);
         let msg = decode_frontend_message(&buf).unwrap().unwrap();
@@ -598,7 +605,7 @@ mod tests {
 
         assert_eq!(parse.statement_name, ""); // unnamed statement
         assert_eq!(parse.query, "SELECT $1, $2");
-        assert_eq!(parse.param_types, vec![23, 25]);
+        assert_eq!(parse.param_types, vec![type_oid::INT4, type_oid::TEXT]);
     }
 
     #[test]
@@ -607,7 +614,7 @@ mod tests {
         body.extend_from_slice(b"portal\0");
         body.extend_from_slice(b"SELECT $1\0");
         body.put_i16(1);
-        body.put_i32(23);
+        body.put_i32(type_oid::INT4);
 
         let buf = make_frontend_message(b'P', &body);
         let msg = decode_frontend_message(&buf).unwrap().unwrap();
@@ -618,7 +625,7 @@ mod tests {
 
         assert_eq!(parse.statement_name, "portal");
         assert_eq!(parse.query, "SELECT $1");
-        assert_eq!(parse.param_types, vec![23]);
+        assert_eq!(parse.param_types, vec![type_oid::INT4]);
     }
 
     #[test]
@@ -646,12 +653,12 @@ mod tests {
 
         assert_eq!(bind.portal_name, "portal");
         assert_eq!(bind.statement_name, "stmt");
-        assert_eq!(bind.param_format_codes, vec![0]);
+        assert_eq!(bind.param_format_codes, vec![FormatCode::Text]);
         assert_eq!(bind.param_values.len(), 3);
         assert_eq!(bind.param_values[0], Some(b"42".to_vec()));
         assert_eq!(bind.param_values[1], None); // NULL parameter
         assert_eq!(bind.param_values[2], Some(b"hello".to_vec()));
-        assert_eq!(bind.result_format_codes, vec![0]);
+        assert_eq!(bind.result_format_codes, vec![FormatCode::Text]);
     }
 
     #[test]

@@ -11,7 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::protocol::{
     BackendMessage, BindMessage, CloseMessage, CloseTarget, DescribeMessage, DescribeTarget,
-    ErrorField, ExecuteMessage, FrontendMessage, ParseMessage, PostgresCodec, TransactionStatus,
+    ErrorField, ErrorFieldCode, ExecuteMessage, FrontendMessage, ParseMessage, PostgresCodec,
+    TransactionStatus,
 };
 
 /// A single client connection.
@@ -175,19 +176,19 @@ impl Connection {
                     .send(BackendMessage::ErrorResponse {
                         fields: vec![
                             ErrorField {
-                                code: b'S',
+                                code: ErrorFieldCode::Severity,
                                 value: "ERROR".to_string(),
                             },
                             ErrorField {
-                                code: b'V',
+                                code: ErrorFieldCode::SeverityNonLocalized,
                                 value: "ERROR".to_string(),
                             },
                             ErrorField {
-                                code: b'C',
+                                code: ErrorFieldCode::SqlState,
                                 value: "42601".to_string(), // syntax_error
                             },
                             ErrorField {
-                                code: b'M',
+                                code: ErrorFieldCode::Message,
                                 value: format!(
                                     "Unrecognized query type: {}",
                                     query.chars().take(50).collect::<String>()
@@ -410,19 +411,19 @@ impl Connection {
             .send(BackendMessage::ErrorResponse {
                 fields: vec![
                     ErrorField {
-                        code: b'S',
+                        code: ErrorFieldCode::Severity,
                         value: "ERROR".to_string(),
                     },
                     ErrorField {
-                        code: b'V',
+                        code: ErrorFieldCode::SeverityNonLocalized,
                         value: "ERROR".to_string(),
                     },
                     ErrorField {
-                        code: b'C',
+                        code: ErrorFieldCode::SqlState,
                         value: code.to_string(),
                     },
                     ErrorField {
-                        code: b'M',
+                        code: ErrorFieldCode::Message,
                         value: message.into(),
                     },
                 ],

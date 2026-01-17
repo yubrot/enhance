@@ -1,4 +1,5 @@
 use crate::protocol::codec::{PostgresCodec, StartupCodec, put_cstring};
+use crate::protocol::types::{ErrorFieldCode, FormatCode};
 use bytes::{BufMut, BytesMut};
 use std::io;
 use tokio_util::codec::Encoder;
@@ -171,17 +172,17 @@ impl TransactionStatus {
     }
 }
 
-/// Error/Notice field codes.
+/// Error/Notice field.
 #[derive(Debug)]
 pub struct ErrorField {
-    pub code: u8,
+    pub code: ErrorFieldCode,
     pub value: String,
 }
 
 impl ErrorField {
     /// Encodes this error field into the given BytesMut buffer.
     fn encode(&self, dst: &mut BytesMut) {
-        dst.put_u8(self.code);
+        dst.put_u8(self.code.as_u8());
         put_cstring(dst, &self.value);
     }
 }
@@ -223,8 +224,8 @@ pub struct FieldDescription {
     pub type_size: i16,
     /// Type modifier (-1 if not applicable)
     pub type_modifier: i32,
-    /// Format code (0 = text, 1 = binary)
-    pub format_code: i16,
+    /// Format code
+    pub format_code: FormatCode,
 }
 
 impl FieldDescription {
@@ -236,7 +237,7 @@ impl FieldDescription {
         dst.put_i32(self.type_oid);
         dst.put_i16(self.type_size);
         dst.put_i32(self.type_modifier);
-        dst.put_i16(self.format_code);
+        dst.put_i16(self.format_code.as_i16());
     }
 }
 
@@ -245,6 +246,8 @@ mod tests {
     use super::*;
     use bytes::BytesMut;
     use tokio_util::codec::Encoder;
+
+    use crate::protocol::type_oid;
 
     /// Helper to encode a message and return the buffer.
     fn encode_message(msg: BackendMessage) -> Vec<u8> {
@@ -317,15 +320,15 @@ mod tests {
         let msg = BackendMessage::ErrorResponse {
             fields: vec![
                 ErrorField {
-                    code: b'S',
+                    code: ErrorFieldCode::Severity,
                     value: "ERROR".to_string(),
                 },
                 ErrorField {
-                    code: b'C',
+                    code: ErrorFieldCode::SqlState,
                     value: "42P01".to_string(),
                 },
                 ErrorField {
-                    code: b'M',
+                    code: ErrorFieldCode::Message,
                     value: "table does not exist".to_string(),
                 },
             ],
@@ -353,28 +356,28 @@ mod tests {
                     name: "col".to_string(),
                     table_oid: 0,
                     column_id: 0,
-                    type_oid: 23, // INT4
+                    type_oid: type_oid::INT4,
                     type_size: 4,
                     type_modifier: -1,
-                    format_code: 0,
+                    format_code: FormatCode::Text,
                 },
                 FieldDescription {
                     name: "text_col".to_string(),
                     table_oid: 16384,
                     column_id: 2,
-                    type_oid: 25, // TEXT (variable length)
+                    type_oid: type_oid::TEXT,
                     type_size: -1,
                     type_modifier: -1,
-                    format_code: 0,
+                    format_code: FormatCode::Text,
                 },
                 FieldDescription {
                     name: "binary_col".to_string(),
                     table_oid: 16384,
                     column_id: 3,
-                    type_oid: 17, // BYTEA
+                    type_oid: type_oid::BYTEA,
                     type_size: -1,
                     type_modifier: -1,
-                    format_code: 1, // binary format
+                    format_code: FormatCode::Binary,
                 },
             ],
         };
@@ -462,15 +465,15 @@ mod tests {
     #[test]
     fn test_write_parameter_description() {
         let msg = BackendMessage::ParameterDescription {
-            param_types: vec![23, 25, 1043], // INT4, TEXT, VARCHAR
+            param_types: vec![type_oid::INT4, type_oid::TEXT, type_oid::VARCHAR],
         };
         let buf = encode_message(msg);
 
         assert_eq!(buf[0], b't');
         assert_eq!(read_i32(&buf, 1), 18); // 4 + 2 + 3*4
         assert_eq!(read_i16(&buf, 5), 3); // param count
-        assert_eq!(read_i32(&buf, 7), 23); // INT4
-        assert_eq!(read_i32(&buf, 11), 25); // TEXT
-        assert_eq!(read_i32(&buf, 15), 1043); // VARCHAR
+        assert_eq!(read_i32(&buf, 7), type_oid::INT4);
+        assert_eq!(read_i32(&buf, 11), type_oid::TEXT);
+        assert_eq!(read_i32(&buf, 15), type_oid::VARCHAR);
     }
 }

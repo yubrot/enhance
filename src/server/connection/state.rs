@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::protocol::FormatCode;
+
 /// A prepared statement stored on the connection.
 #[derive(Debug, Clone)]
 pub struct PreparedStatement {
@@ -17,9 +19,9 @@ pub struct Portal {
     /// Bound parameter values (None = NULL)
     pub _param_values: Vec<Option<Vec<u8>>>,
     /// Parameter format codes
-    pub _param_format_codes: Vec<i16>,
+    pub _param_format_codes: Vec<FormatCode>,
     /// Result column format codes
-    pub _result_format_codes: Vec<i16>,
+    pub _result_format_codes: Vec<FormatCode>,
 }
 
 /// Per-connection state for Extended Query Protocol.
