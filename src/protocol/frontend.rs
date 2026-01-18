@@ -283,6 +283,10 @@ impl BindMessage {
         // Parameter values
         ensure_remaining!(src, 2);
         let param_count = src.get_i16() as usize;
+        if param_count > MAX_PARAMS {
+            return Err(ProtocolError::InvalidMessage);
+        }
+
         let mut param_values = Vec::with_capacity(param_count);
         for _ in 0..param_count {
             let value = get_nullable_bytes(src)?;

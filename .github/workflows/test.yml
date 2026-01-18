@@ -7,17 +7,17 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v6
-    - name: Build
-      run: cargo build --verbose
-    - name: Run lints
-      run: cargo clippy
-    - name: Run tests
-      run: cargo test
+      - uses: actions/checkout@v6
+      - name: Build
+        run: cargo build --verbose
+      - name: Run lints
+        run: cargo clippy
+      - name: Run tests
+        run: cargo test

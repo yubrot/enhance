@@ -4,23 +4,49 @@
 
 # This Week I Learned
 
-## Design Decisions
+## Storage Trait: Page I/O Interface
 
-These decisions shape how the storage layer integrates with the Buffer Pool Manager (Week 7-8) and beyond.
+Implemented the `Storage` trait as the foundation for page-based I/O operations:
 
-### Caller-Owned Buffers
+```rust
+pub trait Storage: Send + Sync {
+    async fn read_page(&self, page_id: PageId, buf: &mut [u8]) -> Result<(), StorageError>;
+    async fn write_page(&self, page_id: PageId, buf: &[u8]) -> Result<(), StorageError>;
+    async fn allocate_page(&self) -> Result<PageId, StorageError>;
+    async fn page_count(&self) -> usize;
+    async fn sync_all(&self) -> Result<(), StorageError>;
+}
+```
 
-The `Storage` trait does **raw byte I/O only**. The caller provides the buffer (`&mut [u8]` or `&[u8]`), and Storage reads or writes exactly 8KB.
+**Key Characteristics:**
 
-Notably, each `read_page()` or `write_page()` call goes directly to the underlying storage.
+- **Send + Sync**: Thread-safe for concurrent access from multiple async tasks. The Buffer Pool Manager (Week 7-8) will use this trait from multiple connections.
+- **Caller-owned buffers**: Storage doesn't allocate memory - the caller provides `&mut [u8]` for reads and `&[u8]` for writes. All buffers must be exactly `PAGE_SIZE` (8KB).
+- **No caching**: This layer performs raw I/O only. Caching is the Buffer Pool Manager's responsibility.
 
-**Rationale**: Memory allocation, caching, and buffer lifetime management are explicitly the caller's responsibility. This keeps `Storage` focused solely on I/O operations. The Buffer Pool Manager (Week 7-8) will manage page caching and eviction.
+## PageId and PAGE_SIZE
 
-### Async-First
+- **PAGE_SIZE**: 8192 bytes (8KB), aligned with PostgreSQL standard and OS page sizes for efficient I/O.
+- **PageId**: Simple `u64` wrapper that uniquely identifies a page. Provides `byte_offset()` method to calculate file position (`page_num * 8192`).
 
-All trait methods return futures using Rust 1.75+ native `async fn` in traits.
+Notice that we use 8KB (8192 bytes) fixed-size pages. This is because...
 
-**Design Context**: RDBMS implementations face a fundamental concurrency challenge - handling multiple client connections while managing shared resources (buffer pool, locks, disk I/O). There are several established approaches:
+- Matches PostgreSQL's default
+- Aligns with common OS page sizes (4KB multiple)
+
+## PageData: Page-Aligned Memory Allocation
+
+Implemented `PageData` for low-level page-aligned memory management:
+
+- **4KB alignment**: Uses `std::alloc` to allocate 8KB blocks aligned to 4KB boundaries (typical OS page size).
+- **Zero-initialized**: New pages are zeroed on allocation for safety.
+- **Send + Sync**: Safe to share across threads (used inside `Mutex<Vec<PageData>>` in MemoryStorage).
+
+**Why page alignment?** Aligning to OS page boundaries provides better cache efficiency and compatibility with future Direct I/O features.
+
+## Why Async Rust for Storage?
+
+RDBMS implementations face a fundamental concurrency challenge: handling multiple client connections while managing shared resources (buffer pool, locks, disk I/O). There are several established approaches:
 
 | Concurrency Model          | Examples                   | Strengths                                                       | Weaknesses                                                  |
 | -------------------------- | -------------------------- | --------------------------------------------------------------- | ----------------------------------------------------------- |
@@ -29,17 +55,11 @@ All trait methods return futures using Rust 1.75+ native `async fn` in traits.
 | **Thread pool**            | Modern PostgreSQL, MariaDB | Bounded resource usage, better scalability                      | Complex work stealing, still limited by thread count        |
 | **Async/Event-driven**     | ScyllaDB, Redis            | Handle many connections with few threads, efficient I/O waiting | Complex async programming, harder debugging                 |
 
-Our approach corresponds to the **Async/Event-driven** model, but leverages Rust's safety guarantees and tokio's ecosystem.
+Our approach corresponds to the **Async/Event-driven** model, but leverages Rust's safety guarantees and tokio's ecosystem:
 
-**Notable characteristics of Async Rust + tokio**:
-
-1. **Compile-time state machines**: Futures compile to state machines at compile time with no heap allocations per async call. Callback-based systems (Node.js, libuv) use dynamic dispatch; async/await is zero-cost in Rust.
-2. **Compile-time `Send + Sync` checking**: The compiler prevents holding non-Send values (e.g., `Rc<T>`) across `.await` points. This is enforced at compile time, unlike runtime checks in Go or dynamic languages.
-3. **Uniform async/await syntax**: TCP listener, query parser, buffer pool, and disk I/O all use `async fn` and `.await`. Python's asyncio requires mixing blocking I/O threads with async runtime; Rust doesn't.
-4. **Strongly-typed futures**: `Future<Output = Result<T, E>>` encodes return types in the type system. C-based async systems (libuv callbacks) often use void pointers; Rust futures are fully type-checked.
-5. **Integrated ecosystem**: `tokio::fs::File`, `tokio::net::TcpListener`, and async traits work together without adapters. No bridging layer needed between different async primitives.
-
-**Trade-offs**: Async Rust has a steeper learning curve. Lifetime management across `.await` and debugging async stack traces require familiarity with the model. For this learning-focused project, these challenges provide insight into modern concurrency patterns.
+1. **Compile-time `Send + Sync` checking**: The compiler prevents holding non-Send values (e.g., `Rc<T>`) across `.await` points. This is enforced at compile time, unlike runtime checks in Go or dynamic languages.
+2. **Strongly-typed futures**: `Future<Output = Result<T, E>>` encodes return types in the type system. C-based async systems (libuv callbacks) often use void pointers; Rust futures are fully type-checked.
+3. **Integrated ecosystem**: `tokio::fs::File`, `tokio::net::TcpListener`, and async traits work together without adapters. No bridging layer needed between different async primitives.
 
 # Looking Forward
 

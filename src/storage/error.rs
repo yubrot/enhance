@@ -28,6 +28,11 @@ pub enum StorageError {
     ///
     /// This is primarily used by MemoryStorage with max_pages limit for testing.
     /// FileStorage may return this if the file system is full.
+    ///
+    /// NOTE: Currently unused. For production implementation:
+    /// - MemoryStorage: Add `max_pages` limit in constructor
+    /// - FileStorage: Check available disk space or set max file size
+    /// - Buffer Pool: Return this when all frames are pinned and no eviction possible
     StorageFull,
 
     /// Data corruption detected.

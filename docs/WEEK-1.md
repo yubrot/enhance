@@ -4,6 +4,32 @@
 
 # This Week I Learned
 
+## Uses Rust + Tokio Async Runtime
+
+**Context**: RDBMS implementation requires handling multiple concurrent connections efficiently.
+
+**Decision**: Use Rust with Tokio async runtime instead of thread-per-connection model.
+
+**Consequences**:
+
+- (+) Low memory overhead per connection (task vs thread)
+- (+) Compile-time safety guarantees via `Send + Sync`
+- (+) Rich ecosystem (`tokio::fs`, `tokio::net`, etc.)
+- (-) Debugging async code can be challenging
+
+## PostgreSQL Wire Protocol v3.0
+
+**Context**: Need a well-documented protocol that allows testing with existing tools.
+
+**Decision**: Implement PostgreSQL wire protocol v3.0 with Extended Query Protocol support.
+
+**Consequences**:
+
+- (+) Can use psql, pgAdmin, and standard PostgreSQL drivers for testing
+- (+) Well-documented protocol with clear message formats
+- (+) Extended Query Protocol enables prepared statements
+- (-) Must implement complex startup sequence (SSLRequest, parameters, etc.)
+
 ## How PostgreSQL Wire Protocol 3.0 Begins
 
 Since we use psql as a client, we needed to learn some aspects of the PostgreSQL Wire Protocol 3.0.
@@ -99,13 +125,11 @@ Understanding the architectural difference in handling concurrent connections:
 PostgreSQL uses a traditional multi-process model:
 
 1. **Process Structure**
-
    - `postmaster`: Main process that accepts client connections
    - `postgres`: Backend process forked per connection (one OS process per client)
    - Utility processes: WAL writer, checkpointer, autovacuum, etc.
 
 2. **Memory Sharing via OS Shared Memory**
-
    - **Shared Buffer Pool**: Disk page cache shared across all processes
    - **WAL Buffer**: Transaction log buffer
    - **Lock Table**: Table/row-level lock information
@@ -120,13 +144,11 @@ PostgreSQL uses a traditional multi-process model:
 enhance takes a modern Rust-centric approach:
 
 1. **Concurrency Model**
-
    - Single process with Tokio async runtime
    - One async task per connection (not OS threads)
    - Lightweight task switching managed by Tokio executor
 
 2. **Memory Sharing via Rust's Type System**
-
    - **`Arc<RwLock<Page>>` (maybe)**: Safe shared access to pages across tasks
    - No OS-level shared memory needed
    - Rust's ownership system prevents data races at compile time
