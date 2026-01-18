@@ -9,17 +9,23 @@
 //! - PageId → FrameId mapping via page_table
 //! - Simple FIFO free_list (no eviction if full)
 //!
+//! # Week 8 Additions
+//!
+//! - LRU Replacer for page replacement policy
+//! - Page-level latches for fine-grained concurrency control
+//!
 //! # Future Extensions
 //!
-//! - Week 8: LRU Replacer and Page-level Latches
 //! - Week 21: WAL integration (page_lsn tracking)
 
 pub mod error;
 pub mod frame;
 pub mod guard;
 pub mod manager;
+pub mod replacer;
 
 pub use error::BufferPoolError;
-pub use frame::{Frame, FrameId};
+pub use frame::{Frame, FrameId, FrameInner};
 pub use guard::{PageReadGuard, PageWriteGuard};
 pub use manager::{BufferPoolConfig, BufferPoolManager};
+pub use replacer::{LruReplacer, Replacer};

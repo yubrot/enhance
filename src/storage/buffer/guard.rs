@@ -2,30 +2,46 @@
 //!
 //! Guards automatically unpin pages when dropped, preventing pin leaks.
 
-use super::frame::FrameId;
+use super::frame::{FrameId, FrameInner};
 use super::manager::BufferPoolManager;
+use super::replacer::Replacer;
 use crate::storage::{PageData, PageId, Storage};
+use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
+use std::sync::{RwLockReadGuard, RwLockWriteGuard};
 
 /// Read guard for accessing a page in the buffer pool.
 ///
 /// When dropped, automatically unpins the page. This prevents pin leaks
 /// and ensures that pages can be evicted when no longer in use.
 ///
-/// # Week 7 Implementation
+/// # Week 8 Architecture
 ///
-/// The guard holds a reference to the `BufferPoolManager` and uses a
-/// synchronous `Mutex` in `Drop` to avoid the async Drop problem.
+/// The guard holds an `RwLockReadGuard` for the frame's inner state,
+/// providing safe read access without unsafe transmute.
 ///
-/// # Week 8 Evolution
+/// # Limitation
 ///
-/// In Week 8, this will hold an `RwLockReadGuard` for page-level latching:
-/// ```text
-/// pub struct PageReadGuard<'a> {
-///     _latch: RwLockReadGuard<'a, PageData>,
-///     bpm: &'a BufferPoolManager,
-///     frame_id: FrameId,
-/// }
+/// While holding a `PageReadGuard`, do not call `BufferPoolManager` methods
+/// that acquire frame locks (e.g., `frame_count()`, `pin_count()`). This may
+/// cause deadlock due to `RwLock` semantics - the guard holds a read lock, and
+/// the same thread cannot acquire another lock on the same frame.
+///
+/// Safe usage pattern:
+/// ```no_run
+/// # use enhance::storage::{MemoryStorage, BufferPoolManager, BufferPoolConfig, PageId};
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// # let storage = MemoryStorage::new();
+/// # let bpm = BufferPoolManager::new(storage, BufferPoolConfig::default());
+/// let data = {
+///     let guard = bpm.fetch_page(PageId::new(0)).await?;
+///     guard[0] // Read data
+/// }; // Guard dropped here
+///
+/// // Now safe to call other BPM methods
+/// let count = bpm.frame_count().await;
+/// # Ok(())
+/// # }
 /// ```
 ///
 /// # Example
@@ -43,15 +59,34 @@ use std::ops::{Deref, DerefMut};
 /// # }
 /// ```
 pub struct PageReadGuard<'a, S: Storage> {
+    /// The frame's read lock guard, wrapped in ManuallyDrop.
+    ///
+    /// We use ManuallyDrop to control when the lock is released in Drop.
+    /// This allows us to drop the lock before trying to unpin.
+    latch: ManuallyDrop<RwLockReadGuard<'a, FrameInner>>,
+
+    /// Reference to the BPM for unpin on drop.
     bpm: &'a BufferPoolManager<S>,
+
+    /// Frame ID for unpin operation.
     frame_id: FrameId,
+
+    /// Page ID for unpin operation.
     page_id: PageId,
 }
 
 impl<'a, S: Storage> PageReadGuard<'a, S> {
     /// Creates a new read guard (internal use only).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the frame's lock is poisoned.
     pub(super) fn new(bpm: &'a BufferPoolManager<S>, frame_id: FrameId, page_id: PageId) -> Self {
+        // Acquire the frame's read lock
+        let latch = bpm.frames[frame_id.as_usize()].read();
+
         Self {
+            latch: ManuallyDrop::new(latch),
             bpm,
             frame_id,
             page_id,
@@ -65,27 +100,7 @@ impl<'a, S: Storage> PageReadGuard<'a, S> {
 
     /// Access the page data as a byte slice.
     pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: WEEK-7 LIMITATION - This implementation is only safe for
-        // single-threaded/single-task usage. The transmute extends the lifetime
-        // of the data reference beyond the RwLock guard, which means:
-        // - The frame cannot be evicted (guaranteed by pin_count > 0)
-        // - BUT the frame CAN be modified by another thread/task acquiring
-        //   a write lock after this read lock is released
-        //
-        // For Week 7, all tests assume single-threaded access to each page.
-        //
-        // WEEK-8: This will be replaced with per-frame RwLock that is held
-        // for the guard's lifetime, providing proper read/write exclusion:
-        // ```rust
-        // pub struct PageReadGuard<'a> {
-        //     _latch: RwLockReadGuard<'a, PageData>,
-        //     ...
-        // }
-        // ```
-        let inner = self.bpm.inner.read().unwrap();
-        let frame = &inner.frames[self.frame_id.as_usize()];
-
-        unsafe { std::mem::transmute(frame.data().as_slice()) }
+        self.latch.data().as_slice()
     }
 
     /// Manually releases the guard, unpinning the page.
@@ -100,19 +115,33 @@ impl<'a, S: Storage> PageReadGuard<'a, S> {
 
 impl<S: Storage> Drop for PageReadGuard<'_, S> {
     fn drop(&mut self) {
-        // WEEK-7: Simplified Drop implementation.
-        // In Week 7, we use try_write to avoid blocking in Drop.
-        // If the lock cannot be acquired, we skip unpinning (pin leak).
+        //  Week 8: Since we hold a read lock in self.latch, we can't directly
+        // unpin (which requires a write lock). We must drop the read lock first.
         //
-        // WEEK-8: This will be replaced with per-frame locks that can be
-        // acquired synchronously without blocking the runtime.
+        // SAFETY: Manually drop the latch to release the read lock.
+        unsafe {
+            ManuallyDrop::drop(&mut self.latch);
+        }
 
-        if let Ok(mut inner) = self.bpm.inner.try_write() {
-            let frame = &mut inner.frames[self.frame_id.as_usize()];
-            frame.unpin();
+        // Now the read lock is released, we can acquire write lock to unpin
+        // Note: We use try_write with a fallback to handle edge cases
+        let frame = &self.bpm.frames[self.frame_id.as_usize()];
+
+        if let Some(mut frame_inner) = frame.try_write() {
+            frame_inner.unpin();
+
+            // Notify replacer if frame became unpinned
+            let became_unpinned = frame_inner.pin_count() == 0;
+            drop(frame_inner);
+
+            if became_unpinned
+                && let Ok(mut replacer) = self.bpm.replacer.lock()
+            {
+                replacer.unpin(self.frame_id);
+            }
         } else {
             eprintln!(
-                "WARNING: Failed to unpin page {:?} in Drop - pin leak detected",
+                "WARNING: Failed to unpin page {:?} in Drop - pin leak",
                 self.page_id
             );
         }
@@ -122,6 +151,31 @@ impl<S: Storage> Drop for PageReadGuard<'_, S> {
 /// Write guard for accessing and modifying a page.
 ///
 /// When dropped, marks the page as dirty and unpins it.
+///
+/// # Limitation
+///
+/// While holding a `PageWriteGuard`, do not call `BufferPoolManager` methods
+/// that acquire frame locks (e.g., `frame_count()`, `pin_count()`). This may
+/// cause deadlock due to `RwLock` semantics - the guard holds a write lock, and
+/// the same thread cannot acquire another lock on the same frame.
+///
+/// Safe usage pattern:
+/// ```no_run
+/// # use enhance::storage::{MemoryStorage, BufferPoolManager, BufferPoolConfig, PageId};
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// # let storage = MemoryStorage::new();
+/// # let bpm = BufferPoolManager::new(storage, BufferPoolConfig::default());
+/// let page_id = {
+///     let mut guard = bpm.fetch_page_mut(PageId::new(0)).await?;
+///     guard[0] = 42; // Modify data
+///     guard.page_id()
+/// }; // Guard dropped here
+///
+/// // Now safe to call other BPM methods
+/// let count = bpm.frame_count().await;
+/// # Ok(())
+/// # }
+/// ```
 ///
 /// # Example
 ///
@@ -137,17 +191,36 @@ impl<S: Storage> Drop for PageReadGuard<'_, S> {
 /// # }
 /// ```
 pub struct PageWriteGuard<'a, S: Storage> {
+    /// The frame's write lock guard, wrapped in ManuallyDrop.
+    ///
+    /// We use ManuallyDrop to control when the lock is released in Drop.
+    latch: ManuallyDrop<RwLockWriteGuard<'a, FrameInner>>,
+
+    /// Reference to the BPM for unpin on drop.
     bpm: &'a BufferPoolManager<S>,
+
+    /// Frame ID for unpin operation.
     frame_id: FrameId,
+
+    /// Page ID for unpin operation.
     page_id: PageId,
+
     /// Track whether the page was modified to set dirty flag on drop.
     was_modified: bool,
 }
 
 impl<'a, S: Storage> PageWriteGuard<'a, S> {
     /// Creates a new write guard (internal use only).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the frame's lock is poisoned.
     pub(super) fn new(bpm: &'a BufferPoolManager<S>, frame_id: FrameId, page_id: PageId) -> Self {
+        // Acquire the frame's write lock
+        let latch = bpm.frames[frame_id.as_usize()].write();
+
         Self {
+            latch: ManuallyDrop::new(latch),
             bpm,
             frame_id,
             page_id,
@@ -162,11 +235,7 @@ impl<'a, S: Storage> PageWriteGuard<'a, S> {
 
     /// Access the page data as a byte slice.
     pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: See PageReadGuard::as_slice() for detailed safety discussion.
-        // Week 7: single-threaded/single-task access only.
-        let inner = self.bpm.inner.read().unwrap();
-        let frame = &inner.frames[self.frame_id.as_usize()];
-        unsafe { std::mem::transmute(frame.data().as_slice()) }
+        self.latch.data().as_slice()
     }
 
     /// Access the page data as a mutable byte slice.
@@ -174,25 +243,12 @@ impl<'a, S: Storage> PageWriteGuard<'a, S> {
     /// Calling this method marks the page as dirty.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         self.was_modified = true;
-
-        let mut inner = self.bpm.inner.write().unwrap();
-        let frame = &mut inner.frames[self.frame_id.as_usize()];
-
-        // Mark dirty immediately (data_mut() will also mark dirty, but that's fine)
-        frame.mark_dirty();
-
-        // SAFETY: See PageReadGuard::as_slice() for detailed safety discussion.
-        // Week 7: single-threaded/single-task access only.
-        unsafe { std::mem::transmute(frame.data_mut().as_mut_slice()) }
+        self.latch.data_mut().as_mut_slice()
     }
 
     /// Returns a reference to the underlying `PageData`.
     pub fn data(&self) -> &PageData {
-        // SAFETY: See PageReadGuard::as_slice() for detailed safety discussion.
-        // Week 7: single-threaded/single-task access only.
-        let inner = self.bpm.inner.read().unwrap();
-        let frame = &inner.frames[self.frame_id.as_usize()];
-        unsafe { std::mem::transmute(frame.data()) }
+        self.latch.data()
     }
 
     /// Returns a mutable reference to the underlying `PageData`.
@@ -200,16 +256,7 @@ impl<'a, S: Storage> PageWriteGuard<'a, S> {
     /// Calling this method marks the page as dirty.
     pub fn data_mut(&mut self) -> &mut PageData {
         self.was_modified = true;
-
-        let mut inner = self.bpm.inner.write().unwrap();
-        let frame = &mut inner.frames[self.frame_id.as_usize()];
-
-        // Mark dirty immediately
-        frame.mark_dirty();
-
-        // SAFETY: See PageReadGuard::as_slice() for detailed safety discussion.
-        // Week 7: single-threaded/single-task access only.
-        unsafe { std::mem::transmute(frame.data_mut()) }
+        self.latch.data_mut()
     }
 
     /// Manually releases the guard, unpinning the page and marking it dirty if modified.
@@ -223,18 +270,27 @@ impl<'a, S: Storage> PageWriteGuard<'a, S> {
 
 impl<S: Storage> Drop for PageWriteGuard<'_, S> {
     fn drop(&mut self) {
-        // WEEK-7: Simplified Drop implementation using try_write.
-        if let Ok(mut inner) = self.bpm.inner.try_write() {
-            let frame = &mut inner.frames[self.frame_id.as_usize()];
-            if self.was_modified {
-                frame.mark_dirty();
-            }
-            frame.unpin();
-        } else {
-            eprintln!(
-                "WARNING: Failed to unpin page {:?} in Drop - pin leak detected",
-                self.page_id
-            );
+        // Mark dirty if was modified (while we still hold the lock)
+        if self.was_modified {
+            self.latch.mark_dirty();
+        }
+
+        // Unpin while we still hold the write lock
+        self.latch.unpin();
+
+        // Check if we need to notify replacer
+        let became_unpinned = self.latch.pin_count() == 0;
+
+        // Now manually drop the latch to release the write lock
+        unsafe {
+            ManuallyDrop::drop(&mut self.latch);
+        }
+
+        // Notify replacer if frame became unpinned (after releasing the lock)
+        if became_unpinned
+            && let Ok(mut replacer) = self.bpm.replacer.lock()
+        {
+            replacer.unpin(self.frame_id);
         }
     }
 }

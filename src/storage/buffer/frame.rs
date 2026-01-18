@@ -4,6 +4,7 @@
 //! Each frame tracks metadata about the loaded page (if any).
 
 use crate::storage::{PageData, PageId};
+use std::sync::RwLock;
 
 /// Identifier for a frame in the buffer pool.
 ///
@@ -27,62 +28,129 @@ impl FrameId {
     }
 }
 
-/// A frame in the buffer pool containing page data and metadata.
+/// A frame in the buffer pool with per-frame locking.
 ///
-/// Each frame can hold exactly one page at a time. The frame tracks:
-/// - Which page is currently loaded (if any)
-/// - How many operations are currently using the page (`pin_count`)
-/// - Whether the page has been modified (`is_dirty`)
+/// # Week 8 Architecture
+///
+/// The frame uses an `RwLock` to protect its internal state, enabling
+/// fine-grained concurrency control. Multiple readers can access the frame
+/// simultaneously, while writers have exclusive access.
 ///
 /// # Lifecycle
 ///
 /// 1. **Empty**: `page_id = None`, frame is in the free_list
 /// 2. **Loaded**: Page is read from storage, `page_id = Some(...)`
 /// 3. **Pinned**: `pin_count > 0`, page cannot be evicted
-/// 4. **Unpinned**: `pin_count = 0`, page can be evicted (Week 8+)
+/// 4. **Unpinned**: `pin_count = 0`, page can be evicted
 /// 5. **Evicted**: If dirty, written to storage, then returned to free_list
-///
-/// # Week 8 Evolution
-///
-/// The `Frame` struct will evolve to support fine-grained locking:
-/// - `data: RwLock<PageData>` for page-level latches
-/// - `meta: Mutex<FrameMeta>` for metadata protection
 pub struct Frame {
+    /// The frame's internal state, protected by RwLock.
+    ///
+    /// Read lock: for reading page data and metadata
+    /// Write lock: for modifying page data, incrementing pin_count, or evicting
+    inner: RwLock<FrameInner>,
+}
+
+/// Inner state of a frame protected by RwLock.
+///
+/// This structure contains all the mutable state of a frame. The `Frame`
+/// struct wraps this in an `RwLock` to provide thread-safe access.
+pub struct FrameInner {
     /// The page data buffer (always allocated).
-    data: PageData,
+    pub(super) data: PageData,
 
     /// The `PageId` currently loaded in this frame, if any.
-    page_id: Option<PageId>,
+    pub(super) page_id: Option<PageId>,
 
     /// Number of operations currently using this frame.
     ///
     /// A frame cannot be evicted while `pin_count > 0`.
     /// Each call to `fetch_page` increments this counter, and each `unpin_page`
     /// (or `PageGuard::drop`) decrements it.
-    pin_count: u32,
+    pub(super) pin_count: u32,
 
     /// Whether the page has been modified since loading from disk.
     ///
     /// Dirty pages must be written back to storage before eviction.
-    is_dirty: bool,
+    pub(super) is_dirty: bool,
     // WEEK-21: WAL integration requires tracking the Log Sequence Number (LSN)
     // of the last modification to this page. Before flushing a dirty page,
     // the BPM must ensure that all WAL records up to page_lsn have been flushed.
     //
-    // page_lsn: Option<u64>,
+    // pub(super) page_lsn: Option<u64>,
 }
 
 impl Frame {
     /// Creates a new empty frame.
     pub fn new() -> Self {
         Self {
-            data: PageData::new(),
-            page_id: None,
-            pin_count: 0,
-            is_dirty: false,
+            inner: RwLock::new(FrameInner {
+                data: PageData::new(),
+                page_id: None,
+                pin_count: 0,
+                is_dirty: false,
+            }),
         }
     }
 
+    /// Acquires a read lock on the frame's inner state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the lock is poisoned.
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, FrameInner> {
+        self.inner.read().unwrap()
+    }
+
+    /// Acquires a write lock on the frame's inner state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the lock is poisoned.
+    pub fn write(&self) -> std::sync::RwLockWriteGuard<'_, FrameInner> {
+        self.inner.write().unwrap()
+    }
+
+    /// Attempts to acquire a write lock without blocking.
+    ///
+    /// Returns `None` if the lock is currently held.
+    pub fn try_write(&self) -> Option<std::sync::RwLockWriteGuard<'_, FrameInner>> {
+        self.inner.try_write().ok()
+    }
+
+    /// Returns true if this frame is currently pinned (in use).
+    pub fn is_pinned(&self) -> bool {
+        self.read().pin_count > 0
+    }
+
+    /// Returns true if the frame contains a page.
+    pub fn is_occupied(&self) -> bool {
+        self.read().page_id.is_some()
+    }
+
+    /// Returns the `PageId` of the loaded page, if any.
+    pub fn page_id(&self) -> Option<PageId> {
+        self.read().page_id
+    }
+
+    /// Returns the pin count.
+    pub fn pin_count(&self) -> u32 {
+        self.read().pin_count
+    }
+
+    /// Returns true if the page has been modified.
+    pub fn is_dirty(&self) -> bool {
+        self.read().is_dirty
+    }
+}
+
+impl Default for Frame {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameInner {
     /// Returns true if this frame is currently pinned (in use).
     pub fn is_pinned(&self) -> bool {
         self.pin_count > 0
@@ -161,12 +229,6 @@ impl Frame {
     }
 }
 
-impl Default for Frame {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,10 +245,13 @@ mod tests {
 
     #[test]
     fn test_frame_reset() {
-        let mut frame = Frame::new();
+        let frame = Frame::new();
         let page_id = PageId::new(42);
 
-        frame.reset(page_id);
+        {
+            let mut frame_inner = frame.write();
+            frame_inner.reset(page_id);
+        }
 
         assert!(frame.is_occupied());
         assert!(frame.is_pinned());
@@ -197,19 +262,32 @@ mod tests {
 
     #[test]
     fn test_frame_pin_unpin() {
-        let mut frame = Frame::new();
-        frame.reset(PageId::new(1));
+        let frame = Frame::new();
+
+        {
+            let mut frame_inner = frame.write();
+            frame_inner.reset(PageId::new(1));
+        }
 
         assert_eq!(frame.pin_count(), 1);
 
-        frame.pin();
+        {
+            let mut frame_inner = frame.write();
+            frame_inner.pin();
+        }
         assert_eq!(frame.pin_count(), 2);
 
-        frame.unpin();
+        {
+            let mut frame_inner = frame.write();
+            frame_inner.unpin();
+        }
         assert_eq!(frame.pin_count(), 1);
         assert!(frame.is_pinned());
 
-        frame.unpin();
+        {
+            let mut frame_inner = frame.write();
+            frame_inner.unpin();
+        }
         assert_eq!(frame.pin_count(), 0);
         assert!(!frame.is_pinned());
     }
@@ -217,29 +295,44 @@ mod tests {
     #[test]
     #[should_panic(expected = "unpin called with pin_count == 0")]
     fn test_frame_unpin_panics_when_zero() {
-        let mut frame = Frame::new();
-        frame.unpin();
+        let frame = Frame::new();
+        let mut frame_inner = frame.write();
+        frame_inner.unpin();
     }
 
     #[test]
     fn test_frame_data_mut_marks_dirty() {
-        let mut frame = Frame::new();
-        frame.reset(PageId::new(1));
+        let frame = Frame::new();
+
+        {
+            let mut frame_inner = frame.write();
+            frame_inner.reset(PageId::new(1));
+        }
 
         assert!(!frame.is_dirty());
 
-        let _data = frame.data_mut();
+        {
+            let mut frame_inner = frame.write();
+            let _data = frame_inner.data_mut();
+        }
 
         assert!(frame.is_dirty());
     }
 
     #[test]
     fn test_frame_clear() {
-        let mut frame = Frame::new();
-        frame.reset(PageId::new(1));
-        frame.mark_dirty();
+        let frame = Frame::new();
 
-        frame.clear();
+        {
+            let mut frame_inner = frame.write();
+            frame_inner.reset(PageId::new(1));
+            frame_inner.mark_dirty();
+        }
+
+        {
+            let mut frame_inner = frame.write();
+            frame_inner.clear();
+        }
 
         assert!(!frame.is_occupied());
         assert!(!frame.is_pinned());
