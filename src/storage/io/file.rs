@@ -1,12 +1,14 @@
 //! File-backed storage implementation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::fs::{File, OpenOptions};
+use tokio::fs::{File as TokioFile, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use crate::storage::{PageId, Storage, StorageError, PAGE_SIZE};
+use super::Storage;
+use crate::storage::error::StorageError;
+use crate::storage::page::{PAGE_SIZE, PageId};
 
 /// File-backed storage implementation.
 ///
@@ -39,7 +41,7 @@ pub struct FileStorage {
     /// Path to the storage file
     path: PathBuf,
     /// File handle wrapped in async mutex for serialized access
-    file: Mutex<File>,
+    file: Mutex<TokioFile>,
     /// Number of pages currently in the file
     page_count: AtomicU64,
 }
@@ -86,7 +88,7 @@ impl FileStorage {
     }
 
     /// Returns the path to the storage file.
-    pub fn path(&self) -> &PathBuf {
+    pub fn path(&self) -> &Path {
         &self.path
     }
 }
@@ -125,7 +127,7 @@ impl Storage for FileStorage {
 
         let current_count = self.page_count.load(Ordering::Acquire);
         if page_id.page_num() >= current_count {
-            return Err(StorageError::InvalidPageId(page_id));
+            return Err(StorageError::PageNotFound(page_id));
         }
 
         let mut file = self.file.lock().await;
@@ -154,8 +156,8 @@ impl Storage for FileStorage {
         Ok(page_id)
     }
 
-    async fn page_count(&self) -> u64 {
-        self.page_count.load(Ordering::Acquire)
+    async fn page_count(&self) -> usize {
+        self.page_count.load(Ordering::Acquire) as usize
     }
 
     async fn sync_all(&self) -> Result<(), StorageError> {
@@ -271,7 +273,7 @@ mod tests {
         let storage = FileStorage::open(&path).await.unwrap();
         let buf = [0u8; PAGE_SIZE];
         let result = storage.write_page(PageId::new(0), &buf).await;
-        assert!(matches!(result, Err(StorageError::InvalidPageId(_))));
+        assert!(matches!(result, Err(StorageError::PageNotFound(_))));
     }
 
     #[tokio::test]
@@ -286,7 +288,10 @@ mod tests {
         let result = storage.read_page(page_id, &mut buf).await;
         assert!(matches!(
             result,
-            Err(StorageError::InvalidBufferSize { expected: PAGE_SIZE, actual: 100 })
+            Err(StorageError::InvalidBufferSize {
+                expected: PAGE_SIZE,
+                actual: 100
+            })
         ));
     }
 
@@ -302,7 +307,10 @@ mod tests {
         let result = storage.write_page(page_id, &buf).await;
         assert!(matches!(
             result,
-            Err(StorageError::InvalidBufferSize { expected: PAGE_SIZE, actual: 100 })
+            Err(StorageError::InvalidBufferSize {
+                expected: PAGE_SIZE,
+                actual: 100
+            })
         ));
     }
 

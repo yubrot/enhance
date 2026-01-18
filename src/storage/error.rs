@@ -8,14 +8,8 @@ pub enum StorageError {
     /// Page not found in storage.
     ///
     /// This occurs when attempting to read or write a page that has not been
-    /// allocated yet.
+    /// allocated yet. Use `allocate_page` to create new pages.
     PageNotFound(PageId),
-
-    /// Invalid page ID (e.g., attempting to access beyond allocated pages).
-    ///
-    /// This occurs when trying to write to a page that doesn't exist.
-    /// Use `allocate_page` to create new pages.
-    InvalidPageId(PageId),
 
     /// Invalid buffer size provided to read_page or write_page.
     ///
@@ -46,7 +40,6 @@ impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StorageError::PageNotFound(id) => write!(f, "page not found: {:?}", id),
-            StorageError::InvalidPageId(id) => write!(f, "invalid page id: {:?}", id),
             StorageError::InvalidBufferSize { expected, actual } => {
                 write!(f, "invalid buffer size: expected {}, got {}", expected, actual)
             }

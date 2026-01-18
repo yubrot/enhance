@@ -77,9 +77,10 @@ impl BackendMessage {
     ///
     /// # Examples
     ///
-    /// ```ignore
-    /// use crate::protocol::{BackendMessage, sql_state};
+    /// ```rust,no_run
+    /// use enhance::protocol::{BackendMessage, sql_state};
     ///
+    /// let query = "INVALID SYNTAX";
     /// let msg = BackendMessage::error(
     ///     sql_state::SYNTAX_ERROR,
     ///     format!("Unrecognized query type: {}", query)

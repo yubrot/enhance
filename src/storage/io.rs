@@ -1,13 +1,23 @@
-//! Storage trait definition.
+//! Page I/O backend implementations.
+//!
+//! This module provides the `Storage` trait for page-based I/O operations,
+//! along with MemoryStorage and FileStorage implementations.
 
-use crate::storage::{PageId, StorageError};
+mod file;
+mod memory;
 
-/// Storage backend trait for page-based I/O.
+pub use file::FileStorage;
+pub use memory::MemoryStorage;
+
+use super::page::PageId;
+use crate::storage::error::StorageError;
+
+/// Page I/O backend trait for page-based storage.
 ///
 /// This trait defines the interface for reading and writing 8KB pages using
 /// caller-owned buffers. Implementations include:
-/// - `MemoryStorage`: In-memory storage for testing
-/// - `FileStorage`: Disk-backed storage using tokio::fs
+/// - `io::MemoryStorage`: In-memory storage
+/// - `io::FileStorage`: Disk-backed storage using tokio::fs
 ///
 /// # Design Decisions
 ///
@@ -59,7 +69,7 @@ pub trait Storage: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns `StorageError::InvalidPageId` if the page has not been allocated.
+    /// Returns `StorageError::PageNotFound` if the page has not been allocated.
     /// Returns `StorageError::InvalidBufferSize` if `buf.len() != PAGE_SIZE`.
     fn write_page(
         &self,
@@ -71,6 +81,11 @@ pub trait Storage: Send + Sync {
     ///
     /// The new page is initialized to zeros.
     ///
+    /// # Page ID Allocation
+    ///
+    /// The first call to `allocate_page()` on an empty storage is guaranteed to
+    /// return `PageId(0)`. The order of subsequent allocations is implementation-defined.
+    ///
     /// # Errors
     ///
     /// Returns `StorageError::StorageFull` if storage limit is reached.
@@ -79,12 +94,12 @@ pub trait Storage: Send + Sync {
     ) -> impl std::future::Future<Output = Result<PageId, StorageError>> + Send;
 
     /// Returns the total number of allocated pages.
-    fn page_count(&self) -> impl std::future::Future<Output = u64> + Send;
+    fn page_count(&self) -> impl std::future::Future<Output = usize> + Send;
 
     /// Syncs all pending writes to physical disk (fsync).
     ///
-    /// For MemoryStorage, this is a no-op.
-    /// For FileStorage, this calls `sync_all()` to ensure durability.
+    /// For io::MemoryStorage, this is a no-op.
+    /// For io::FileStorage, this calls `sync_all()` to ensure durability.
     ///
     /// This method makes the distinction between:
     /// - Memory → OS buffer: write (implicit)

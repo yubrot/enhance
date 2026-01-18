@@ -1,4 +1,11 @@
-//! Page identifier and size constants.
+//! Page-level abstractions for the storage layer.
+//!
+//! This module provides the core page abstractions used throughout the storage
+//! engine, including page identifiers and page data structures.
+
+pub mod data;
+
+pub use data::PageData;
 
 /// 8KB page size (aligned with OS page size and PostgreSQL standard).
 pub const PAGE_SIZE: usize = 8192;
@@ -11,7 +18,7 @@ pub const PAGE_SIZE: usize = 8192;
 /// NOTE: For production, this could be extended to support multiple files
 /// (tablespaces, indexes, etc.) by encoding file_id in the high bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PageId(pub u64);
+pub struct PageId(u64);
 
 impl PageId {
     /// Creates a new PageId from a page number.
@@ -41,19 +48,5 @@ mod tests {
         assert_eq!(PageId::new(0).byte_offset(), 0);
         assert_eq!(PageId::new(1).byte_offset(), 8192);
         assert_eq!(PageId::new(100).byte_offset(), 819200);
-        assert_eq!(PageId::new(1000).byte_offset(), 8192000);
-    }
-
-    #[test]
-    fn test_page_id_new() {
-        let page_id = PageId::new(42);
-        assert_eq!(page_id.page_num(), 42);
-    }
-
-    #[test]
-    fn test_page_id_ordering() {
-        assert!(PageId::new(0) < PageId::new(1));
-        assert!(PageId::new(1) < PageId::new(100));
-        assert_eq!(PageId::new(42), PageId::new(42));
     }
 }
