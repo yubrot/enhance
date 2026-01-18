@@ -22,10 +22,12 @@
 //! +--------------+ +-------------+
 //! ```
 
+pub mod buffer;
 pub mod error;
 pub mod io;
 pub mod page;
 
+pub use buffer::{BufferPoolConfig, BufferPoolError, BufferPoolManager};
 pub use error::StorageError;
 pub use io::{FileStorage, MemoryStorage, Storage};
 pub use page::{PageData, PageId, PAGE_SIZE};
