@@ -45,7 +45,7 @@ Goal: Connect via `psql` and handle the stateful Parse/Bind/Execute flow.
 Goal: Manage 8KB pages safely across threads with disk persistence.
 
 - Week 5-6: Storage Trait & Implementations: Define the Storage trait. Implement memory-backed and file-backed storage for 8KB page I/O. ✅
-- Week 7: Buffer Pool Manager (Core): Implement fetch_page and unpin_page. Map PageId to memory Frames.
+- Week 7: Buffer Pool (Core): Implement fetch_page and unpin_page. Map PageId to memory Frames.
 - Week 8: LRU Policy & Latch Hierarchy: Implement page replacement logic. Crucial: Design the locking order to ensure the system is deadlock-free.
 
 ### Month 3: Data Layout & Serialization

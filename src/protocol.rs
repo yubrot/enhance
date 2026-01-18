@@ -4,11 +4,11 @@ pub mod error;
 pub mod frontend;
 pub mod types;
 
-pub use backend::{sql_state, BackendMessage, ErrorField, FieldDescription, TransactionStatus};
+pub use backend::{BackendMessage, ErrorField, FieldDescription, TransactionStatus, sql_state};
 pub use codec::{PostgresCodec, StartupCodec};
 pub use error::ProtocolError;
 pub use frontend::{
     BindMessage, CloseMessage, CloseTarget, DescribeMessage, DescribeTarget, ExecuteMessage,
     FrontendMessage, ParseMessage, StartupMessage, StartupParameters,
 };
-pub use types::{type_oid, ErrorFieldCode, FormatCode};
+pub use types::{ErrorFieldCode, FormatCode, type_oid};

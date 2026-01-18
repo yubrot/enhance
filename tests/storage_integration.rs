@@ -1,6 +1,6 @@
 //! Integration tests for storage layer.
 
-use enhance::storage::{FileStorage, MemoryStorage, PageId, PAGE_SIZE, Storage, StorageError};
+use enhance::storage::{FileStorage, MemoryStorage, PAGE_SIZE, PageId, Storage, StorageError};
 use std::sync::Arc;
 use tempfile::{TempDir, tempdir};
 

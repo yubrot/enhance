@@ -667,9 +667,7 @@ mod tests {
 
     #[test]
     fn test_read_describe_statement() {
-        let mut body = Vec::new();
-        body.push(b'S'); // Statement
-        body.push(0); // empty (unnamed) statement
+        let body = vec![b'S', 0]; // Statement, empty (unnamed) statement
 
         let buf = make_frontend_message(b'D', &body);
         let msg = decode_frontend_message(&buf).unwrap().unwrap();
@@ -718,9 +716,7 @@ mod tests {
 
     #[test]
     fn test_read_close_statement() {
-        let mut body = Vec::new();
-        body.push(b'S'); // Statement
-        body.push(0); // empty (unnamed) statement
+        let body = vec![b'S', 0]; // Statement, empty (unnamed) statement
 
         let buf = make_frontend_message(b'C', &body);
         let msg = decode_frontend_message(&buf).unwrap().unwrap();
@@ -735,9 +731,7 @@ mod tests {
 
     #[test]
     fn test_read_close_portal() {
-        let mut body = Vec::new();
-        body.push(b'P'); // Portal
-        body.push(0); // empty (unnamed) portal
+        let body = vec![b'P', 0]; // Portal, empty (unnamed) portal
 
         let buf = make_frontend_message(b'C', &body);
         let msg = decode_frontend_message(&buf).unwrap().unwrap();

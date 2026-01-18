@@ -46,7 +46,11 @@ impl std::fmt::Display for StorageError {
         match self {
             StorageError::PageNotFound(id) => write!(f, "page not found: {:?}", id),
             StorageError::InvalidBufferSize { expected, actual } => {
-                write!(f, "invalid buffer size: expected {}, got {}", expected, actual)
+                write!(
+                    f,
+                    "invalid buffer size: expected {}, got {}",
+                    expected, actual
+                )
             }
             StorageError::Io(e) => write!(f, "I/O error: {}", e),
             StorageError::StorageFull => write!(f, "storage is full"),
