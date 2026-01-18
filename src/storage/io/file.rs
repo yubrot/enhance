@@ -32,6 +32,7 @@ use crate::storage::page::{PAGE_SIZE, PageId};
 /// - Use multiple file handles (one per thread)
 /// - Use pread/pwrite for concurrent access to different offsets
 /// - Implement Direct I/O to bypass OS cache
+/// - I/O retry logic for transient failures (EINTR, etc.)
 ///
 /// # Durability
 ///

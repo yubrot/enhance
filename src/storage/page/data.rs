@@ -40,6 +40,12 @@ pub struct PageData {
     layout: Layout,
 }
 
+impl Default for PageData {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PageData {
     /// Creates a new page-aligned allocation, zero-initialized.
     ///

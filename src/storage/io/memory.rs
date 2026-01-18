@@ -1,4 +1,9 @@
 //! In-memory page storage implementation.
+//!
+//! NOTE: This implementation uses `unwrap()` on Mutex locks for simplicity.
+//! For production:
+//! - Use `parking_lot::Mutex` which doesn't poison on panic
+//! - Or handle `PoisonError` by recovering or propagating as `StorageError`
 
 use std::sync::Mutex;
 

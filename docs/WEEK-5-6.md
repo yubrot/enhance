@@ -21,7 +21,6 @@ pub trait Storage: Send + Sync {
 **Key Characteristics:**
 
 - **Send + Sync**: Thread-safe for concurrent access from multiple async tasks. The Buffer Pool Manager (Week 7-8) will use this trait from multiple connections.
-- **Async-first**: Uses native `async fn` in traits (Rust 1.75+) for seamless integration with tokio runtime.
 - **Caller-owned buffers**: Storage doesn't allocate memory - the caller provides `&mut [u8]` for reads and `&[u8]` for writes. All buffers must be exactly `PAGE_SIZE` (8KB).
 - **No caching**: This layer performs raw I/O only. Caching is the Buffer Pool Manager's responsibility.
 
@@ -29,6 +28,11 @@ pub trait Storage: Send + Sync {
 
 - **PAGE_SIZE**: 8192 bytes (8KB), aligned with PostgreSQL standard and OS page sizes for efficient I/O.
 - **PageId**: Simple `u64` wrapper that uniquely identifies a page. Provides `byte_offset()` method to calculate file position (`page_num * 8192`).
+
+Notice that we use 8KB (8192 bytes) fixed-size pages. This is because...
+
+- Matches PostgreSQL's default
+- Aligns with common OS page sizes (4KB multiple)
 
 ## PageData: Page-Aligned Memory Allocation
 

@@ -6,9 +6,14 @@ use tokio_util::sync::CancellationToken;
 ///
 /// This is used to look up connections for query cancellation and other
 /// inter-connection communication.
+///
+/// NOTE: Current implementation uses std::sync::Mutex with `.expect()`.
+/// For production:
+/// - Use `DashMap` or `parking_lot::RwLock` for better concurrent access
+/// - Handle mutex poisoning gracefully instead of panicking
+/// - Consider sharding by PID for reduced contention under high load
 pub struct Registry {
     // pid -> ConnectionHandle
-    // NOTE: Consider DashMap?
     connections: Mutex<HashMap<i32, ConnectionHandle>>,
 }
 
