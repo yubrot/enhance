@@ -17,11 +17,11 @@ use crate::storage::{PageData, PageId, Storage};
 /// When this guard is dropped, the page is automatically unpinned,
 /// making it eligible for eviction if no other references exist.
 ///
-/// # Latch Hierarchy
+/// # Latch Ordering
 ///
 /// This guard holds a read lock on the frame's data. Multiple read guards
-/// can exist for the same page simultaneously. To prevent deadlocks when
-/// acquiring multiple pages, always acquire pages in ascending `PageId` order.
+/// can exist for the same page simultaneously. When acquiring multiple pages,
+/// always acquire in ascending `PageId` order to prevent deadlocks.
 ///
 /// # Example
 ///
@@ -86,11 +86,11 @@ impl<S: Storage, R: Replacer> Drop for PageReadGuard<'_, S, R> {
 /// If `mark_dirty()` was called, the dirty flag is set on the frame,
 /// ensuring the page will be written back to storage before eviction.
 ///
-/// # Latch Hierarchy
+/// # Latch Ordering
 ///
 /// This guard holds a write lock on the frame's data. Only one write guard
-/// can exist for a page at a time. To prevent deadlocks when acquiring
-/// multiple pages, always acquire pages in ascending `PageId` order.
+/// can exist for a page at a time. When acquiring multiple pages, always
+/// acquire in ascending `PageId` order to prevent deadlocks.
 ///
 /// # Example
 ///

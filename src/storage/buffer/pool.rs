@@ -51,13 +51,35 @@ pub struct BufferPool<S: Storage, R: Replacer> {
     inner: BufferPoolInner<S, R>,
 }
 
-// # Latch Hierarchy
+// # Latch Ordering
 //
-// To prevent deadlocks, locks must be acquired in strict order:
-// 1. State mutex (page_table, frame_metadata, free_list, replacer)
-// 2. Frame data RwLock (in PageId order when multiple frames needed)
+// To prevent deadlocks, the following invariant must be maintained:
 //
-// **NEVER** acquire the state lock while holding a frame data lock.
+// **NEVER acquire a frame data lock while holding the state lock.**
+//
+// The reverse (acquiring state lock while holding frame lock) is permitted
+// and necessary for:
+// - Drop implementations (unpin while holding data lock)
+// - Flush operations (clear dirty flag atomically with write)
+//
+// This ordering prevents circular wait: all code paths that acquire both
+// locks do so in frame → state order, never state → frame.
+//
+// When acquiring multiple frame locks, acquire in ascending PageId order.
+//
+// # Data-PageId Consistency Invariant
+//
+// **When page_table[page_id] == frame_id, that frame's data is guaranteed
+// to be that page's data.**
+//
+// This invariant holds because complete_read (which registers the page_table
+// entry) runs only after write lock acquisition and storage read.
+//
+// Consequently, while holding a frame's read lock:
+// - The frame's data cannot change (write lock required)
+// - frame_metadata.page_id may become None (eviction), but cannot change
+//   to a different page (eviction sets None first, then write lock is
+//   required to load new data, then complete_read sets new page_id)
 //
 // NOTE: For production, consider these improvements:
 // - Use `parking_lot::Mutex` for better performance (no poisoning)
@@ -138,6 +160,17 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
         }
     }
 
+    /// Returns the number of frames in the buffer pool.
+    pub fn pool_size(&self) -> usize {
+        self.inner.frames.len()
+    }
+
+    /// Returns the number of pages currently in the buffer pool.
+    pub fn page_count(&self) -> usize {
+        let state = self.inner.state.lock().expect("state lock poisoned");
+        state.page_table.len()
+    }
+
     /// Fetches a page for reading.
     ///
     /// Returns a guard that holds a pin on the page, preventing eviction
@@ -198,39 +231,16 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
     }
 
     /// Flushes a specific page to storage if dirty.
-    ///
-    /// # Errors
-    ///
-    /// Returns `BufferPoolError::Storage` if the write fails.
-    pub async fn flush_page(&self, page_id: PageId) -> Result<(), BufferPoolError> {
-        // Get frame_id and check if dirty while holding state lock briefly
+    pub async fn flush_page(&self, page_id: PageId) -> Result<(), StorageError> {
         let frame_id = {
             let state = self.inner.state.lock().expect("state lock poisoned");
             match state.page_table.get(&page_id) {
-                Some(&fid) if state.frame_metadata[fid].is_dirty => Some(fid),
-                _ => None,
+                Some(&fid) if state.frame_metadata[fid].is_dirty => fid,
+                _ => return Ok(()),
             }
         };
 
-        if let Some(frame_id) = frame_id {
-            // Acquire frame data lock for reading
-            let data_guard = self.inner.frames[frame_id].read().await;
-
-            // Write to storage
-            self.inner
-                .storage
-                .write_page(page_id, data_guard.as_slice())
-                .await?;
-
-            // Clear dirty flag
-            let mut state = self.inner.state.lock().expect("state lock poisoned");
-            // Verify the frame still holds the same page
-            if state.frame_metadata[frame_id].page_id == Some(page_id) {
-                state.frame_metadata[frame_id].is_dirty = false;
-            }
-        }
-
-        Ok(())
+        self.inner.flush(frame_id, page_id).await
     }
 
     /// Flushes all dirty pages to storage.
@@ -239,62 +249,24 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
     ///
     /// Returns `BufferPoolError::Storage` if any write fails.
     pub async fn flush_all(&self) -> Result<(), BufferPoolError> {
-        // Collect all dirty pages first (to release state lock quickly)
         let dirty_pages: Vec<(FrameId, PageId)> = {
             let state = self.inner.state.lock().expect("state lock poisoned");
             state
                 .frame_metadata
                 .iter()
                 .enumerate()
-                .filter_map(|(frame_id, meta)| {
-                    if meta.is_dirty {
-                        meta.page_id.map(|page_id| (frame_id, page_id))
-                    } else {
-                        None
-                    }
-                })
+                .filter(|(_, meta)| meta.is_dirty)
+                .filter_map(|(frame_id, meta)| meta.page_id.map(|page_id| (frame_id, page_id)))
                 .collect()
         };
 
-        // Flush each dirty page
         for (frame_id, page_id) in dirty_pages {
-            let data_guard = self.inner.frames[frame_id].read().await;
-
-            // Verify frame still holds the same page before writing
-            {
-                let state = self.inner.state.lock().expect("state lock poisoned");
-                if state.frame_metadata[frame_id].page_id != Some(page_id) {
-                    continue;
-                }
-            }
-
-            self.inner
-                .storage
-                .write_page(page_id, data_guard.as_slice())
-                .await?;
-
-            // Clear dirty flag
-            let mut state = self.inner.state.lock().expect("state lock poisoned");
-            if state.frame_metadata[frame_id].page_id == Some(page_id) {
-                state.frame_metadata[frame_id].is_dirty = false;
-            }
+            self.inner.flush(frame_id, page_id).await?;
         }
 
-        // Sync to disk
         self.inner.storage.sync_all().await?;
 
         Ok(())
-    }
-
-    /// Returns the number of frames in the buffer pool.
-    pub fn pool_size(&self) -> usize {
-        self.inner.frames.len()
-    }
-
-    /// Returns the number of pages currently in the buffer pool.
-    pub fn page_count(&self) -> usize {
-        let state = self.inner.state.lock().expect("state lock poisoned");
-        state.page_table.len()
     }
 }
 
@@ -328,7 +300,9 @@ impl<S: Storage, R: Replacer> BufferPoolInner<S, R> {
                 AcquireFrame::WriteBackRequired(frame_id, evict_page_id) => {
                     let write_result = {
                         let data = self.frames[frame_id].read().await;
-                        self.storage.write_page(evict_page_id, data.as_slice()).await
+                        self.storage
+                            .write_page(evict_page_id, data.as_slice())
+                            .await
                     };
 
                     let mut state = self.state.lock().expect("state lock poisoned");
@@ -369,6 +343,31 @@ impl<S: Storage, R: Replacer> BufferPoolInner<S, R> {
     pub(super) fn release(&self, frame_id: FrameId, is_dirty: bool) {
         let mut state = self.state.lock().expect("state lock poisoned");
         state.unpin_frame(frame_id, is_dirty);
+    }
+
+    /// Flushes a frame to storage if it still holds the expected page.
+    async fn flush(&self, frame_id: FrameId, page_id: PageId) -> Result<(), StorageError> {
+        let data_guard = self.frames[frame_id].read().await;
+
+        // By the Data-PageId Consistency Invariant (see module-level comment),
+        // if page_id matches while we hold read lock, data is guaranteed valid.
+        {
+            let state = self.state.lock().expect("state lock poisoned");
+            if state.frame_metadata[frame_id].page_id != Some(page_id) {
+                return Ok(());
+            }
+        }
+
+        self.storage
+            .write_page(page_id, data_guard.as_slice())
+            .await?;
+
+        let mut state = self.state.lock().expect("state lock poisoned");
+        if state.frame_metadata[frame_id].page_id == Some(page_id) {
+            state.frame_metadata[frame_id].is_dirty = false;
+        }
+
+        Ok(())
     }
 }
 
@@ -518,7 +517,7 @@ impl<R: Replacer> BufferPoolState<R> {
 mod tests {
     use super::super::LruReplacer;
     use super::*;
-    use crate::storage::{MemoryStorage, StorageError, PAGE_SIZE};
+    use crate::storage::{MemoryStorage, PAGE_SIZE, StorageError};
 
     #[tokio::test]
     async fn test_new_buffer_pool() {
