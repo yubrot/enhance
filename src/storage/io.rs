@@ -106,3 +106,118 @@ pub trait Storage: Send + Sync {
     /// - OS buffer → physical disk: sync_all (explicit)
     fn sync_all(&self) -> impl std::future::Future<Output = Result<(), StorageError>> + Send;
 }
+
+/// Generic test functions for Storage implementations.
+///
+/// Each implementation module should import these and call them in their own tests.
+#[cfg(test)]
+mod tests {
+    use super::Storage;
+    use crate::storage::{PAGE_SIZE, PageId, StorageError};
+    use std::sync::Arc;
+
+    /// Write a single byte value to a page.
+    pub async fn write_test_data<S: Storage>(storage: &S, page_id: PageId, value: u8) {
+        let mut buf = [0u8; PAGE_SIZE];
+        buf[0] = value;
+        storage.write_page(page_id, &buf).await.unwrap();
+    }
+
+    /// Verify the first byte of a page matches expected value.
+    pub async fn verify_test_data<S: Storage>(storage: &S, page_id: PageId, expected: u8) {
+        let mut buf = [0u8; PAGE_SIZE];
+        storage.read_page(page_id, &mut buf).await.unwrap();
+        assert_eq!(buf[0], expected);
+    }
+
+    /// Allocate a page and write a test value to it.
+    pub async fn allocate_and_write<S: Storage>(storage: &S, value: u8) -> PageId {
+        let page_id = storage.allocate_page().await.unwrap();
+        write_test_data(storage, page_id, value).await;
+        page_id
+    }
+
+    /// Test basic operations: allocate, write, read, page_count, sync_all.
+    pub async fn test_basic_operations<S: Storage>(storage: S) {
+        assert_eq!(storage.page_count().await, 0);
+
+        let id0 = allocate_and_write(&storage, 10).await;
+        let id1 = allocate_and_write(&storage, 20).await;
+        let id2 = allocate_and_write(&storage, 30).await;
+
+        assert_eq!(id0.page_num(), 0);
+        assert_eq!(id1.page_num(), 1);
+        assert_eq!(id2.page_num(), 2);
+        assert_eq!(storage.page_count().await, 3);
+
+        verify_test_data(&storage, id0, 10).await;
+        verify_test_data(&storage, id1, 20).await;
+        verify_test_data(&storage, id2, 30).await;
+
+        storage.sync_all().await.unwrap();
+    }
+
+    /// Test concurrent writes to different pages.
+    pub async fn test_concurrent_access<S: Storage + 'static>(storage: S) {
+        let storage = Arc::new(storage);
+        let mut page_ids = vec![];
+        for _ in 0..10 {
+            page_ids.push(storage.allocate_page().await.unwrap());
+        }
+
+        let mut handles = vec![];
+        for (i, page_id) in page_ids.iter().enumerate() {
+            let storage = storage.clone();
+            let page_id = *page_id;
+            handles.push(tokio::spawn(async move {
+                write_test_data(&*storage, page_id, i as u8).await;
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        storage.sync_all().await.unwrap();
+
+        for (i, page_id) in page_ids.iter().enumerate() {
+            verify_test_data(&*storage, *page_id, i as u8).await;
+        }
+    }
+
+    /// Test buffer size validation for read and write.
+    pub async fn test_buffer_size_validation<S: Storage>(storage: S) {
+        let page_id = storage.allocate_page().await.unwrap();
+
+        let mut small_buf = [0u8; 100];
+        let result = storage.read_page(page_id, &mut small_buf).await;
+        assert!(matches!(
+            result,
+            Err(StorageError::InvalidBufferSize {
+                expected: PAGE_SIZE,
+                actual: 100
+            })
+        ));
+
+        let small_buf = [0u8; 100];
+        let result = storage.write_page(page_id, &small_buf).await;
+        assert!(matches!(
+            result,
+            Err(StorageError::InvalidBufferSize {
+                expected: PAGE_SIZE,
+                actual: 100
+            })
+        ));
+    }
+
+    /// Test reading/writing unallocated pages returns PageNotFound.
+    pub async fn test_page_not_found<S: Storage>(storage: S) {
+        let mut buf = [0u8; PAGE_SIZE];
+        let result = storage.read_page(PageId::new(0), &mut buf).await;
+        assert!(matches!(result, Err(StorageError::PageNotFound(_))));
+
+        let buf = [0u8; PAGE_SIZE];
+        let result = storage.write_page(PageId::new(0), &buf).await;
+        assert!(matches!(result, Err(StorageError::PageNotFound(_))));
+    }
+}

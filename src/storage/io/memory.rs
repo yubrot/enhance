@@ -91,68 +91,25 @@ impl Default for MemoryStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::tests as generic;
 
     #[tokio::test]
-    async fn test_allocate_and_read() {
-        let storage = MemoryStorage::new();
-        let page_id = storage.allocate_page().await.unwrap();
-        let mut buf = vec![0u8; PAGE_SIZE];
-        storage.read_page(page_id, &mut buf).await.unwrap();
-        assert!(buf.iter().all(|&b| b == 0));
+    async fn test_basic_operations() {
+        generic::test_basic_operations(MemoryStorage::new()).await;
     }
 
     #[tokio::test]
-    async fn test_write_and_read() {
-        let storage = MemoryStorage::new();
-        let page_id = storage.allocate_page().await.unwrap();
+    async fn test_concurrent_access() {
+        generic::test_concurrent_access(MemoryStorage::new()).await;
+    }
 
-        let mut write_buf = vec![0u8; PAGE_SIZE];
-        write_buf[0] = 42;
-        write_buf[100] = 99;
-        storage.write_page(page_id, &write_buf).await.unwrap();
-
-        let mut read_buf = vec![0u8; PAGE_SIZE];
-        storage.read_page(page_id, &mut read_buf).await.unwrap();
-        assert_eq!(read_buf[0], 42);
-        assert_eq!(read_buf[100], 99);
+    #[tokio::test]
+    async fn test_buffer_size_validation() {
+        generic::test_buffer_size_validation(MemoryStorage::new()).await;
     }
 
     #[tokio::test]
     async fn test_page_not_found() {
-        let storage = MemoryStorage::new();
-        let mut buf = vec![0u8; PAGE_SIZE];
-        let result = storage.read_page(PageId::new(999), &mut buf).await;
-        assert!(matches!(result, Err(StorageError::PageNotFound(_))));
-    }
-
-    #[tokio::test]
-    async fn test_invalid_buffer_size() {
-        let storage = MemoryStorage::new();
-        let page_id = storage.allocate_page().await.unwrap();
-        let mut buf = vec![0u8; 100];
-        let result = storage.read_page(page_id, &mut buf).await;
-        assert!(matches!(
-            result,
-            Err(StorageError::InvalidBufferSize { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_page_count() {
-        let storage = MemoryStorage::new();
-        assert_eq!(storage.page_count().await, 0);
-
-        storage.allocate_page().await.unwrap();
-        assert_eq!(storage.page_count().await, 1);
-
-        storage.allocate_page().await.unwrap();
-        assert_eq!(storage.page_count().await, 2);
-    }
-
-    #[tokio::test]
-    async fn test_sync_all() {
-        let storage = MemoryStorage::new();
-        // Should not panic
-        storage.sync_all().await.unwrap();
+        generic::test_page_not_found(MemoryStorage::new()).await;
     }
 }
