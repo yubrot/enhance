@@ -47,6 +47,30 @@ use super::replacer::Replacer;
 /// - Multiple readers can access the same page simultaneously (shared lock)
 /// - Writers get exclusive access to their page (exclusive lock)
 /// - The state (page table, metadata, replacer) is protected by a mutex
+///
+/// # Cancel Safety
+///
+/// **This implementation is NOT cancel-safe.**
+///
+/// If a Future returned by buffer pool methods (e.g., `fetch_page`, `flush_page`)
+/// is dropped before completion, internal state may become inconsistent:
+///
+/// - **Frame leaks**: Pin counts may not be decremented, causing frames to remain
+///   pinned indefinitely. This prevents those frames from being evicted, effectively
+///   reducing the buffer pool capacity.
+///
+/// - **Inconsistent metadata**: The page table, frame metadata, or replacer state
+///   may become out of sync with actual frame usage.
+///
+/// To avoid these issues:
+/// - Always await buffer pool operations to completion or handle errors properly
+/// - Do not use timeout operations (e.g., `tokio::time::timeout`) that may cancel
+///   buffer pool operations
+/// - Ensure that drop/cleanup code completes before task cancellation
+///
+/// This limitation exists because correct cancel safety would require significant
+/// complexity (e.g., async drop, rollback mechanisms, or guard-based RAII that
+/// works across await points).
 pub struct BufferPool<S: Storage, R: Replacer> {
     inner: BufferPoolInner<S, R>,
 }
@@ -67,19 +91,31 @@ pub struct BufferPool<S: Storage, R: Replacer> {
 //
 // When acquiring multiple frame locks, acquire in ascending PageId order.
 //
-// # Data-PageId Consistency Invariant
+// # Data-PageId Consistency Invariants
 //
-// **When page_table[page_id] == frame_id, that frame's data is guaranteed
-// to be that page's data.**
+// **Invariant 1: page_table and frame_metadata are always synchronized.**
 //
-// This invariant holds because complete_read (which registers the page_table
-// entry) runs only after write lock acquisition and storage read.
+// - If `page_table[page_id] == frame_id`, then `frame_metadata[frame_id].page_id == Some(page_id)`
+// - If `frame_metadata[frame_id].page_id == Some(page_id)`, then `page_table[page_id] == frame_id`
 //
-// Consequently, while holding a frame's read lock:
-// - The frame's data cannot change (write lock required)
-// - frame_metadata.page_id may become None (eviction), but cannot change
-//   to a different page (eviction sets None first, then write lock is
-//   required to load new data, then complete_read sets new page_id)
+// This holds because the code always updates both simultaneously:
+// - `complete_read` sets both page_table entry and frame_metadata.page_id together
+// - Eviction (`acquire_frame`, `complete_write_back`) clears both together
+//
+// **Invariant 2: When the mapping exists, frame data matches the page.**
+//
+// When `page_table[page_id] == frame_id` (equivalently, `frame_metadata[frame_id].page_id == Some(page_id)`),
+// the data in `frames[frame_id]` is guaranteed to be that page's data.
+//
+// This holds because `complete_read` only establishes the mapping AFTER acquiring
+// the frame's write lock and completing the storage read.
+//
+// Consequently, while holding a frame's read or write lock:
+// - The frame's data cannot change (write lock is required for modification)
+// - `frame_metadata[frame_id].page_id` may become None due to concurrent eviction
+//   (state lock and frame lock are independent)
+// - However, page_id cannot change to a DIFFERENT page (loading new data requires
+//   write lock, which we hold or block)
 //
 // NOTE: For production, consider these improvements:
 // - Use `parking_lot::Mutex` for better performance (no poisoning)
@@ -163,12 +199,6 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
     /// Returns the number of frames in the buffer pool.
     pub fn pool_size(&self) -> usize {
         self.inner.frames.len()
-    }
-
-    /// Returns the number of pages currently in the buffer pool.
-    pub fn page_count(&self) -> usize {
-        let state = self.inner.state.lock().expect("state lock poisoned");
-        state.page_table.len()
     }
 
     /// Fetches a page for reading.
@@ -268,6 +298,12 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
 
         Ok(())
     }
+
+    /// Returns a reference to the underlying storage for testing purposes.
+    #[cfg(test)]
+    pub(super) fn storage(&self) -> &S {
+        &self.inner.storage
+    }
 }
 
 impl<S: Storage, R: Replacer> BufferPoolInner<S, R> {
@@ -290,23 +326,23 @@ impl<S: Storage, R: Replacer> BufferPoolInner<S, R> {
     /// - `BufferPoolError::Storage` if I/O fails
     async fn acquire(&self, page_id: PageId) -> Result<FrameId, BufferPoolError> {
         let new_frame_id = loop {
-            let acquire_result = {
+            let action = {
                 let mut state = self.state.lock().expect("state lock poisoned");
                 state.acquire_frame(page_id)
             };
-            match acquire_result {
+            match action {
                 AcquireFrame::Ready(frame_id) => return Ok(frame_id),
                 AcquireFrame::ReadRequired(frame_id) => break frame_id,
-                AcquireFrame::WriteBackRequired(frame_id, evict_page_id) => {
+                AcquireFrame::WriteBackRequired(frame_id, evicted_page_id) => {
                     let write_result = {
                         let data = self.frames[frame_id].read().await;
                         self.storage
-                            .write_page(evict_page_id, data.as_slice())
+                            .write_page(evicted_page_id, data.as_slice())
                             .await
                     };
 
                     let mut state = self.state.lock().expect("state lock poisoned");
-                    match state.complete_write_back(frame_id, evict_page_id, write_result)? {
+                    match state.complete_write_back(frame_id, evicted_page_id, write_result)? {
                         CompleteWriteBack::ReadRequired(frame_id) => break frame_id,
                         CompleteWriteBack::Retry => {}
                     }
@@ -411,7 +447,7 @@ impl<R: Replacer> BufferPoolState<R> {
             return AcquireFrame::Full;
         };
 
-        let Some(page_id) = self.frame_metadata[frame_id].page_id else {
+        let Some(evicted_page_id) = self.frame_metadata[frame_id].page_id else {
             panic!("Evicted frame must be previously occupied");
         };
         debug_assert_eq!(self.frame_metadata[frame_id].pin_count, 0);
@@ -423,10 +459,10 @@ impl<R: Replacer> BufferPoolState<R> {
             // Clear is_dirty so we can detect if someone modifies the page during write back.
             self.frame_metadata[frame_id].pin_count = 1;
             self.frame_metadata[frame_id].is_dirty = false;
-            return AcquireFrame::WriteBackRequired(frame_id, page_id);
+            return AcquireFrame::WriteBackRequired(frame_id, evicted_page_id);
         }
 
-        self.page_table.remove(&page_id);
+        self.page_table.remove(&evicted_page_id);
         self.frame_metadata[frame_id] = FrameMetadata::vacant();
         AcquireFrame::ReadRequired(frame_id)
     }
@@ -439,6 +475,8 @@ impl<R: Replacer> BufferPoolState<R> {
         read_result: Result<(), StorageError>,
     ) -> Result<FrameId, BufferPoolError> {
         if let Err(e) = read_result {
+            // Read failed: return to free_list
+            // NOTE: We may remove read_result argument when resolving cancel safety issues
             self.free_list.push(frame_id);
             return Err(e.into());
         }
@@ -467,6 +505,7 @@ impl<R: Replacer> BufferPoolState<R> {
     ) -> Result<CompleteWriteBack, BufferPoolError> {
         if let Err(e) = write_result {
             // Write back failed: restore dirty flag
+            // NOTE: We may remove write_result argument when resolving cancel safety issues
             self.unpin_frame(frame_id, true);
             return Err(e.into());
         }
@@ -515,243 +554,249 @@ impl<R: Replacer> BufferPoolState<R> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::super::LruReplacer;
     use super::*;
     use crate::storage::{MemoryStorage, PAGE_SIZE, StorageError};
 
+    /// Helper function to create a buffer pool with pre-allocated pages.
+    async fn create_pool(
+        pool_size: usize,
+        allocated_pages: usize,
+    ) -> BufferPool<MemoryStorage, LruReplacer> {
+        let storage = MemoryStorage::new();
+        for _ in 0..allocated_pages {
+            storage.allocate_page().await.unwrap();
+        }
+        let replacer = LruReplacer::new(pool_size);
+        BufferPool::new(storage, replacer, pool_size)
+    }
+
+    /// Helper function to read a page directly from storage.
+    async fn storage_data(
+        pool: &BufferPool<MemoryStorage, LruReplacer>,
+        page_id: PageId,
+    ) -> Vec<u8> {
+        let mut data = vec![0u8; PAGE_SIZE];
+        pool.storage().read_page(page_id, &mut data).await.unwrap();
+        data
+    }
+
     #[tokio::test]
     async fn test_new_buffer_pool() {
-        let storage = MemoryStorage::new();
-        let replacer = LruReplacer::new(10);
-        let bpm = BufferPool::new(storage, replacer, 10);
-
-        assert_eq!(bpm.pool_size(), 10);
-        assert_eq!(bpm.page_count(), 0);
+        let pool = create_pool(10, 0).await;
+        assert_eq!(pool.pool_size(), 10);
     }
 
     #[tokio::test]
     async fn test_new_page() {
-        let storage = MemoryStorage::new();
-        let replacer = LruReplacer::new(10);
-        let bpm = BufferPool::new(storage, replacer, 10);
-
-        let guard = bpm.new_page().await.unwrap();
+        let pool = create_pool(10, 0).await;
+        let guard = pool.new_page().await.unwrap();
         let page_id = guard.page_id();
 
         assert_eq!(page_id, PageId::new(0));
         assert_eq!(guard.data().len(), PAGE_SIZE);
-
-        drop(guard);
-        assert_eq!(bpm.page_count(), 1);
     }
 
     #[tokio::test]
     async fn test_fetch_page() {
-        let storage = MemoryStorage::new();
-        let page_id = storage.allocate_page().await.unwrap();
+        let pool = create_pool(10, 1).await;
+        let page_id = PageId::new(0);
 
-        let replacer = LruReplacer::new(10);
-        let bpm = BufferPool::new(storage, replacer, 10);
-
-        let guard = bpm.fetch_page(page_id).await.unwrap();
+        let guard = pool.fetch_page(page_id).await.unwrap();
         assert_eq!(guard.page_id(), page_id);
         assert_eq!(guard.data().len(), PAGE_SIZE);
     }
 
     #[tokio::test]
     async fn test_fetch_same_page_twice() {
-        let storage = MemoryStorage::new();
-        let page_id = storage.allocate_page().await.unwrap();
-
-        let replacer = LruReplacer::new(10);
-        let bpm = BufferPool::new(storage, replacer, 10);
+        let pool = create_pool(10, 1).await;
+        let page_id = PageId::new(0);
 
         // Fetch once
-        let guard1 = bpm.fetch_page(page_id).await.unwrap();
-        drop(guard1);
+        {
+            let _guard1 = pool.fetch_page(page_id).await.unwrap();
+        }
 
         // Fetch again - should hit buffer pool
-        let guard2 = bpm.fetch_page(page_id).await.unwrap();
+        let guard2 = pool.fetch_page(page_id).await.unwrap();
         assert_eq!(guard2.page_id(), page_id);
-
-        assert_eq!(bpm.page_count(), 1);
     }
 
     #[tokio::test]
-    async fn test_dirty_page_write_back() {
-        let storage = MemoryStorage::new();
-        let replacer = LruReplacer::new(10);
-        let bpm = BufferPool::new(storage, replacer, 10);
+    async fn test_fetch_same_page_write_and_read() {
+        let pool = create_pool(10, 1).await;
+        let page_id = PageId::new(0);
+
+        // Fetch once
+        {
+            let mut guard1 = pool.fetch_page_mut(page_id).await.unwrap();
+            guard1[0] = 111;
+            guard1.mark_dirty();
+        }
+
+        // Fetch again - should hit buffer pool
+        let guard2 = pool.fetch_page(page_id).await.unwrap();
+        assert_eq!(guard2.page_id(), page_id);
+        assert_eq!(guard2[0], 111);
+    }
+
+    #[tokio::test]
+    async fn test_dirty_page_flush() {
+        let pool = create_pool(10, 1).await;
+        let page_id = PageId::new(0);
 
         // Create and modify page
-        let page_id;
         {
-            let mut guard = bpm.new_page().await.unwrap();
-            page_id = guard.page_id();
+            let mut guard = pool.fetch_page_mut(page_id).await.unwrap();
             guard.data_mut()[0] = 42;
             guard.mark_dirty();
         }
 
         // Flush to storage
-        bpm.flush_page(page_id).await.unwrap();
+        pool.flush_page(page_id).await.unwrap();
 
-        // Verify by fetching again
-        let guard = bpm.fetch_page(page_id).await.unwrap();
-        assert_eq!(guard.data()[0], 42);
+        // Verify by reading from storage directly
+        let data = storage_data(&pool, page_id).await;
+        assert_eq!(data[0], 42);
     }
 
     #[tokio::test]
-    async fn test_eviction_on_full_pool() {
-        let storage = MemoryStorage::new();
+    async fn test_write_and_read_pages() {
+        let pool = create_pool(3, 5).await;
 
-        // Allocate more pages than pool size
-        for _ in 0..5 {
-            storage.allocate_page().await.unwrap();
-        }
-
-        // Pool size of 3
-        let replacer = LruReplacer::new(3);
-        let bpm = BufferPool::new(storage, replacer, 3);
-
-        // Fetch all 5 pages - should trigger evictions
         for i in 0..5 {
-            let guard = bpm.fetch_page(PageId::new(i)).await.unwrap();
-            drop(guard); // Unpin immediately to allow eviction
+            let mut guard = pool.fetch_page_mut(PageId::new(i)).await.unwrap();
+            guard[0] = (i * 10) as u8;
+            guard.mark_dirty();
         }
-
-        // Should have 3 pages in pool (pool_size)
-        assert_eq!(bpm.page_count(), 3);
-    }
-
-    #[tokio::test]
-    async fn test_no_free_frames_all_pinned() {
-        let storage = MemoryStorage::new();
-
-        for _ in 0..3 {
-            storage.allocate_page().await.unwrap();
+        for i in 0..5 {
+            let guard = pool.fetch_page(PageId::new(i)).await.unwrap();
+            assert_eq!(guard[0], (i * 10) as u8);
         }
-
-        let replacer = LruReplacer::new(2);
-        let bpm = BufferPool::new(storage, replacer, 2);
-
-        // Pin 2 pages (filling the pool)
-        let _guard1 = bpm.fetch_page(PageId::new(0)).await.unwrap();
-        let _guard2 = bpm.fetch_page(PageId::new(1)).await.unwrap();
-
-        // Try to fetch a third - should fail
-        let result = bpm.fetch_page(PageId::new(2)).await;
-        assert!(matches!(result, Err(BufferPoolError::NoFreeFrames)));
     }
 
     #[tokio::test]
     async fn test_dirty_eviction_writes_back() {
-        let storage = MemoryStorage::new();
-
-        for _ in 0..3 {
-            storage.allocate_page().await.unwrap();
-        }
-
-        let replacer = LruReplacer::new(2);
-        let bpm = BufferPool::new(storage, replacer, 2);
+        let pool = create_pool(2, 3).await;
 
         // Write to page 0
         {
-            let mut guard = bpm.fetch_page_mut(PageId::new(0)).await.unwrap();
+            let mut guard = pool.fetch_page_mut(PageId::new(0)).await.unwrap();
             guard.data_mut()[0] = 99;
             guard.mark_dirty();
         }
 
-        // Fetch pages 1 and 2, forcing eviction of page 0
+        // Write to page 1
         {
-            let _g1 = bpm.fetch_page(PageId::new(1)).await.unwrap();
-        }
-        {
-            let _g2 = bpm.fetch_page(PageId::new(2)).await.unwrap();
+            let mut guard = pool.fetch_page_mut(PageId::new(1)).await.unwrap();
+            guard.data_mut()[0] = 88;
+            guard.mark_dirty();
         }
 
-        // Page 0 should have been written back, fetch it again
-        let guard = bpm.fetch_page(PageId::new(0)).await.unwrap();
-        assert_eq!(guard.data()[0], 99);
+        // Write to page 2, forcing eviction of page 0
+        {
+            let mut guard = pool.fetch_page_mut(PageId::new(2)).await.unwrap();
+            guard.data_mut()[0] = 77;
+            guard.mark_dirty();
+        }
+
+        // Pages 0 should have been written back to storage by eviction
+        let data0 = storage_data(&pool, PageId::new(0)).await;
+        assert_eq!(data0[0], 99);
+
+        // Page 1 and Page 2 will be written back by explicit flush
+        let data1 = storage_data(&pool, PageId::new(1)).await;
+        assert_eq!(data1[0], 0);
+        let data2 = storage_data(&pool, PageId::new(2)).await;
+        assert_eq!(data2[0], 0);
+
+        pool.flush_page(PageId::new(1)).await.unwrap();
+        let data1 = storage_data(&pool, PageId::new(1)).await;
+        assert_eq!(data1[0], 88);
+        let data2 = storage_data(&pool, PageId::new(2)).await;
+        assert_eq!(data2[0], 0);
+    }
+
+    #[tokio::test]
+    async fn test_no_free_frames_all_pinned() {
+        let pool = create_pool(2, 3).await;
+
+        // Pin 2 pages (filling the pool)
+        let _guard1 = pool.fetch_page(PageId::new(0)).await.unwrap();
+        let _guard2 = pool.fetch_page(PageId::new(1)).await.unwrap();
+
+        // Try to fetch a third - should fail
+        let result = pool.fetch_page(PageId::new(2)).await;
+        assert!(matches!(result, Err(BufferPoolError::NoFreeFrames)));
     }
 
     #[tokio::test]
     async fn test_flush_all() {
-        let storage = MemoryStorage::new();
-        let replacer = LruReplacer::new(10);
-        let bpm = BufferPool::new(storage, replacer, 10);
+        let pool = create_pool(10, 0).await;
 
         // Create and modify multiple pages
         for i in 0..3 {
-            let mut guard = bpm.new_page().await.unwrap();
+            let mut guard = pool.new_page().await.unwrap();
             guard.data_mut()[0] = i as u8;
             guard.mark_dirty();
         }
 
         // Flush all
-        bpm.flush_all().await.unwrap();
+        pool.flush_all().await.unwrap();
 
-        // Verify all pages
+        // Verify all pages by reading from storage directly
         for i in 0..3 {
-            let guard = bpm.fetch_page(PageId::new(i)).await.unwrap();
-            assert_eq!(guard.data()[0], i as u8);
+            let data = storage_data(&pool, PageId::new(i)).await;
+            assert_eq!(data[0], i as u8);
         }
     }
 
     #[tokio::test]
-    async fn test_multiple_readers() {
-        let storage = MemoryStorage::new();
-        storage.allocate_page().await.unwrap();
-
-        let replacer = LruReplacer::new(10);
-        let bpm = BufferPool::new(storage, replacer, 10);
-
-        // Multiple read guards should be allowed
-        let guard1 = bpm.fetch_page(PageId::new(0)).await.unwrap();
-        let guard2 = bpm.fetch_page(PageId::new(0)).await.unwrap();
-
-        assert_eq!(guard1.page_id(), guard2.page_id());
-    }
-
-    #[tokio::test]
     async fn test_flush_page_not_in_pool() {
-        let storage = MemoryStorage::new();
-        let page_id = storage.allocate_page().await.unwrap();
-
-        let replacer = LruReplacer::new(10);
-        let bpm = BufferPool::new(storage, replacer, 10);
+        let pool = create_pool(10, 1).await;
+        let page_id = PageId::new(0);
 
         // Flushing a page not in the buffer pool should succeed silently
-        let result = bpm.flush_page(page_id).await;
+        let result = pool.flush_page(page_id).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_flush_page_clean() {
-        let storage = MemoryStorage::new();
-        let replacer = LruReplacer::new(10);
-        let bpm = BufferPool::new(storage, replacer, 10);
+        let pool = create_pool(10, 0).await;
 
         // Create a page but don't mark it dirty
         let page_id;
         {
-            let guard = bpm.new_page().await.unwrap();
+            let guard = pool.new_page().await.unwrap();
             page_id = guard.page_id();
             // Not calling mark_dirty()
         }
 
         // Flushing a clean page should succeed without writing
-        let result = bpm.flush_page(page_id).await;
+        let result = pool.flush_page(page_id).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
+    async fn test_multiple_readers() {
+        let pool = create_pool(10, 1).await;
+
+        // Multiple read guards should be allowed
+        let guard1 = pool.fetch_page(PageId::new(0)).await.unwrap();
+        let guard2 = pool.fetch_page(PageId::new(0)).await.unwrap();
+
+        assert_eq!(guard1.page_id(), guard2.page_id());
+    }
+
+    #[tokio::test]
     async fn test_fetch_page_not_allocated() {
-        let storage = MemoryStorage::new();
-        let replacer = LruReplacer::new(10);
-        let bpm = BufferPool::new(storage, replacer, 10);
+        let pool = create_pool(10, 0).await;
 
         // Fetching a non-existent page should return an error
-        let result = bpm.fetch_page(PageId::new(999)).await;
+        let result = pool.fetch_page(PageId::new(999)).await;
         assert!(matches!(
             result,
             Err(BufferPoolError::Storage(StorageError::PageNotFound(_)))
@@ -759,38 +804,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_and_read_back() {
-        let storage = MemoryStorage::new();
-        let replacer = LruReplacer::new(10);
-        let bpm = BufferPool::new(storage, replacer, 10);
-
-        let page_id;
-        {
-            let mut guard = bpm.new_page().await.unwrap();
-            page_id = guard.page_id();
-            // Write a pattern
-            for (i, byte) in guard.data_mut().iter_mut().enumerate() {
-                *byte = (i % 256) as u8;
-            }
-            guard.mark_dirty();
-        }
-
-        // Read back and verify
-        let guard = bpm.fetch_page(page_id).await.unwrap();
-        for (i, byte) in guard.data().iter().enumerate() {
-            assert_eq!(*byte, (i % 256) as u8);
-        }
-    }
-
-    #[tokio::test]
     async fn test_multiple_writes_same_page() {
-        let storage = MemoryStorage::new();
-        let replacer = LruReplacer::new(10);
-        let bpm = BufferPool::new(storage, replacer, 10);
+        let pool = create_pool(10, 0).await;
 
         let page_id;
         {
-            let mut guard = bpm.new_page().await.unwrap();
+            let mut guard = pool.new_page().await.unwrap();
             page_id = guard.page_id();
             guard.data_mut()[0] = 1;
             guard.mark_dirty();
@@ -798,68 +817,31 @@ mod tests {
 
         // Write again
         {
-            let mut guard = bpm.fetch_page_mut(page_id).await.unwrap();
+            let mut guard = pool.fetch_page_mut(page_id).await.unwrap();
             assert_eq!(guard.data()[0], 1);
-            guard.data_mut()[0] = 2;
+            guard.data_mut()[1] = 2;
             guard.mark_dirty();
         }
 
         // Verify
-        let guard = bpm.fetch_page(page_id).await.unwrap();
-        assert_eq!(guard.data()[0], 2);
-    }
-
-    #[tokio::test]
-    async fn test_eviction_lru_order() {
-        let storage = MemoryStorage::new();
-
-        // Allocate 4 pages
-        for _ in 0..4 {
-            storage.allocate_page().await.unwrap();
-        }
-
-        // Pool size of 3
-        let replacer = LruReplacer::new(3);
-        let bpm = BufferPool::new(storage, replacer, 3);
-
-        // Fetch pages 0, 1, 2 (fills the pool)
-        for i in 0..3 {
-            let _g = bpm.fetch_page(PageId::new(i)).await.unwrap();
-        }
-        assert_eq!(bpm.page_count(), 3);
-
-        // Access page 0 again to make it most recently used
-        {
-            let _g = bpm.fetch_page(PageId::new(0)).await.unwrap();
-        }
-
-        // Fetch page 3 - should evict page 1 (LRU)
-        {
-            let _g = bpm.fetch_page(PageId::new(3)).await.unwrap();
-        }
-
-        // Page 1 should be evicted, pages 0, 2, 3 should remain
-        // Verify by fetching page 0 (cache hit - still in pool)
-        let guard = bpm.fetch_page(PageId::new(0)).await.unwrap();
-        assert_eq!(guard.page_id(), PageId::new(0));
+        let guard = pool.fetch_page(page_id).await.unwrap();
+        assert_eq!(guard.data()[0], 1);
+        assert_eq!(guard.data()[1], 2);
     }
 
     #[tokio::test]
     async fn test_concurrent_fetch_same_page() {
         use std::sync::Arc;
 
-        let storage = MemoryStorage::new();
-        let page_id = storage.allocate_page().await.unwrap();
-
-        let replacer = LruReplacer::new(10);
-        let bpm = Arc::new(BufferPool::new(storage, replacer, 10));
+        let pool = Arc::new(create_pool(10, 1).await);
+        let page_id = PageId::new(0);
 
         // Spawn multiple tasks fetching the same page concurrently
         let mut handles = vec![];
         for _ in 0..10 {
-            let bpm = Arc::clone(&bpm);
+            let pool = Arc::clone(&pool);
             handles.push(tokio::spawn(async move {
-                let guard = bpm.fetch_page(page_id).await.unwrap();
+                let guard = pool.fetch_page(page_id).await.unwrap();
                 assert_eq!(guard.page_id(), page_id);
             }));
         }
@@ -867,29 +849,20 @@ mod tests {
         for handle in handles {
             handle.await.unwrap();
         }
-
-        // Should only have 1 page in pool
-        assert_eq!(bpm.page_count(), 1);
     }
 
     #[tokio::test]
     async fn test_concurrent_fetch_different_pages() {
         use std::sync::Arc;
 
-        let storage = MemoryStorage::new();
-        for _ in 0..5 {
-            storage.allocate_page().await.unwrap();
-        }
-
-        let replacer = LruReplacer::new(10);
-        let bpm = Arc::new(BufferPool::new(storage, replacer, 10));
+        let pool = Arc::new(create_pool(10, 5).await);
 
         // Spawn tasks fetching different pages concurrently
         let mut handles = vec![];
         for i in 0..5 {
-            let bpm = Arc::clone(&bpm);
+            let pool = Arc::clone(&pool);
             handles.push(tokio::spawn(async move {
-                let guard = bpm.fetch_page(PageId::new(i)).await.unwrap();
+                let guard = pool.fetch_page(PageId::new(i)).await.unwrap();
                 assert_eq!(guard.page_id(), PageId::new(i));
             }));
         }
@@ -897,53 +870,172 @@ mod tests {
         for handle in handles {
             handle.await.unwrap();
         }
-
-        assert_eq!(bpm.page_count(), 5);
     }
 
     #[tokio::test]
     async fn test_pin_prevents_eviction() {
-        let storage = MemoryStorage::new();
-
-        for _ in 0..3 {
-            storage.allocate_page().await.unwrap();
-        }
-
-        let replacer = LruReplacer::new(2);
-        let bpm = BufferPool::new(storage, replacer, 2);
+        let pool = create_pool(2, 3).await;
 
         // Pin page 0
-        let _guard0 = bpm.fetch_page(PageId::new(0)).await.unwrap();
+        let _guard0 = pool.fetch_page(PageId::new(0)).await.unwrap();
 
         // Fetch page 1 (fills pool)
         {
-            let _g = bpm.fetch_page(PageId::new(1)).await.unwrap();
+            let _g = pool.fetch_page(PageId::new(1)).await.unwrap();
         }
 
         // Fetch page 2 - should evict page 1 (page 0 is pinned)
         {
-            let _g = bpm.fetch_page(PageId::new(2)).await.unwrap();
+            let _g = pool.fetch_page(PageId::new(2)).await.unwrap();
         }
 
         // Page 0 should still be valid
         assert_eq!(_guard0.page_id(), PageId::new(0));
     }
 
-    #[tokio::test]
-    async fn test_deref_traits() {
-        let storage = MemoryStorage::new();
-        let replacer = LruReplacer::new(10);
-        let bpm = BufferPool::new(storage, replacer, 10);
+    /// Storage wrapper that adds synchronization points for testing race conditions.
+    struct SyncableStorage {
+        inner: MemoryStorage,
+        read_barrier: Option<Arc<tokio::sync::Barrier>>,
+        write_started: Option<Arc<tokio::sync::Notify>>,
+        write_barrier: Option<Arc<tokio::sync::Barrier>>,
+    }
 
-        // Test Deref for PageWriteGuard
+    impl SyncableStorage {
+        fn new(inner: MemoryStorage) -> Self {
+            Self {
+                inner,
+                read_barrier: None,
+                write_started: None,
+                write_barrier: None,
+            }
+        }
+
+        fn with_read_barrier(mut self, barrier: Arc<tokio::sync::Barrier>) -> Self {
+            self.read_barrier = Some(barrier);
+            self
+        }
+
+        fn with_write_sync(
+            mut self,
+            started: Arc<tokio::sync::Notify>,
+            barrier: Arc<tokio::sync::Barrier>,
+        ) -> Self {
+            self.write_started = Some(started);
+            self.write_barrier = Some(barrier);
+            self
+        }
+    }
+
+    impl Storage for SyncableStorage {
+        async fn read_page(&self, page_id: PageId, buf: &mut [u8]) -> Result<(), StorageError> {
+            let result = self.inner.read_page(page_id, buf).await;
+            if let Some(barrier) = &self.read_barrier {
+                barrier.wait().await;
+            }
+            result
+        }
+
+        async fn write_page(&self, page_id: PageId, buf: &[u8]) -> Result<(), StorageError> {
+            if let Some(notify) = &self.write_started {
+                notify.notify_one();
+            }
+            let result = self.inner.write_page(page_id, buf).await;
+            if let Some(barrier) = &self.write_barrier {
+                barrier.wait().await;
+            }
+            result
+        }
+
+        async fn allocate_page(&self) -> Result<PageId, StorageError> {
+            self.inner.allocate_page().await
+        }
+
+        async fn page_count(&self) -> usize {
+            self.inner.page_count().await
+        }
+
+        async fn sync_all(&self) -> Result<(), StorageError> {
+            self.inner.sync_all().await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_complete_read_race() {
+        // Barrier(2): Both tasks synchronize after read completes
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let inner = MemoryStorage::new();
+        let page = inner.allocate_page().await.unwrap();
+        let storage = SyncableStorage::new(inner).with_read_barrier(barrier);
+        let pool = Arc::new(BufferPool::new(storage, LruReplacer::new(2), 2));
+
+        let t1 = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                let guard = pool.fetch_page(page).await.unwrap();
+                guard.page_id()
+            }
+        });
+        let t2 = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                let guard = pool.fetch_page(page).await.unwrap();
+                guard.page_id()
+            }
+        });
+
+        let (r1, r2) = tokio::join!(t1, t2);
+        assert_eq!(r1.unwrap(), page);
+        assert_eq!(r2.unwrap(), page);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_write_back_during_pin() {
+        // write_started: notified when write_page begins
+        // barrier: synchronize write_back completion with main thread
+        let write_started = Arc::new(tokio::sync::Notify::new());
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let inner = MemoryStorage::new();
+        let page_0 = inner.allocate_page().await.unwrap();
+        let page_1 = inner.allocate_page().await.unwrap();
+        let storage =
+            SyncableStorage::new(inner).with_write_sync(write_started.clone(), barrier.clone());
+        let pool = Arc::new(BufferPool::new(storage, LruReplacer::new(1), 1));
+
+        // Make page_0 dirty
         {
-            let mut guard = bpm.new_page().await.unwrap();
-            guard[0] = 42; // Uses DerefMut
+            let mut guard = pool.fetch_page_mut(page_0).await.unwrap();
+            guard[0] = 42;
             guard.mark_dirty();
         }
 
-        // Test Deref for PageReadGuard
-        let guard = bpm.fetch_page(PageId::new(0)).await.unwrap();
-        assert_eq!(guard[0], 42); // Uses Deref
+        // Fetch page_1 → eviction starts, write_back begins
+        let t1 = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.fetch_page(page_1).await.map(|g| g.page_id()) }
+        });
+
+        // Wait for write_back to start
+        write_started.notified().await;
+
+        // During write_back, fetch page_0 (pin_count becomes 2)
+        // This should succeed because page_0 is still in the buffer (being written back)
+        let guard = pool.fetch_page(page_0).await.unwrap();
+        assert_eq!(guard[0], 42);
+
+        // Release barrier to complete write_back → pin_count > 1 → Retry
+        barrier.wait().await;
+
+        // t1 retries but fails because frame is still pinned
+        let r1 = t1.await.unwrap();
+        assert!(matches!(r1, Err(BufferPoolError::NoFreeFrames)));
     }
+
+    // NOTE: The `is_dirty` case in `complete_write_back` cannot be tested
+    // deterministically with SyncableStorage. This race condition occurs in the narrow
+    // window between frame read lock release and state lock acquisition, which cannot
+    // be synchronized from within the Storage trait. Testing `is_dirty`  would require stress
+    // testing or instrumentation within BufferPool itself.
 }
