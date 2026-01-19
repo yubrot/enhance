@@ -7,11 +7,10 @@ use std::ops::{Deref, DerefMut};
 
 use tokio::sync::{RwLockReadGuard, RwLockWriteGuard};
 
-use crate::storage::{PageData, PageId, Storage};
-
 use super::frame::FrameId;
 use super::pool::BufferPoolInner;
 use super::replacer::Replacer;
+use crate::storage::{PageData, PageId, Storage};
 
 /// RAII guard for reading a page in the buffer pool.
 ///
@@ -77,7 +76,7 @@ impl<S: Storage, R: Replacer> Deref for PageReadGuard<'_, S, R> {
 
 impl<S: Storage, R: Replacer> Drop for PageReadGuard<'_, S, R> {
     fn drop(&mut self) {
-        self.inner.unpin(self.frame_id, false);
+        self.inner.release(self.frame_id, false);
     }
 }
 
@@ -169,6 +168,6 @@ impl<S: Storage, R: Replacer> DerefMut for PageWriteGuard<'_, S, R> {
 
 impl<S: Storage, R: Replacer> Drop for PageWriteGuard<'_, S, R> {
     fn drop(&mut self) {
-        self.inner.unpin(self.frame_id, self.is_dirty);
+        self.inner.release(self.frame_id, self.is_dirty);
     }
 }

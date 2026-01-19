@@ -6,10 +6,12 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::storage::{PageId, Storage};
+use tokio::sync::RwLock;
+
+use crate::storage::{PageData, PageId, Storage, StorageError};
 
 use super::error::BufferPoolError;
-use super::frame::{Frame, FrameId, FrameMetadata};
+use super::frame::{FrameId, FrameMetadata};
 use super::guard::{PageReadGuard, PageWriteGuard};
 use super::replacer::Replacer;
 
@@ -29,7 +31,7 @@ use super::replacer::Replacer;
 ///          |
 ///          v
 /// +-------------------+
-/// | BufferPool |  <- You are here
+/// | BufferPool        |  <- You are here
 /// +-------------------+
 ///          |
 ///          v
@@ -45,24 +47,24 @@ use super::replacer::Replacer;
 /// - Multiple readers can access the same page simultaneously (shared lock)
 /// - Writers get exclusive access to their page (exclusive lock)
 /// - The state (page table, metadata, replacer) is protected by a mutex
-///
-/// # Latch Hierarchy
-///
-/// To prevent deadlocks, locks must be acquired in strict order:
-/// 1. State mutex (page_table, frame_metadata, free_list, replacer)
-/// 2. Frame data RwLock (in PageId order when multiple frames needed)
-///
-/// **NEVER** acquire the state lock while holding a frame data lock.
-///
-/// NOTE: For production, consider these improvements:
-/// - Use `parking_lot::Mutex` for better performance (no poisoning)
-/// - Split state into multiple locks to reduce contention
-/// - Add metrics (hit rate, eviction count, dirty page count)
-/// - Implement background flusher thread for dirty pages
-/// - Support page prefetching for sequential scans
 pub struct BufferPool<S: Storage, R: Replacer> {
     inner: BufferPoolInner<S, R>,
 }
+
+// # Latch Hierarchy
+//
+// To prevent deadlocks, locks must be acquired in strict order:
+// 1. State mutex (page_table, frame_metadata, free_list, replacer)
+// 2. Frame data RwLock (in PageId order when multiple frames needed)
+//
+// **NEVER** acquire the state lock while holding a frame data lock.
+//
+// NOTE: For production, consider these improvements:
+// - Use `parking_lot::Mutex` for better performance (no poisoning)
+// - Split state into multiple locks to reduce contention
+// - Add metrics (hit rate, eviction count, dirty page count)
+// - Implement background flusher thread for dirty pages
+// - Support page prefetching for sequential scans
 
 /// Internal state of the buffer pool manager.
 ///
@@ -71,16 +73,17 @@ pub(super) struct BufferPoolInner<S: Storage, R: Replacer> {
     /// The underlying storage backend.
     storage: S,
 
-    /// Frame array - each frame's data is protected by its own RwLock.
-    frames: Vec<Frame>,
+    /// Frame data array (indexed by FrameId).
+    ///
+    /// Each element holds page data protected by an async RwLock for concurrent
+    /// access. Corresponding metadata (page_id, pin_count, is_dirty) is stored
+    /// in `state.frame_metadata` at the same index.
+    frames: Vec<RwLock<PageData>>,
 
     /// Protected mutable state (page table, metadata, free list, replacer).
     ///
     /// Uses `std::sync::Mutex` to allow synchronous access from `Drop`.
     state: Mutex<BufferPoolState<R>>,
-
-    /// Number of frames in the pool.
-    pool_size: usize,
 }
 
 /// Mutable state protected by the state mutex.
@@ -113,13 +116,10 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
     pub fn new(storage: S, replacer: R, pool_size: usize) -> Self {
         assert!(pool_size > 0, "pool_size must be > 0");
 
-        // Pre-allocate all frames
-        let frames: Vec<_> = (0..pool_size).map(|_| Frame::new()).collect();
-
-        // Pre-allocate all metadata
-        let frame_metadata: Vec<_> = (0..pool_size).map(|_| FrameMetadata::new()).collect();
-
-        // All frames start as free
+        let frames: Vec<_> = (0..pool_size)
+            .map(|_| RwLock::new(PageData::new()))
+            .collect();
+        let frame_metadata: Vec<_> = (0..pool_size).map(|_| FrameMetadata::vacant()).collect();
         let free_list: Vec<_> = (0..pool_size).collect();
 
         let state = BufferPoolState {
@@ -134,18 +134,14 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
                 storage,
                 frames,
                 state: Mutex::new(state),
-                pool_size,
             },
         }
     }
 
     /// Fetches a page for reading.
     ///
-    /// If the page is already in the buffer pool, returns it directly.
-    /// Otherwise, reads it from storage into a free or evicted frame.
-    ///
-    /// The returned guard holds a pin on the page, preventing eviction
-    /// until the guard is dropped.
+    /// Returns a guard that holds a pin on the page, preventing eviction
+    /// until dropped.
     ///
     /// # Errors
     ///
@@ -155,10 +151,8 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
         &self,
         page_id: PageId,
     ) -> Result<PageReadGuard<'_, S, R>, BufferPoolError> {
-        let frame_id = self.inner.get_or_allocate_frame(page_id).await?;
-
-        // Acquire read lock on the frame's data
-        let data_guard = self.inner.frames[frame_id].data.read().await;
+        let frame_id = self.inner.acquire(page_id).await?;
+        let data_guard = self.inner.frames[frame_id].read().await;
 
         Ok(PageReadGuard {
             inner: &self.inner,
@@ -170,9 +164,7 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
 
     /// Fetches a page for writing.
     ///
-    /// Similar to `fetch_page`, but returns a mutable guard.
-    /// The page is NOT automatically marked dirty; call `mark_dirty()`
-    /// on the guard after modifications.
+    /// Returns a mutable guard. Call `mark_dirty()` after modifications.
     ///
     /// # Errors
     ///
@@ -182,10 +174,8 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
         &self,
         page_id: PageId,
     ) -> Result<PageWriteGuard<'_, S, R>, BufferPoolError> {
-        let frame_id = self.inner.get_or_allocate_frame(page_id).await?;
-
-        // Acquire write lock on the frame's data
-        let data_guard = self.inner.frames[frame_id].data.write().await;
+        let frame_id = self.inner.acquire(page_id).await?;
+        let data_guard = self.inner.frames[frame_id].write().await;
 
         Ok(PageWriteGuard {
             inner: &self.inner,
@@ -196,25 +186,18 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
         })
     }
 
-    /// Creates a new page in storage and fetches it into the buffer pool.
-    ///
-    /// The new page is initialized to zeros.
+    /// Creates a new page in storage and returns a mutable guard.
     ///
     /// # Errors
     ///
     /// - `BufferPoolError::NoFreeFrames` if the pool is full and all pages are pinned
     /// - `BufferPoolError::Storage` if storage allocation fails
     pub async fn new_page(&self) -> Result<PageWriteGuard<'_, S, R>, BufferPoolError> {
-        // Allocate page in storage first
         let page_id = self.inner.storage.allocate_page().await?;
-
-        // Then fetch it (will use a free/evicted frame)
         self.fetch_page_mut(page_id).await
     }
 
-    /// Flushes a specific page to storage if it's dirty.
-    ///
-    /// Does nothing if the page is not in the buffer pool or not dirty.
+    /// Flushes a specific page to storage if dirty.
     ///
     /// # Errors
     ///
@@ -231,7 +214,7 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
 
         if let Some(frame_id) = frame_id {
             // Acquire frame data lock for reading
-            let data_guard = self.inner.frames[frame_id].data.read().await;
+            let data_guard = self.inner.frames[frame_id].read().await;
 
             // Write to storage
             self.inner
@@ -275,7 +258,7 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
 
         // Flush each dirty page
         for (frame_id, page_id) in dirty_pages {
-            let data_guard = self.inner.frames[frame_id].data.read().await;
+            let data_guard = self.inner.frames[frame_id].read().await;
 
             // Verify frame still holds the same page before writing
             {
@@ -305,7 +288,7 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
 
     /// Returns the number of frames in the buffer pool.
     pub fn pool_size(&self) -> usize {
-        self.inner.pool_size
+        self.inner.frames.len()
     }
 
     /// Returns the number of pages currently in the buffer pool.
@@ -316,155 +299,217 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
 }
 
 impl<S: Storage, R: Replacer> BufferPoolInner<S, R> {
-    /// Gets or allocates a frame for a page.
+    /// Acquires a frame for the given page, loading it from storage if necessary.
     ///
-    /// If the page is already in the buffer pool, increments its pin count.
-    /// Otherwise, allocates a free frame or evicts a victim frame.
+    /// This method handles:
+    /// - Cache hit: Returns the existing frame (increments pin count)
+    /// - Cache miss with free frame: Allocates a free frame and loads the page
+    /// - Cache miss without free frame: Evicts a victim frame (writing back if dirty) and loads the page
     ///
-    /// # Concurrency Note
+    /// # Contract
     ///
-    /// If multiple threads concurrently request the same page that is not in
-    /// the buffer pool, both may allocate frames and perform I/O. After I/O
-    /// completes, we re-check the page table and discard the redundant frame
-    /// if another thread won the race. This is inefficient but correct.
-    async fn get_or_allocate_frame(&self, page_id: PageId) -> Result<FrameId, BufferPoolError> {
-        // First, check if page is already in buffer pool (fast path)
-        {
-            let mut state = self.state.lock().expect("state lock poisoned");
+    /// **The caller MUST call [`release`] exactly once for each successful `acquire`.**
+    /// Failing to release will cause frame leaks (frames remain pinned forever).
+    /// Releasing more than once will cause undefined behavior (double unpin).
+    ///
+    /// # Errors
+    ///
+    /// - `BufferPoolError::NoFreeFrames` if all frames are pinned
+    /// - `BufferPoolError::Storage` if I/O fails
+    async fn acquire(&self, page_id: PageId) -> Result<FrameId, BufferPoolError> {
+        let new_frame_id = loop {
+            let acquire_result = {
+                let mut state = self.state.lock().expect("state lock poisoned");
+                state.acquire_frame(page_id)
+            };
+            match acquire_result {
+                AcquireFrame::Ready(frame_id) => return Ok(frame_id),
+                AcquireFrame::ReadRequired(frame_id) => break frame_id,
+                AcquireFrame::WriteBackRequired(frame_id, evict_page_id) => {
+                    let write_result = {
+                        let data = self.frames[frame_id].read().await;
+                        self.storage.write_page(evict_page_id, data.as_slice()).await
+                    };
 
-            if let Some(&frame_id) = state.page_table.get(&page_id) {
-                // Page hit - increment pin count
-                state.frame_metadata[frame_id].pin_count += 1;
-
-                // Remove from replacer since it's now pinned
-                state.replacer.pin(frame_id);
-
-                return Ok(frame_id);
+                    let mut state = self.state.lock().expect("state lock poisoned");
+                    match state.complete_write_back(frame_id, evict_page_id, write_result)? {
+                        CompleteWriteBack::ReadRequired(frame_id) => break frame_id,
+                        CompleteWriteBack::Retry => {}
+                    }
+                }
+                AcquireFrame::Full => return Err(BufferPoolError::NoFreeFrames),
             }
-        }
-
-        // Page miss - need to allocate a frame
-        let frame_id = self.allocate_frame().await?;
-
-        // Read page from storage into frame
-        let read_result = {
-            let mut data_guard = self.frames[frame_id].data.write().await;
-            self.storage
-                .read_page(page_id, data_guard.as_mut_slice())
-                .await
+            // FIXME: Potential busy loop if write back keeps failing
         };
 
-        // Handle read error - return frame to free list to avoid leak
+        let read_result = {
+            let mut data = self.frames[new_frame_id].write().await;
+            self.storage.read_page(page_id, data.as_mut_slice()).await
+        };
+
+        let mut state = self.state.lock().expect("state lock poisoned");
+        state.complete_read(new_frame_id, page_id, read_result)
+    }
+
+    /// Releases a previously acquired frame, decrementing its pin count.
+    ///
+    /// When the pin count reaches zero, the frame becomes eligible for eviction
+    /// by the replacer.
+    ///
+    /// # Contract
+    ///
+    /// **This method MUST be called exactly once for each successful [`acquire`].**
+    /// - Not calling release: Frame remains pinned forever (memory leak)
+    /// - Calling release multiple times: Undefined behavior (double unpin)
+    ///
+    /// # Arguments
+    ///
+    /// * `frame_id` - The frame ID returned by a previous `acquire` call
+    /// * `is_dirty` - If true, marks the frame as dirty (needs write-back before eviction)
+    pub(super) fn release(&self, frame_id: FrameId, is_dirty: bool) {
+        let mut state = self.state.lock().expect("state lock poisoned");
+        state.unpin_frame(frame_id, is_dirty);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AcquireFrame {
+    /// Page already in buffer pool, frame is pinned. Ready to use.
+    Ready(FrameId),
+    /// New frame allocated. Caller must read page and call `complete_read`.
+    ReadRequired(FrameId),
+    /// Dirty frame needs write back. Caller must write and call `complete_write_back`.
+    WriteBackRequired(FrameId, PageId),
+    /// All frames are pinned. Caller should return an error.
+    Full,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CompleteWriteBack {
+    /// Write back succeeded and frame was evicted. Caller must read page and call `complete_read`.
+    ReadRequired(FrameId),
+    /// Eviction aborted (frame was pinned or dirtied during write back). Caller should retry `acquire_frame`.
+    Retry,
+}
+
+impl<R: Replacer> BufferPoolState<R> {
+    /// Acquires a frame for the given page.
+    fn acquire_frame(&mut self, page_id: PageId) -> AcquireFrame {
+        // Fast path: page already in buffer pool
+        if let Some(&frame_id) = self.page_table.get(&page_id) {
+            self.pin_frame(frame_id);
+            return AcquireFrame::Ready(frame_id);
+        }
+
+        // Slow path: allocate a frame
+        // Try to get a free frame first
+        if let Some(frame_id) = self.free_list.pop() {
+            return AcquireFrame::ReadRequired(frame_id);
+        }
+
+        // Need to evict - find a victim
+        let Some(frame_id) = self.replacer.evict() else {
+            return AcquireFrame::Full;
+        };
+
+        let Some(page_id) = self.frame_metadata[frame_id].page_id else {
+            panic!("Evicted frame must be previously occupied");
+        };
+        debug_assert_eq!(self.frame_metadata[frame_id].pin_count, 0);
+
+        if self.frame_metadata[frame_id].is_dirty {
+            // Evicted frame is dirty - write back is required.
+            // Pin the frame during write back to allow concurrent access to the same page
+            // (other threads can use the in-memory data while we write it back).
+            // Clear is_dirty so we can detect if someone modifies the page during write back.
+            self.frame_metadata[frame_id].pin_count = 1;
+            self.frame_metadata[frame_id].is_dirty = false;
+            return AcquireFrame::WriteBackRequired(frame_id, page_id);
+        }
+
+        self.page_table.remove(&page_id);
+        self.frame_metadata[frame_id] = FrameMetadata::vacant();
+        AcquireFrame::ReadRequired(frame_id)
+    }
+
+    /// Completes a read operation initiated by `acquire_frame`.
+    fn complete_read(
+        &mut self,
+        frame_id: FrameId,
+        page_id: PageId,
+        read_result: Result<(), StorageError>,
+    ) -> Result<FrameId, BufferPoolError> {
         if let Err(e) = read_result {
-            let mut state = self.state.lock().expect("state lock poisoned");
-            state.free_list.push(frame_id);
+            self.free_list.push(frame_id);
             return Err(e.into());
         }
 
-        // Update state
-        {
-            let mut state = self.state.lock().expect("state lock poisoned");
-
-            // Check if another thread loaded this page while we were doing I/O
-            if let Some(&existing_frame_id) = state.page_table.get(&page_id) {
-                // Another thread won the race - discard our frame and use theirs
-                state.free_list.push(frame_id);
-                state.frame_metadata[existing_frame_id].pin_count += 1;
-                state.replacer.pin(existing_frame_id);
-                return Ok(existing_frame_id);
-            }
-
-            state.page_table.insert(page_id, frame_id);
-            state.frame_metadata[frame_id].page_id = Some(page_id);
-            state.frame_metadata[frame_id].pin_count = 1;
-            state.frame_metadata[frame_id].is_dirty = false;
-        }
+        let frame_id = if let Some(&won_frame_id) = self.page_table.get(&page_id) {
+            // Another thread won the race - discard our frame and use theirs
+            self.free_list.push(frame_id);
+            self.pin_frame(won_frame_id);
+            won_frame_id
+        } else {
+            // Ready to use this frame
+            self.page_table.insert(page_id, frame_id);
+            self.frame_metadata[frame_id] = FrameMetadata::occupied(page_id);
+            frame_id
+        };
 
         Ok(frame_id)
     }
 
-    /// Allocates a free frame, evicting if necessary.
-    async fn allocate_frame(&self) -> Result<FrameId, BufferPoolError> {
-        // Try to get a free frame first
-        {
-            let mut state = self.state.lock().expect("state lock poisoned");
-
-            if let Some(frame_id) = state.free_list.pop() {
-                return Ok(frame_id);
-            }
+    /// Completes a write back operation initiated by `acquire_frame`.
+    fn complete_write_back(
+        &mut self,
+        frame_id: FrameId,
+        page_id: PageId,
+        write_result: Result<(), StorageError>,
+    ) -> Result<CompleteWriteBack, BufferPoolError> {
+        if let Err(e) = write_result {
+            // Write back failed: restore dirty flag
+            self.unpin_frame(frame_id, true);
+            return Err(e.into());
         }
 
-        // Need to evict - find a victim
-        loop {
-            let victim = {
-                let mut state = self.state.lock().expect("state lock poisoned");
-                state.replacer.evict()
-            };
+        if self.frame_metadata[frame_id].pin_count > 1 || self.frame_metadata[frame_id].is_dirty {
+            // Abort eviction if either:
+            // - pin_count > 1: Another caller acquired this frame during write back and still holds it
+            // - is_dirty: The page was modified during write back (the caller may have already released)
+            // In both cases, preserve the current state and retry acquiring a frame.
+            self.unpin_frame(frame_id, false /* don't add dirty flag */);
+            return Ok(CompleteWriteBack::Retry);
+        }
 
-            let frame_id = match victim {
-                Some(fid) => fid,
-                None => return Err(BufferPoolError::NoFreeFrames),
-            };
+        // Success - complete eviction
+        self.page_table.remove(&page_id);
+        self.frame_metadata[frame_id] = FrameMetadata::vacant();
+        Ok(CompleteWriteBack::ReadRequired(frame_id))
+    }
 
-            // Get victim's info and prepare for eviction
-            let (old_page_id, is_dirty) = {
-                let state = self.state.lock().expect("state lock poisoned");
-                let meta = &state.frame_metadata[frame_id];
-                (meta.page_id, meta.is_dirty)
-            };
+    /// Increments pin count for a frame and notifies the replacer if needed.
+    fn pin_frame(&mut self, frame_id: FrameId) {
+        let meta = &mut self.frame_metadata[frame_id];
 
-            // Write back if dirty
-            if let Some(old_page_id) = old_page_id
-                && is_dirty
-            {
-                let data_guard = self.frames[frame_id].data.read().await;
-                self.storage
-                    .write_page(old_page_id, data_guard.as_slice())
-                    .await?;
-            }
-
-            // Complete eviction under state lock
-            {
-                let mut state = self.state.lock().expect("state lock poisoned");
-
-                // Verify the frame wasn't re-pinned while we were doing I/O
-                if state.frame_metadata[frame_id].pin_count > 0 {
-                    // Frame was re-pinned, try again with another victim
-                    continue;
-                }
-
-                // Remove from page table
-                if let Some(old_page_id) = old_page_id {
-                    state.page_table.remove(&old_page_id);
-                }
-
-                // Reset frame metadata
-                state.frame_metadata[frame_id].reset();
-
-                return Ok(frame_id);
-            }
+        meta.pin_count += 1;
+        if meta.pin_count == 1 {
+            self.replacer.pin(frame_id);
         }
     }
 
-    /// Unpins a frame (called from PageGuard::drop).
+    /// Decrements pin count for a frame and notifies the replacer if needed.
     ///
-    /// This is a synchronous operation because Drop is synchronous.
-    pub(super) fn unpin(&self, frame_id: FrameId, is_dirty: bool) {
-        let mut state = self.state.lock().expect("state lock poisoned");
+    /// If `is_dirty` is true, the frame is marked as dirty.
+    fn unpin_frame(&mut self, frame_id: FrameId, is_dirty: bool) {
+        let meta = &mut self.frame_metadata[frame_id];
+        debug_assert!(meta.pin_count > 0, "unpin called on unpinned frame");
 
-        let meta = &mut state.frame_metadata[frame_id];
-
-        if meta.pin_count > 0 {
-            meta.pin_count -= 1;
-
-            if is_dirty {
-                meta.is_dirty = true;
-            }
-
-            // If unpinned (pin_count == 0), add to replacer
-            if meta.pin_count == 0 {
-                state.replacer.unpin(frame_id);
-            }
+        if is_dirty {
+            meta.is_dirty = true;
+        }
+        meta.pin_count -= 1;
+        if meta.pin_count == 0 {
+            self.replacer.unpin(frame_id);
         }
     }
 }
@@ -473,7 +518,7 @@ impl<S: Storage, R: Replacer> BufferPoolInner<S, R> {
 mod tests {
     use super::super::LruReplacer;
     use super::*;
-    use crate::storage::{MemoryStorage, PAGE_SIZE};
+    use crate::storage::{MemoryStorage, StorageError, PAGE_SIZE};
 
     #[tokio::test]
     async fn test_new_buffer_pool() {
@@ -666,5 +711,240 @@ mod tests {
         let guard2 = bpm.fetch_page(PageId::new(0)).await.unwrap();
 
         assert_eq!(guard1.page_id(), guard2.page_id());
+    }
+
+    #[tokio::test]
+    async fn test_flush_page_not_in_pool() {
+        let storage = MemoryStorage::new();
+        let page_id = storage.allocate_page().await.unwrap();
+
+        let replacer = LruReplacer::new(10);
+        let bpm = BufferPool::new(storage, replacer, 10);
+
+        // Flushing a page not in the buffer pool should succeed silently
+        let result = bpm.flush_page(page_id).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_flush_page_clean() {
+        let storage = MemoryStorage::new();
+        let replacer = LruReplacer::new(10);
+        let bpm = BufferPool::new(storage, replacer, 10);
+
+        // Create a page but don't mark it dirty
+        let page_id;
+        {
+            let guard = bpm.new_page().await.unwrap();
+            page_id = guard.page_id();
+            // Not calling mark_dirty()
+        }
+
+        // Flushing a clean page should succeed without writing
+        let result = bpm.flush_page(page_id).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_page_not_allocated() {
+        let storage = MemoryStorage::new();
+        let replacer = LruReplacer::new(10);
+        let bpm = BufferPool::new(storage, replacer, 10);
+
+        // Fetching a non-existent page should return an error
+        let result = bpm.fetch_page(PageId::new(999)).await;
+        assert!(matches!(
+            result,
+            Err(BufferPoolError::Storage(StorageError::PageNotFound(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_write_and_read_back() {
+        let storage = MemoryStorage::new();
+        let replacer = LruReplacer::new(10);
+        let bpm = BufferPool::new(storage, replacer, 10);
+
+        let page_id;
+        {
+            let mut guard = bpm.new_page().await.unwrap();
+            page_id = guard.page_id();
+            // Write a pattern
+            for (i, byte) in guard.data_mut().iter_mut().enumerate() {
+                *byte = (i % 256) as u8;
+            }
+            guard.mark_dirty();
+        }
+
+        // Read back and verify
+        let guard = bpm.fetch_page(page_id).await.unwrap();
+        for (i, byte) in guard.data().iter().enumerate() {
+            assert_eq!(*byte, (i % 256) as u8);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_multiple_writes_same_page() {
+        let storage = MemoryStorage::new();
+        let replacer = LruReplacer::new(10);
+        let bpm = BufferPool::new(storage, replacer, 10);
+
+        let page_id;
+        {
+            let mut guard = bpm.new_page().await.unwrap();
+            page_id = guard.page_id();
+            guard.data_mut()[0] = 1;
+            guard.mark_dirty();
+        }
+
+        // Write again
+        {
+            let mut guard = bpm.fetch_page_mut(page_id).await.unwrap();
+            assert_eq!(guard.data()[0], 1);
+            guard.data_mut()[0] = 2;
+            guard.mark_dirty();
+        }
+
+        // Verify
+        let guard = bpm.fetch_page(page_id).await.unwrap();
+        assert_eq!(guard.data()[0], 2);
+    }
+
+    #[tokio::test]
+    async fn test_eviction_lru_order() {
+        let storage = MemoryStorage::new();
+
+        // Allocate 4 pages
+        for _ in 0..4 {
+            storage.allocate_page().await.unwrap();
+        }
+
+        // Pool size of 3
+        let replacer = LruReplacer::new(3);
+        let bpm = BufferPool::new(storage, replacer, 3);
+
+        // Fetch pages 0, 1, 2 (fills the pool)
+        for i in 0..3 {
+            let _g = bpm.fetch_page(PageId::new(i)).await.unwrap();
+        }
+        assert_eq!(bpm.page_count(), 3);
+
+        // Access page 0 again to make it most recently used
+        {
+            let _g = bpm.fetch_page(PageId::new(0)).await.unwrap();
+        }
+
+        // Fetch page 3 - should evict page 1 (LRU)
+        {
+            let _g = bpm.fetch_page(PageId::new(3)).await.unwrap();
+        }
+
+        // Page 1 should be evicted, pages 0, 2, 3 should remain
+        // Verify by fetching page 0 (cache hit - still in pool)
+        let guard = bpm.fetch_page(PageId::new(0)).await.unwrap();
+        assert_eq!(guard.page_id(), PageId::new(0));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_fetch_same_page() {
+        use std::sync::Arc;
+
+        let storage = MemoryStorage::new();
+        let page_id = storage.allocate_page().await.unwrap();
+
+        let replacer = LruReplacer::new(10);
+        let bpm = Arc::new(BufferPool::new(storage, replacer, 10));
+
+        // Spawn multiple tasks fetching the same page concurrently
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let bpm = Arc::clone(&bpm);
+            handles.push(tokio::spawn(async move {
+                let guard = bpm.fetch_page(page_id).await.unwrap();
+                assert_eq!(guard.page_id(), page_id);
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // Should only have 1 page in pool
+        assert_eq!(bpm.page_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_fetch_different_pages() {
+        use std::sync::Arc;
+
+        let storage = MemoryStorage::new();
+        for _ in 0..5 {
+            storage.allocate_page().await.unwrap();
+        }
+
+        let replacer = LruReplacer::new(10);
+        let bpm = Arc::new(BufferPool::new(storage, replacer, 10));
+
+        // Spawn tasks fetching different pages concurrently
+        let mut handles = vec![];
+        for i in 0..5 {
+            let bpm = Arc::clone(&bpm);
+            handles.push(tokio::spawn(async move {
+                let guard = bpm.fetch_page(PageId::new(i)).await.unwrap();
+                assert_eq!(guard.page_id(), PageId::new(i));
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        assert_eq!(bpm.page_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_pin_prevents_eviction() {
+        let storage = MemoryStorage::new();
+
+        for _ in 0..3 {
+            storage.allocate_page().await.unwrap();
+        }
+
+        let replacer = LruReplacer::new(2);
+        let bpm = BufferPool::new(storage, replacer, 2);
+
+        // Pin page 0
+        let _guard0 = bpm.fetch_page(PageId::new(0)).await.unwrap();
+
+        // Fetch page 1 (fills pool)
+        {
+            let _g = bpm.fetch_page(PageId::new(1)).await.unwrap();
+        }
+
+        // Fetch page 2 - should evict page 1 (page 0 is pinned)
+        {
+            let _g = bpm.fetch_page(PageId::new(2)).await.unwrap();
+        }
+
+        // Page 0 should still be valid
+        assert_eq!(_guard0.page_id(), PageId::new(0));
+    }
+
+    #[tokio::test]
+    async fn test_deref_traits() {
+        let storage = MemoryStorage::new();
+        let replacer = LruReplacer::new(10);
+        let bpm = BufferPool::new(storage, replacer, 10);
+
+        // Test Deref for PageWriteGuard
+        {
+            let mut guard = bpm.new_page().await.unwrap();
+            guard[0] = 42; // Uses DerefMut
+            guard.mark_dirty();
+        }
+
+        // Test Deref for PageReadGuard
+        let guard = bpm.fetch_page(PageId::new(0)).await.unwrap();
+        assert_eq!(guard[0], 42); // Uses Deref
     }
 }
