@@ -68,7 +68,7 @@ impl Record {
     ///
     /// This includes the null bitmap and all non-null values.
     pub fn serialized_size(&self) -> usize {
-        let null_bitmap_bytes = (self.values.len() + 7) / 8;
+        let null_bitmap_bytes = self.values.len().div_ceil(8);
         let values_size: usize = self
             .values
             .iter()
@@ -95,18 +95,18 @@ impl Record {
         }
 
         let num_cols = self.values.len();
-        let null_bitmap_bytes = (num_cols + 7) / 8;
+        let null_bitmap_bytes = num_cols.div_ceil(8);
 
         // Write null bitmap (bit=1 means NOT NULL)
-        for i in 0..null_bitmap_bytes {
-            let mut byte = 0u8;
+        for (i, byte) in buf.iter_mut().take(null_bitmap_bytes).enumerate() {
+            let mut b = 0u8;
             for bit in 0..8 {
                 let col_idx = i * 8 + bit;
                 if col_idx < num_cols && !self.values[col_idx].is_null() {
-                    byte |= 1 << bit;
+                    b |= 1 << bit;
                 }
             }
-            buf[i] = byte;
+            *byte = b;
         }
 
         // Write non-null values
@@ -132,7 +132,7 @@ impl Record {
     /// Returns error if buffer is malformed or too small.
     pub fn deserialize(buf: &[u8], schema: &[i32]) -> Result<Self, SerdeError> {
         let num_cols = schema.len();
-        let null_bitmap_bytes = (num_cols + 7) / 8;
+        let null_bitmap_bytes = num_cols.div_ceil(8);
 
         if buf.len() < null_bitmap_bytes {
             return Err(SerdeError::BufferTooSmall {
@@ -142,13 +142,14 @@ impl Record {
         }
 
         // Read null bitmap
-        let mut is_null = vec![false; num_cols];
-        for i in 0..num_cols {
-            let byte_idx = i / 8;
-            let bit_idx = i % 8;
-            // bit=1 means NOT NULL, so is_null when bit=0
-            is_null[i] = (buf[byte_idx] & (1 << bit_idx)) == 0;
-        }
+        let is_null: Vec<bool> = (0..num_cols)
+            .map(|i| {
+                let byte_idx = i / 8;
+                let bit_idx = i % 8;
+                // bit=1 means NOT NULL, so is_null when bit=0
+                (buf[byte_idx] & (1 << bit_idx)) == 0
+            })
+            .collect();
 
         // Read values
         let mut offset = null_bitmap_bytes;
