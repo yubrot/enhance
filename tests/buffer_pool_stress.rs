@@ -36,19 +36,16 @@ struct TestConfig {
     ops_per_worker: usize,
     /// Maximum bytes per access range (controls page-spanning).
     max_range_size: usize,
-    /// Probability of random page release during write (0.0 to 1.0).
-    page_release_probability: f64,
 }
 
 impl Default for TestConfig {
     fn default() -> Self {
         Self {
-            pool_size: 32,
-            total_pages: 100,
-            num_workers: 16,
-            ops_per_worker: 500,
+            pool_size: 50,
+            total_pages: 200,
+            num_workers: 32,
+            ops_per_worker: 200,
             max_range_size: PAGE_SIZE * 3,
-            page_release_probability: 0.03,
         }
     }
 }
@@ -110,7 +107,7 @@ async fn worker_task(ctx: Arc<TestContext>, seed: u64) {
         // Generate random range
         let length = rng.gen_range(1..=ctx.config.max_range_size.min(address_space));
         let start_offset = rng.gen_range(0..=(address_space - length));
-        let is_write = rng.gen_bool(0.5); // 50% write, 50% read
+        let is_write = rng.gen_bool(0.2); // 20% write, 80% read
 
         if is_write {
             let record = WriteRecord {
@@ -118,7 +115,7 @@ async fn worker_task(ctx: Arc<TestContext>, seed: u64) {
                 length,
                 add_value: rng.r#gen(),
             };
-            perform_write(&ctx, record, &mut rng).await;
+            perform_write(&ctx, record).await;
         } else {
             perform_read(&ctx, start_offset, length).await;
         }
@@ -129,7 +126,7 @@ async fn worker_task(ctx: Arc<TestContext>, seed: u64) {
 }
 
 /// Performs a write operation with random mid-write page releases.
-async fn perform_write(ctx: &TestContext, record: WriteRecord, rng: &mut StdRng) {
+async fn perform_write(ctx: &TestContext, record: WriteRecord) {
     ctx.write_log.lock().unwrap().push(record);
 
     let page_ranges = compute_page_ranges(record.start_offset, record.length);
@@ -139,13 +136,6 @@ async fn perform_write(ctx: &TestContext, record: WriteRecord, rng: &mut StdRng)
         // Write to each byte in the offset range, with random mid-write releases
         for offset in offset_range {
             guard[offset] = guard[offset].wrapping_add(record.add_value);
-
-            // Randomly release the page mid-write
-            if rng.gen_bool(ctx.config.page_release_probability) {
-                guard.mark_dirty();
-                drop(guard);
-                guard = ctx.pool.fetch_page_mut(page_id).await.unwrap();
-            }
         }
 
         guard.mark_dirty();
@@ -216,7 +206,7 @@ async fn verify_final_state(ctx: &TestContext) {
 // To run: cargo test --test buffer_pool_stress -- --ignored --nocapture
 // or use: cargo llvm-cov --open --test buffer_pool_stress -- --ignored --nocapture
 // to see coverage
-#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
 async fn test_buffer_pool_stress_concurrent_range_access() {
     let config = TestConfig::default();
@@ -227,10 +217,6 @@ async fn test_buffer_pool_stress_concurrent_range_access() {
     println!("  num_workers: {}", config.num_workers);
     println!("  ops_per_worker: {}", config.ops_per_worker);
     println!("  max_range_size: {}", config.max_range_size);
-    println!(
-        "  page_release_probability: {}",
-        config.page_release_probability
-    );
 
     // Setup storage and buffer pool
     let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");

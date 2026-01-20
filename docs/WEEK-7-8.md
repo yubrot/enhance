@@ -8,7 +8,7 @@
 
 The buffer pool caches up to `pool_size` pages from a potentially vast Storage as **frames** in memory.
 
-Frames share a pre-allocated fixed-size memory region. A frame holding a page can be **evicted** and reassigned to a different page. However, the **Pin/Unpin** mechanism prevents frames currently in use (pin_count > 0) from being evicted.
+Frames share a pre-allocated fixed-size memory region. A frame holding a page can be **evicted** and reassigned to a different page. However, the **Pin/Unpin** mechanism prevents frames currently in use (`pin_count > 0`) from being evicted.
 
 Frame contents are written back to Storage at these times:
 
@@ -36,11 +36,9 @@ LRU is simple to implement and has predictable behavior. More sophisticated poli
 The buffer pool separates frame data from metadata with different lock types:
 
 ```
-frames: Vec<RwLock<PageData>>     -- Async RwLock (tokio)
-state: Mutex<BufferPoolState<R>>  -- Sync Mutex (std)
+frames: Vec<RwLock<PageData>>     -- Async RwLock (tokio) protects page data
+state: Mutex<BufferPoolState<R>>  -- Sync Mutex (std) protects page_table, frame_metadata, free_list, replacer
 ```
-
-**State Mutex protects**: `page_table`, `frame_metadata`, `free_list`, `replacer`
 
 This design simultaneously satisfies three constraints:
 
@@ -86,15 +84,9 @@ Since Frame lock and State lock are independent, it might seem dangerous that "a
 
 **Invariant**: While holding a frame's read/write lock, the frame's `page_id` may become `None`, but **cannot change to a different page ID**.
 
-**Reason**: Loading a new page into a frame requires the frame's **write lock** (`complete_read` updates `page_table` only after acquiring write lock). Therefore, data is safe as long as you hold the read lock.
+**Reason**: Eviction sets `page_id` to `None` **before** acquiring the frame's write lock. Loading new data requires the write lock, which blocks while any read lock is held. Therefore, if you hold a read lock and see `page_id == Some(X)`, the data is guaranteed to belong to page X. If eviction occurs concurrently, `page_id` becomes `None`, but the data remains valid until the read lock is released.
 
-```rust
-// In acquire: always acquire write lock when loading a new page
-let mut data = self.frames[new_frame_id].write().await;
-self.storage.read_page(page_id, data.as_mut_slice()).await
-```
-
-The flush operation verifies `page_id` before and after the write to handle concurrent eviction correctly—ensuring dirty flags aren't cleared for the wrong page.
+This is why the flush operation checks `page_id` **before** reading the data—if already `None`, the frame was evicted and the data may no longer belongs to the target page. The post-write check handles eviction occurring between read lock acquisition and flush completion.
 
 #### Multi-Page Lock Ordering
 
@@ -111,24 +103,6 @@ let page_1 = bpm.fetch_page(PageId::new(1)).await?;
 ```
 
 The Buffer Pool cannot know which pages will be acquired together. Only higher layers have this information, so ordering guarantees are delegated to callers. For B-tree indexes, production RDBMSs use "latch crabbing" (top-down acquisition with early release of safe nodes) to allow high concurrency while preventing deadlocks.
-
-### Page Guards: RAII Pattern for Safe Access
-
-Guards provide type-safe access to page data and ensure automatic unpinning when dropped.
-
-```rust
-// Read-only access (shared lock)
-pub struct PageReadGuard<'a, S: Storage, R: Replacer> { ... }
-
-// Mutable access (exclusive lock)
-pub struct PageWriteGuard<'a, S: Storage, R: Replacer> { ... }
-```
-
-**Benefits:**
-
-1. **Memory safety**: Rust's borrow checker prevents use-after-free and data races
-2. **Automatic cleanup**: Guards unpin pages on drop (even during panics)
-3. **Convenient API**: Implements `Deref`/`DerefMut` for direct slice access
 
 ## Cancel Safety Considerations
 
@@ -147,25 +121,13 @@ If a Future returned by buffer pool methods is dropped before completion (e.g., 
 
 ## Testing: Concurrent Stress Test
 
-`tests/buffer_pool_stress.rs` validates correctness under concurrent load:
-
-```rust
-struct TestConfig {
-    pool_size: 32,              // Frames in buffer pool
-    total_pages: 100,           // Pages in storage (> pool_size)
-    num_workers: 16,            // Concurrent tasks
-    ops_per_worker: 500,        // Operations per task
-    max_range_size: PAGE_SIZE * 3,  // Spans multiple pages
-    page_release_probability: 0.03,  // Random mid-write releases
-}
-```
+`tests/buffer_pool_stress.rs` validates correctness under concurrent load.
 
 **Test Strategy:**
 
 1. **Additive write model**: Each write adds a known value to bytes (allows verification)
 2. **Random range access**: Read/write ranges may span multiple pages
-3. **Mid-write releases**: Drop guards randomly during writes to test consistency
-4. **Final verification**: Reconstruct expected state from write log and compare with actual storage
+3. **Final verification**: Reconstruct expected state from write log and compare with actual storage
 
 **Why this design?**
 
@@ -185,10 +147,7 @@ The current implementation prioritizes learning and clarity. For production use,
 ### Performance Optimizations
 
 - **parking_lot::Mutex**: Faster, no poisoning (but less debugging info)
-- **Split state locks**: Separate locks for page_table and replacer to reduce contention
-- **Lock-free page table**: Use concurrent hash maps for higher throughput
-- **Page prefetching**: Predict sequential access patterns and load ahead
-- **Background flusher**: Dedicated task to flush dirty pages asynchronously
+- **Background flusher**: Reduce foreground flush frequency by proactively flushing dirty pages; PostgreSQL uses bgwriter (`buffers_backend` monitors fallback), MySQL InnoDB uses page cleaner threads (fallback is "single page flush")
 
 ### Monitoring & Metrics
 
@@ -203,12 +162,10 @@ The current implementation prioritizes learning and clarity. For production use,
 - **Graceful shutdown**: Flush all dirty pages before exit
 - **Page checksums**: Validate integrity on read (CRC32, xxHash)
 - **I/O error recovery**: Retry transient failures, fail fast on corruption
-- **Deadlock detection**: Monitor lock wait times, auto-abort on timeout
 
 ### Advanced Features
 
 - **Multiple buffer pools**: Per-tablespace or per-index pools
 - **Adaptive replacement**: Clock, 2Q, or ARC for better hit rates
-- **Large page support**: Handle pages > 8KB for TOAST-like data
 - **Direct I/O**: Bypass OS page cache for more control
 - **NUMA awareness**: Allocate frames on local memory nodes

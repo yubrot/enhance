@@ -350,6 +350,7 @@ impl<S: Storage, R: Replacer> BufferPoolInner<S, R> {
                 AcquireFrame::Full => return Err(BufferPoolError::NoFreeFrames),
             }
             // FIXME: Potential busy loop if write back keeps failing
+            tokio::task::yield_now().await;
         };
 
         let read_result = {
