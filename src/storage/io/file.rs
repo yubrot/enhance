@@ -171,180 +171,90 @@ impl Storage for FileStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use super::super::tests as generic;
+    use crate::storage::StorageError;
+    use tempfile::{TempDir, tempdir};
+
+    /// Helper for creating temporary FileStorage instances for testing.
+    struct TempFileStorage {
+        dir: TempDir,
+    }
+
+    impl TempFileStorage {
+        fn new() -> Self {
+            Self {
+                dir: tempdir().unwrap(),
+            }
+        }
+
+        async fn storage(&self) -> FileStorage {
+            FileStorage::open(self.dir.path().join("test.db"))
+                .await
+                .unwrap()
+        }
+    }
+
+    // === Generic tests ===
+
+    #[tokio::test]
+    async fn test_basic_operations() {
+        generic::test_basic_operations(TempFileStorage::new().storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_access() {
+        generic::test_concurrent_access(TempFileStorage::new().storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_buffer_size_validation() {
+        generic::test_buffer_size_validation(TempFileStorage::new().storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_page_not_found() {
+        generic::test_page_not_found(TempFileStorage::new().storage().await).await;
+    }
+
+    // === FileStorage-specific tests ===
 
     #[tokio::test]
     async fn test_create_new_file() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-
         let storage = FileStorage::open(&path).await.unwrap();
         assert_eq!(storage.page_count().await, 0);
         assert!(path.exists());
     }
 
     #[tokio::test]
-    async fn test_allocate_and_read() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-
-        let storage = FileStorage::open(&path).await.unwrap();
-        let page_id = storage.allocate_page().await.unwrap();
-
-        let mut buf = [0u8; PAGE_SIZE];
-        storage.read_page(page_id, &mut buf).await.unwrap();
-        assert!(buf.iter().all(|&b| b == 0));
-    }
-
-    #[tokio::test]
-    async fn test_write_and_read() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-
-        let storage = FileStorage::open(&path).await.unwrap();
-        let page_id = storage.allocate_page().await.unwrap();
-
-        // Write data
-        let mut write_buf = [0u8; PAGE_SIZE];
-        write_buf[0..4].copy_from_slice(&[1, 2, 3, 4]);
-        storage.write_page(page_id, &write_buf).await.unwrap();
-        storage.sync_all().await.unwrap();
-
-        // Read back
-        let mut read_buf = [0u8; PAGE_SIZE];
-        storage.read_page(page_id, &mut read_buf).await.unwrap();
-        assert_eq!(&read_buf[0..4], &[1, 2, 3, 4]);
-    }
-
-    #[tokio::test]
-    async fn test_persistence() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-
-        // Write data
-        {
-            let storage = FileStorage::open(&path).await.unwrap();
-            let page_id = storage.allocate_page().await.unwrap();
-
-            let mut buf = [0u8; PAGE_SIZE];
-            buf[0] = 42;
-            storage.write_page(page_id, &buf).await.unwrap();
-            storage.sync_all().await.unwrap();
-        }
-
-        // Reopen and verify
-        {
-            let storage = FileStorage::open(&path).await.unwrap();
-            assert_eq!(storage.page_count().await, 1);
-
-            let mut buf = [0u8; PAGE_SIZE];
-            storage.read_page(PageId::new(0), &mut buf).await.unwrap();
-            assert_eq!(buf[0], 42);
-        }
-    }
-
-    #[tokio::test]
     async fn test_corrupted_file_size() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-
-        // Create file with invalid size
         tokio::fs::write(&path, vec![0u8; 100]).await.unwrap();
-
         let result = FileStorage::open(&path).await;
         assert!(matches!(result, Err(StorageError::Corrupted(_))));
     }
 
     #[tokio::test]
-    async fn test_read_unallocated_page() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
+    async fn test_persistence_across_instances() {
+        let temp = TempFileStorage::new();
+        let mut page_ids = Vec::new();
 
-        let storage = FileStorage::open(&path).await.unwrap();
-        let mut buf = [0u8; PAGE_SIZE];
-        let result = storage.read_page(PageId::new(0), &mut buf).await;
-        assert!(matches!(result, Err(StorageError::PageNotFound(_))));
-    }
-
-    #[tokio::test]
-    async fn test_write_unallocated_page() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-
-        let storage = FileStorage::open(&path).await.unwrap();
-        let buf = [0u8; PAGE_SIZE];
-        let result = storage.write_page(PageId::new(0), &buf).await;
-        assert!(matches!(result, Err(StorageError::PageNotFound(_))));
-    }
-
-    #[tokio::test]
-    async fn test_invalid_buffer_size_read() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-
-        let storage = FileStorage::open(&path).await.unwrap();
-        let page_id = storage.allocate_page().await.unwrap();
-
-        let mut buf = [0u8; 100]; // Wrong size
-        let result = storage.read_page(page_id, &mut buf).await;
-        assert!(matches!(
-            result,
-            Err(StorageError::InvalidBufferSize {
-                expected: PAGE_SIZE,
-                actual: 100
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_invalid_buffer_size_write() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-
-        let storage = FileStorage::open(&path).await.unwrap();
-        let page_id = storage.allocate_page().await.unwrap();
-
-        let buf = [0u8; 100]; // Wrong size
-        let result = storage.write_page(page_id, &buf).await;
-        assert!(matches!(
-            result,
-            Err(StorageError::InvalidBufferSize {
-                expected: PAGE_SIZE,
-                actual: 100
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_multiple_pages() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-
-        let storage = FileStorage::open(&path).await.unwrap();
-
-        // Allocate multiple pages
-        let id0 = storage.allocate_page().await.unwrap();
-        let id1 = storage.allocate_page().await.unwrap();
-        let id2 = storage.allocate_page().await.unwrap();
-
-        // Write distinct data to each
-        for (id, value) in [(id0, 10u8), (id1, 20u8), (id2, 30u8)] {
-            let mut buf = [0u8; PAGE_SIZE];
-            buf[0] = value;
-            storage.write_page(id, &buf).await.unwrap();
+        {
+            let storage = temp.storage().await;
+            for i in 0..5 {
+                page_ids.push(generic::allocate_and_write(&storage, (i * 10) as u8).await);
+            }
+            storage.sync_all().await.unwrap();
         }
 
-        storage.sync_all().await.unwrap();
-
-        // Read back and verify
-        let mut buf = [0u8; PAGE_SIZE];
-        storage.read_page(id0, &mut buf).await.unwrap();
-        assert_eq!(buf[0], 10);
-
-        storage.read_page(id1, &mut buf).await.unwrap();
-        assert_eq!(buf[0], 20);
-
-        storage.read_page(id2, &mut buf).await.unwrap();
-        assert_eq!(buf[0], 30);
+        {
+            let storage = temp.storage().await;
+            assert_eq!(storage.page_count().await, 5);
+            for (i, &page_id) in page_ids.iter().enumerate() {
+                generic::verify_test_data(&storage, page_id, (i * 10) as u8).await;
+            }
+        }
     }
 }

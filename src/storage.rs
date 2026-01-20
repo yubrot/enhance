@@ -7,9 +7,9 @@
 //! # Architecture
 //!
 //! ```text
-//! +-------------------+
-//! | Buffer Pool       |  <- Week 7-8
-//! +-------------------+
+//! +------------+
+//! | BufferPool |  <- buffer
+//! +------------+
 //!          |
 //!          v
 //! +-------------------+
@@ -22,10 +22,14 @@
 //! +--------------+ +-------------+
 //! ```
 
+pub mod buffer;
 pub mod error;
 pub mod io;
 pub mod page;
 
+pub use buffer::{
+    BufferPool, BufferPoolError, LruReplacer, PageReadGuard, PageWriteGuard, Replacer,
+};
 pub use error::StorageError;
 pub use io::{FileStorage, MemoryStorage, Storage};
-pub use page::{PageData, PageId, PAGE_SIZE};
+pub use page::{PAGE_SIZE, PageData, PageId};
