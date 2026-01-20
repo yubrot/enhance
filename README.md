@@ -51,9 +51,7 @@ Goal: Manage 8KB pages safely across threads with disk persistence.
 
 Goal: Manage variable-length records within the 8KB limit.
 
-- Week 9: Slotted Page Structure: Implement the page header and slot array to manage internal page offsets.
-- Week 10: Serialization with Serde: Convert Rust structs into binary formats. Manage the packing of these bytes into page slots.
-- Week 11: Record CRUD Operations: Implement Insert, Delete, and Update within a page, including free space reclamation.
+- Week 9-11: Slotted Page & Record Management: Implement the slotted page structure (header and slot array), binary serialization for records, and CRUD operations (Insert, Delete, Update) with free space reclamation.
 - Week 12: Minimal System Catalog: Implement a way to persist table definitions (schema) in a reserved page (e.g., Page 0).
 
 ### Month 4: SQL Parsing & Execution Engine
