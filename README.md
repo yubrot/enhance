@@ -6,7 +6,7 @@ This project is designed as a 6-month intensive learning journey, focusing on co
 
 ## Project Vision & Philosophy
 
-- **Zero Dependencies**: Minimize external crates. Use only Tokio for the async runtime and Serde for serialization to focus on manual implementation of core logic.
+- **Minimal Dependencies**: Rely on Tokio for the async runtime and a few essential crates. Avoid large frameworks to focus on manual implementation of core logic.
 - **PostgreSQL Compatibility**: Implement the wire protocol manually so that standard tools like `psql` can connect to the database.
 - **Concurrency First**: Implement page-level locking and asynchronous I/O from the start to fully utilize Rust’s safety and performance.
 - **Transparency**: Every layer—from the byte-level storage to the SQL parser—is handwritten to ensure deep understanding.

@@ -1,11 +1,6 @@
 //! In-memory page storage implementation.
-//!
-//! NOTE: This implementation uses `unwrap()` on Mutex locks for simplicity.
-//! For production:
-//! - Use `parking_lot::Mutex` which doesn't poison on panic
-//! - Or handle `PoisonError` by recovering or propagating as `StorageError`
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use super::Storage;
 use crate::storage::error::StorageError;
@@ -39,7 +34,7 @@ impl Storage for MemoryStorage {
             });
         }
 
-        let pages = self.pages.lock().unwrap();
+        let pages = self.pages.lock();
         let page = pages
             .get(page_id.page_num() as usize)
             .ok_or(StorageError::PageNotFound(page_id))?;
@@ -56,7 +51,7 @@ impl Storage for MemoryStorage {
             });
         }
 
-        let mut pages = self.pages.lock().unwrap();
+        let mut pages = self.pages.lock();
         let page = pages
             .get_mut(page_id.page_num() as usize)
             .ok_or(StorageError::PageNotFound(page_id))?;
@@ -66,14 +61,14 @@ impl Storage for MemoryStorage {
     }
 
     async fn allocate_page(&self) -> Result<PageId, StorageError> {
-        let mut pages = self.pages.lock().unwrap();
+        let mut pages = self.pages.lock();
         let page_id = PageId::new(pages.len() as u64);
         pages.push(PageData::new());
         Ok(page_id)
     }
 
     async fn page_count(&self) -> usize {
-        self.pages.lock().unwrap().len()
+        self.pages.lock().len()
     }
 
     async fn sync_all(&self) -> Result<(), StorageError> {
@@ -90,8 +85,8 @@ impl Default for MemoryStorage {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::tests as generic;
+    use super::*;
 
     #[tokio::test]
     async fn test_basic_operations() {

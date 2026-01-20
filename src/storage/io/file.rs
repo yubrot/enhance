@@ -170,8 +170,8 @@ impl Storage for FileStorage {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::tests as generic;
+    use super::*;
     use crate::storage::StorageError;
     use tempfile::{TempDir, tempdir};
 

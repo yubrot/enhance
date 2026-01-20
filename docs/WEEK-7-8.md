@@ -76,7 +76,7 @@ impl Drop for PageReadGuard<'_, S, R> {
 }
 ```
 
-Using `std::sync::Mutex` allows synchronous state lock acquisition within Drop. `tokio::sync::Mutex` would require `.await`, which cannot be used in Drop.
+Using a synchronous mutex (e.g., `parking_lot::Mutex`) allows synchronous state lock acquisition within Drop. `tokio::sync::Mutex` would require `.await`, which cannot be used in Drop.
 
 #### Data-PageId Consistency as a Consequence
 

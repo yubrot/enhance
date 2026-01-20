@@ -4,8 +4,8 @@
 //! components, caching frequently accessed pages in memory to reduce I/O.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 
+use parking_lot::Mutex;
 use tokio::sync::RwLock;
 
 use crate::storage::{PageData, PageId, Storage, StorageError};
@@ -118,7 +118,6 @@ pub struct BufferPool<S: Storage, R: Replacer> {
 //   write lock, which we hold or block)
 //
 // NOTE: For production, consider these improvements:
-// - Use `parking_lot::Mutex` for better performance (no poisoning)
 // - Split state into multiple locks to reduce contention
 // - Add metrics (hit rate, eviction count, dirty page count)
 // - Implement background flusher thread for dirty pages
@@ -140,7 +139,7 @@ pub(super) struct BufferPoolInner<S: Storage, R: Replacer> {
 
     /// Protected mutable state (page table, metadata, free list, replacer).
     ///
-    /// Uses `std::sync::Mutex` to allow synchronous access from `Drop`.
+    /// Uses `parking_lot::Mutex` to allow synchronous access from `Drop`.
     state: Mutex<BufferPoolState<R>>,
 }
 
@@ -263,7 +262,7 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
     /// Flushes a specific page to storage if dirty.
     pub async fn flush_page(&self, page_id: PageId) -> Result<(), StorageError> {
         let frame_id = {
-            let state = self.inner.state.lock().expect("state lock poisoned");
+            let state = self.inner.state.lock();
             match state.page_table.get(&page_id) {
                 Some(&fid) if state.frame_metadata[fid].is_dirty => fid,
                 _ => return Ok(()),
@@ -280,7 +279,7 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
     /// Returns `BufferPoolError::Storage` if any write fails.
     pub async fn flush_all(&self) -> Result<(), BufferPoolError> {
         let dirty_pages: Vec<(FrameId, PageId)> = {
-            let state = self.inner.state.lock().expect("state lock poisoned");
+            let state = self.inner.state.lock();
             state
                 .frame_metadata
                 .iter()
@@ -327,7 +326,7 @@ impl<S: Storage, R: Replacer> BufferPoolInner<S, R> {
     async fn acquire(&self, page_id: PageId) -> Result<FrameId, BufferPoolError> {
         let new_frame_id = loop {
             let action = {
-                let mut state = self.state.lock().expect("state lock poisoned");
+                let mut state = self.state.lock();
                 state.acquire_frame(page_id)
             };
             match action {
@@ -341,7 +340,7 @@ impl<S: Storage, R: Replacer> BufferPoolInner<S, R> {
                             .await
                     };
 
-                    let mut state = self.state.lock().expect("state lock poisoned");
+                    let mut state = self.state.lock();
                     match state.complete_write_back(frame_id, evicted_page_id, write_result)? {
                         CompleteWriteBack::ReadRequired(frame_id) => break frame_id,
                         CompleteWriteBack::Retry => {}
@@ -358,7 +357,7 @@ impl<S: Storage, R: Replacer> BufferPoolInner<S, R> {
             self.storage.read_page(page_id, data.as_mut_slice()).await
         };
 
-        let mut state = self.state.lock().expect("state lock poisoned");
+        let mut state = self.state.lock();
         state.complete_read(new_frame_id, page_id, read_result)
     }
 
@@ -378,7 +377,7 @@ impl<S: Storage, R: Replacer> BufferPoolInner<S, R> {
     /// * `frame_id` - The frame ID returned by a previous `acquire` call
     /// * `is_dirty` - If true, marks the frame as dirty (needs write-back before eviction)
     pub(super) fn release(&self, frame_id: FrameId, is_dirty: bool) {
-        let mut state = self.state.lock().expect("state lock poisoned");
+        let mut state = self.state.lock();
         state.unpin_frame(frame_id, is_dirty);
     }
 
@@ -389,7 +388,7 @@ impl<S: Storage, R: Replacer> BufferPoolInner<S, R> {
         // By the Data-PageId Consistency Invariant (see module-level comment),
         // if page_id matches while we hold read lock, data is guaranteed valid.
         {
-            let state = self.state.lock().expect("state lock poisoned");
+            let state = self.state.lock();
             if state.frame_metadata[frame_id].page_id != Some(page_id) {
                 return Ok(());
             }
@@ -399,7 +398,7 @@ impl<S: Storage, R: Replacer> BufferPoolInner<S, R> {
             .write_page(page_id, data_guard.as_slice())
             .await?;
 
-        let mut state = self.state.lock().expect("state lock poisoned");
+        let mut state = self.state.lock();
         if state.frame_metadata[frame_id].page_id == Some(page_id) {
             state.frame_metadata[frame_id].is_dirty = false;
         }
