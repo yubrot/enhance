@@ -26,7 +26,7 @@ use super::value::Value;
 /// # Example
 ///
 /// ```no_run
-/// use enhance::tuple::{Record, Value};
+/// use enhance::heap::{Record, Value};
 /// use enhance::protocol::type_oid;
 ///
 /// let record = Record::new(vec![

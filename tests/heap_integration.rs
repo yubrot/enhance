@@ -1,11 +1,11 @@
-//! Integration tests for the tuple module with BufferPool.
+//! Integration tests for the heap module with BufferPool.
 //!
 //! These tests verify that Slotted, Record, and Value work correctly
 //! when used with the BufferPool's page guards.
 
+use enhance::heap::{Record, Slotted, Value};
 use enhance::protocol::type_oid;
 use enhance::storage::{BufferPool, LruReplacer, MemoryStorage};
-use enhance::tuple::{Record, Slotted, Value};
 
 #[tokio::test]
 async fn test_slotted_page_with_buffer_pool() {

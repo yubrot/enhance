@@ -1,4 +1,8 @@
-//! Tuple (record) storage and serialization.
+//! Heap storage for variable-length records.
+//!
+//! This module provides the heap file implementation, which stores table rows
+//! (tuples/records) in slotted pages. The term "heap" refers to an unordered
+//! collection of records, as opposed to indexed structures like B+trees.
 //!
 //! This module provides:
 //! - [`Slotted`]: Page-level record storage with variable-length records
@@ -37,13 +41,13 @@
 
 mod error;
 mod record;
-mod slotted_page;
+mod slotted;
 mod value;
 
 pub use error::{SerdeError, SlottedPageError};
 pub use record::Record;
-pub use slotted_page::{
-    PageHeader, PageType, RecordId, SlotEntry, SlotId, Slotted, MAX_RECORD_SIZE, PAGE_HEADER_SIZE,
-    SLOT_SIZE,
-};
+pub use slotted::{RecordId, SlotEntry, SlotId, Slotted, MAX_RECORD_SIZE, SLOT_SIZE};
 pub use value::Value;
+
+// Re-export page header types from storage for convenience
+pub use crate::storage::{PageHeader, PageType, PAGE_HEADER_SIZE, PAGE_VERSION};
