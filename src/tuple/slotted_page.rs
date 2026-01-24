@@ -23,7 +23,7 @@ use super::error::SlottedPageError;
 use crate::storage::{PageId, PAGE_SIZE};
 
 /// Size of the page header in bytes.
-pub const PAGE_HEADER_SIZE: usize = 16;
+pub const PAGE_HEADER_SIZE: usize = 24;
 
 /// Size of each slot entry in bytes.
 pub const SLOT_SIZE: usize = 4;
@@ -69,20 +69,36 @@ impl PageType {
 
 /// Page header stored at the beginning of each slotted page.
 ///
-/// Layout (16 bytes total):
+/// Layout (24 bytes total):
+/// - `page_lsn`: u64 (8 bytes) - LSN of last modification (for WAL/recovery)
+/// - `checksum`: u16 (2 bytes) - Page checksum (0 = not computed)
 /// - `page_type`: u8 (1 byte)
-/// - `flags`: u8 (1 byte, reserved)
+/// - `page_version`: u8 (1 byte) - Layout version for format migration
+/// - `flags`: u16 (2 bytes) - Page state flags
 /// - `slot_count`: u16 (2 bytes)
 /// - `free_start`: u16 (2 bytes)
 /// - `free_end`: u16 (2 bytes)
 /// - `first_free_slot`: u16 (2 bytes)
-/// - `reserved`: [u8; 6]
+/// - `reserved`: [u8; 2]
+///
+/// This layout is inspired by PostgreSQL's PageHeaderData (24 bytes) and provides
+/// fields necessary for WAL integration (Week 21-23) and corruption detection.
 #[derive(Debug, Clone, Copy)]
 pub struct PageHeader {
+    /// Log Sequence Number of the last WAL record that modified this page.
+    /// Used for crash recovery to determine if a page needs redo.
+    /// Set to 0 until WAL is implemented.
+    pub page_lsn: u64,
+    /// Checksum of the page contents for corruption detection.
+    /// Set to 0 when checksums are disabled or not yet computed.
+    pub checksum: u16,
     /// Type of this page.
     pub page_type: PageType,
-    /// Reserved flags for future use.
-    pub flags: u8,
+    /// Layout version number for format migration.
+    /// Current version is 1.
+    pub page_version: u8,
+    /// Page state flags (e.g., has free lines, page full hint).
+    pub flags: u16,
     /// Number of slots in the slot array (including deleted slots).
     pub slot_count: u16,
     /// Offset where free space starts (end of slot array).
@@ -93,11 +109,17 @@ pub struct PageHeader {
     pub first_free_slot: u16,
 }
 
+/// Current page layout version.
+pub const PAGE_VERSION: u8 = 1;
+
 impl PageHeader {
     /// Creates a new header for an empty data page.
     pub fn new_data_page() -> Self {
         Self {
+            page_lsn: 0,
+            checksum: 0,
             page_type: PageType::Data,
+            page_version: PAGE_VERSION,
             flags: 0,
             slot_count: 0,
             free_start: PAGE_HEADER_SIZE as u16,
@@ -114,24 +136,33 @@ impl PageHeader {
     /// Reads a header from a page byte slice.
     pub fn read_from(data: &[u8]) -> Self {
         Self {
-            page_type: PageType::from_u8(data[0]).unwrap_or(PageType::Free),
-            flags: data[1],
-            slot_count: u16::from_le_bytes([data[2], data[3]]),
-            free_start: u16::from_le_bytes([data[4], data[5]]),
-            free_end: u16::from_le_bytes([data[6], data[7]]),
-            first_free_slot: u16::from_le_bytes([data[8], data[9]]),
+            page_lsn: u64::from_le_bytes([
+                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+            ]),
+            checksum: u16::from_le_bytes([data[8], data[9]]),
+            page_type: PageType::from_u8(data[10]).unwrap_or(PageType::Free),
+            page_version: data[11],
+            flags: u16::from_le_bytes([data[12], data[13]]),
+            slot_count: u16::from_le_bytes([data[14], data[15]]),
+            free_start: u16::from_le_bytes([data[16], data[17]]),
+            free_end: u16::from_le_bytes([data[18], data[19]]),
+            first_free_slot: u16::from_le_bytes([data[20], data[21]]),
+            // Bytes 22..24 are reserved
         }
     }
 
     /// Writes the header to a page byte slice.
     pub fn write_to(&self, data: &mut [u8]) {
-        data[0] = self.page_type as u8;
-        data[1] = self.flags;
-        data[2..4].copy_from_slice(&self.slot_count.to_le_bytes());
-        data[4..6].copy_from_slice(&self.free_start.to_le_bytes());
-        data[6..8].copy_from_slice(&self.free_end.to_le_bytes());
-        data[8..10].copy_from_slice(&self.first_free_slot.to_le_bytes());
-        // Bytes 10..16 are reserved and should remain zeroed
+        data[0..8].copy_from_slice(&self.page_lsn.to_le_bytes());
+        data[8..10].copy_from_slice(&self.checksum.to_le_bytes());
+        data[10] = self.page_type as u8;
+        data[11] = self.page_version;
+        data[12..14].copy_from_slice(&self.flags.to_le_bytes());
+        data[14..16].copy_from_slice(&self.slot_count.to_le_bytes());
+        data[16..18].copy_from_slice(&self.free_start.to_le_bytes());
+        data[18..20].copy_from_slice(&self.free_end.to_le_bytes());
+        data[20..22].copy_from_slice(&self.first_free_slot.to_le_bytes());
+        // Bytes 22..24 are reserved and should remain zeroed
     }
 }
 
@@ -643,7 +674,11 @@ mod tests {
         page.init();
 
         let header = page.header();
+        assert_eq!(header.page_lsn, 0);
+        assert_eq!(header.checksum, 0);
         assert_eq!(header.page_type, PageType::Data);
+        assert_eq!(header.page_version, PAGE_VERSION);
+        assert_eq!(header.flags, 0);
         assert_eq!(header.slot_count, 0);
         assert_eq!(header.free_start, PAGE_HEADER_SIZE as u16);
         assert_eq!(header.free_end, PAGE_SIZE as u16);
