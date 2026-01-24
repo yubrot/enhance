@@ -308,17 +308,17 @@ async fn test_slot_reuse_after_delete() {
         page.delete(0).unwrap();
         page.delete(1).unwrap();
 
-        // Insert new record - should reuse slot 0
+        // Insert new record - should reuse slot 1 (most recently deleted, LIFO order)
         let slot = page.insert(b"new").unwrap();
-        assert_eq!(slot, 0);
-
-        // Insert another - should reuse slot 1
-        let slot = page.insert(b"newer").unwrap();
         assert_eq!(slot, 1);
 
+        // Insert another - should reuse slot 0
+        let slot = page.insert(b"newer").unwrap();
+        assert_eq!(slot, 0);
+
         // Verify contents
-        assert_eq!(page.read(0), Some(b"new".as_slice()));
-        assert_eq!(page.read(1), Some(b"newer".as_slice()));
+        assert_eq!(page.read(0), Some(b"newer".as_slice()));
+        assert_eq!(page.read(1), Some(b"new".as_slice()));
         assert_eq!(page.read(2), Some(b"c".as_slice()));
     }
     guard.mark_dirty();

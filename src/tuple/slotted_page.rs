@@ -151,9 +151,23 @@ pub struct SlotEntry {
 }
 
 impl SlotEntry {
-    /// Creates an empty/deleted slot entry.
+    /// Creates an empty/deleted slot entry with no link to next free slot.
     pub const fn empty() -> Self {
-        Self { offset: 0, length: 0 }
+        Self {
+            offset: 0,
+            length: u16::MAX,
+        }
+    }
+
+    /// Creates a free slot entry linked to the next free slot.
+    ///
+    /// The `length` field is reused to store the next free slot ID.
+    /// Use `u16::MAX` to indicate end of free list.
+    pub const fn free(next: u16) -> Self {
+        Self {
+            offset: 0,
+            length: next,
+        }
     }
 
     /// Creates a slot entry for a record.
@@ -164,6 +178,16 @@ impl SlotEntry {
     /// Returns true if this slot is empty (deleted).
     pub fn is_empty(&self) -> bool {
         self.offset == 0
+    }
+
+    /// Returns the next free slot ID.
+    ///
+    /// This is only valid for empty slots where the `length` field
+    /// stores the next free slot ID. Returns `u16::MAX` if this is
+    /// the end of the free list.
+    pub fn next_free(&self) -> u16 {
+        debug_assert!(self.is_empty());
+        self.length
     }
 
     /// Reads a slot entry from bytes.
@@ -299,9 +323,9 @@ impl<'a> SlottedPage<'a> {
 
         // Determine slot to use
         let slot_id = if header.first_free_slot != u16::MAX {
-            // Reuse a deleted slot
+            // Reuse a deleted slot (O(1) via free list)
             let slot_id = header.first_free_slot;
-            header.first_free_slot = self.find_next_free_slot(slot_id + 1, header.slot_count);
+            header.first_free_slot = self.get_slot(slot_id).next_free();
             slot_id
         } else {
             // Allocate new slot
@@ -367,14 +391,10 @@ impl<'a> SlottedPage<'a> {
             return Err(SlottedPageError::SlotNotFound(slot_id));
         }
 
-        // Mark slot as deleted
-        self.set_slot(slot_id, &SlotEntry::empty());
-
-        // Update free slot list (keep first_free_slot as the smallest index)
+        // Mark slot as deleted and link to current free list head (O(1))
         let mut header = self.header();
-        if header.first_free_slot == u16::MAX || slot_id < header.first_free_slot {
-            header.first_free_slot = slot_id;
-        }
+        self.set_slot(slot_id, &SlotEntry::free(header.first_free_slot));
+        header.first_free_slot = slot_id;
         self.set_header(&header);
 
         Ok(())
@@ -437,23 +457,14 @@ impl<'a> SlottedPage<'a> {
         }
     }
 
-    /// Finds the next free slot starting from the given index.
-    fn find_next_free_slot(&self, start: SlotId, slot_count: u16) -> u16 {
-        for i in start..slot_count {
-            if self.get_slot(i).is_empty() {
-                return i;
-            }
-        }
-        u16::MAX
-    }
-
     /// Compacts the page by removing gaps between records.
     ///
     /// This operation:
     /// 1. Collects all valid records
     /// 2. Rewrites them contiguously from the bottom
     /// 3. Updates all slot offsets
-    /// 4. Resets `free_end` to the new boundary
+    /// 4. Rebuilds the free list
+    /// 5. Resets `free_end` to the new boundary
     ///
     /// After compaction, `free_space()` returns the maximum available space.
     ///
@@ -482,10 +493,20 @@ impl<'a> SlottedPage<'a> {
             self.set_slot(*slot_id, &SlotEntry::new(new_free_end, record_data.len() as u16));
         }
 
+        // Rebuild free list by scanning empty slots in reverse order
+        // This ensures the list is ordered from lowest to highest slot ID
+        let mut first_free = u16::MAX;
+        for slot_id in (0..header.slot_count).rev() {
+            if self.get_slot(slot_id).is_empty() {
+                self.set_slot(slot_id, &SlotEntry::free(first_free));
+                first_free = slot_id;
+            }
+        }
+
         // Update header
         let mut header = self.header();
         header.free_end = new_free_end;
-        header.first_free_slot = self.find_next_free_slot(0, header.slot_count);
+        header.first_free_slot = first_free;
         self.set_header(&header);
     }
 
