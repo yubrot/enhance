@@ -14,9 +14,6 @@ mod record;
 mod value;
 
 pub use error::{HeapError, SerializationError};
-pub use page::{HeapPage, RecordId, SlotEntry, SlotId, MAX_RECORD_SIZE, SLOT_SIZE};
+pub use page::{HeapPage, SLOT_SIZE, SlotEntry, SlotId};
 pub use record::Record;
 pub use value::Value;
-
-// Re-export page header types from storage for convenience
-pub use crate::storage::{PageHeader, PageType, PAGE_HEADER_SIZE, PAGE_VERSION};

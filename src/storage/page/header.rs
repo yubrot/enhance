@@ -50,10 +50,9 @@ impl TryFrom<u8> for PageType {
 /// - `page_version`: u8 (1 byte) - Layout version for format migration
 /// - `flags`: u16 (2 bytes) - Page state flags
 /// - `slot_count`: u16 (2 bytes)
-/// - `free_start`: u16 (2 bytes)
-/// - `free_end`: u16 (2 bytes)
 /// - `first_free_slot`: u16 (2 bytes)
-/// - `reserved`: [u8; 2]
+/// - `free_end`: u16 (2 bytes)
+/// - `reserved`: [u8; 4]
 ///
 /// This layout is inspired by PostgreSQL's PageHeaderData (24 bytes) and provides
 /// fields necessary for WAL integration (Week 21-23) and corruption detection.
@@ -73,14 +72,12 @@ pub struct PageHeader {
     pub page_version: u8,
     /// Page state flags (e.g., has free lines, page full hint).
     pub flags: u16,
-    /// Number of slots in the slot array (including deleted slots).
+    /// Number of slots in the slot array (including deleted slots, for heap pages).
     pub slot_count: u16,
-    /// Offset where free space starts (end of slot array).
-    pub free_start: u16,
-    /// Offset where free space ends (start of record area).
-    pub free_end: u16,
-    /// Index of first free (deleted) slot, or `u16::MAX` if none.
+    /// Index of first free (deleted) slot, or `u16::MAX` if none (for heap pages).
     pub first_free_slot: u16,
+    /// Offset where free space ends (start of record area, for heap pages).
+    pub free_end: u16,
 }
 
 impl PageHeader {
@@ -93,19 +90,25 @@ impl PageHeader {
             page_version: PAGE_VERSION,
             flags: 0,
             slot_count: 0,
-            free_start: PAGE_HEADER_SIZE as u16,
-            free_end: PAGE_SIZE as u16,
             first_free_slot: u16::MAX,
+            free_end: PAGE_SIZE as u16,
         }
     }
 
+    /// Returns the offset where free space starts (end of slot array).
+    ///
+    /// Computed as `PAGE_HEADER_SIZE + slot_count * slot_size`.
+    pub fn free_start(&self, slot_size: usize) -> u16 {
+        PAGE_HEADER_SIZE as u16 + self.slot_count * slot_size as u16
+    }
+
     /// Returns the amount of contiguous free space available.
-    pub fn free_space(&self) -> u16 {
-        self.free_end.saturating_sub(self.free_start)
+    pub fn free_space(&self, slot_size: usize) -> u16 {
+        self.free_end.saturating_sub(self.free_start(slot_size))
     }
 
     /// Reads a header from a page byte slice.
-    pub fn read_from(data: &[u8]) -> Self {
+    pub fn read(data: &[u8]) -> Self {
         Self {
             page_lsn: u64::from_le_bytes([
                 data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
@@ -115,25 +118,23 @@ impl PageHeader {
             page_version: data[11],
             flags: u16::from_le_bytes([data[12], data[13]]),
             slot_count: u16::from_le_bytes([data[14], data[15]]),
-            free_start: u16::from_le_bytes([data[16], data[17]]),
-            free_end: u16::from_le_bytes([data[18], data[19]]),
-            first_free_slot: u16::from_le_bytes([data[20], data[21]]),
-            // Bytes 22..24 are reserved
+            first_free_slot: u16::from_le_bytes([data[18], data[19]]),
+            free_end: u16::from_le_bytes([data[16], data[17]]),
+            // Bytes 20..24 are reserved
         }
     }
 
     /// Writes the header to a page byte slice.
-    pub fn write_to(&self, data: &mut [u8]) {
+    pub fn write(&self, data: &mut [u8]) {
         data[0..8].copy_from_slice(&self.page_lsn.to_le_bytes());
         data[8..10].copy_from_slice(&self.checksum.to_le_bytes());
         data[10] = self.page_type as u8;
         data[11] = self.page_version;
         data[12..14].copy_from_slice(&self.flags.to_le_bytes());
         data[14..16].copy_from_slice(&self.slot_count.to_le_bytes());
-        data[16..18].copy_from_slice(&self.free_start.to_le_bytes());
-        data[18..20].copy_from_slice(&self.free_end.to_le_bytes());
-        data[20..22].copy_from_slice(&self.first_free_slot.to_le_bytes());
-        // Bytes 22..24 are reserved and should remain zeroed
+        data[18..20].copy_from_slice(&self.first_free_slot.to_le_bytes());
+        data[16..18].copy_from_slice(&self.free_end.to_le_bytes());
+        // Bytes 20..24 are reserved and should remain zeroed
     }
 }
 
@@ -152,7 +153,11 @@ mod tests {
     #[test]
     fn test_header_free_space() {
         let header = PageHeader::new_heap_page();
-        assert_eq!(header.free_space(), (PAGE_SIZE - PAGE_HEADER_SIZE) as u16);
+        const SLOT_SIZE: usize = 4;
+        assert_eq!(
+            header.free_space(SLOT_SIZE),
+            (PAGE_SIZE - PAGE_HEADER_SIZE) as u16
+        );
     }
 
     #[test]
@@ -164,23 +169,21 @@ mod tests {
             page_version: 1,
             flags: 0x1234,
             slot_count: 42,
-            free_start: 100,
-            free_end: 8000,
             first_free_slot: 5,
+            free_end: 8000,
         };
 
         let mut buf = vec![0u8; PAGE_HEADER_SIZE];
-        original.write_to(&mut buf);
+        original.write(&mut buf);
 
-        let parsed = PageHeader::read_from(&buf);
+        let parsed = PageHeader::read(&buf);
         assert_eq!(parsed.page_lsn, original.page_lsn);
         assert_eq!(parsed.checksum, original.checksum);
         assert_eq!(parsed.page_type, original.page_type);
         assert_eq!(parsed.page_version, original.page_version);
         assert_eq!(parsed.flags, original.flags);
         assert_eq!(parsed.slot_count, original.slot_count);
-        assert_eq!(parsed.free_start, original.free_start);
-        assert_eq!(parsed.free_end, original.free_end);
         assert_eq!(parsed.first_free_slot, original.first_free_slot);
+        assert_eq!(parsed.free_end, original.free_end);
     }
 }

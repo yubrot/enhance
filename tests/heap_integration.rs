@@ -27,7 +27,7 @@ async fn test_slotted_page_with_buffer_pool() {
 
         assert_eq!(slot0, 0);
         assert_eq!(slot1, 1);
-        assert_eq!(page.record_count(), 2);
+        assert_eq!(page.records().count(), 2);
     }
     guard.mark_dirty();
     drop(guard);
@@ -36,9 +36,9 @@ async fn test_slotted_page_with_buffer_pool() {
     let guard = pool.fetch_page(page_id).await.unwrap();
     let page = HeapPage::new(guard.data());
 
-    assert_eq!(page.read(0), Some(b"hello".as_slice()));
-    assert_eq!(page.read(1), Some(b"world".as_slice()));
-    assert_eq!(page.record_count(), 2);
+    assert_eq!(page.record(0), Some(b"hello".as_slice()));
+    assert_eq!(page.record(1), Some(b"world".as_slice()));
+    assert_eq!(page.records().count(), 2);
 }
 
 #[tokio::test]
@@ -64,11 +64,7 @@ async fn test_record_serialization_with_buffer_pool() {
             Value::Text("second".to_string()),
             Value::Boolean(false),
         ]),
-        Record::new(vec![
-            Value::Int32(3),
-            Value::Null,
-            Value::Boolean(true),
-        ]),
+        Record::new(vec![Value::Int32(3), Value::Null, Value::Boolean(true)]),
     ];
 
     {
@@ -89,7 +85,7 @@ async fn test_record_serialization_with_buffer_pool() {
     let page = HeapPage::new(guard.data());
 
     let parsed_records: Vec<Record> = page
-        .iter()
+        .records()
         .map(|(_, data)| Record::deserialize(data, &schema).unwrap())
         .collect();
 
@@ -126,7 +122,7 @@ async fn test_update_record_in_buffer_pool() {
     // Verify update
     let guard = pool.fetch_page(page_id).await.unwrap();
     let page = HeapPage::new(guard.data());
-    assert_eq!(page.read(0), Some(b"updated value".as_slice()));
+    assert_eq!(page.record(0), Some(b"updated value".as_slice()));
 }
 
 #[tokio::test]
@@ -159,9 +155,9 @@ async fn test_delete_and_compact_with_buffer_pool() {
         assert!(page.fragmentation() < 0.01);
 
         // Remaining records should be intact
-        assert_eq!(page.read(0), Some(b"record0".as_slice()));
-        assert!(page.read(1).is_none());
-        assert_eq!(page.read(2), Some(b"record2".as_slice()));
+        assert_eq!(page.record(0), Some(b"record0".as_slice()));
+        assert!(page.record(1).is_none());
+        assert_eq!(page.record(2), Some(b"record2".as_slice()));
     }
     guard.mark_dirty();
     drop(guard);
@@ -169,7 +165,7 @@ async fn test_delete_and_compact_with_buffer_pool() {
     // Verify persistence
     let guard = pool.fetch_page(page_id).await.unwrap();
     let page = HeapPage::new(guard.data());
-    assert_eq!(page.record_count(), 2);
+    assert_eq!(page.records().count(), 2);
 }
 
 #[tokio::test]
@@ -188,7 +184,8 @@ async fn test_multiple_pages() {
         {
             let mut page = HeapPage::new(guard.data_mut());
             page.init();
-            page.insert(format!("page {} record", i).as_bytes()).unwrap();
+            page.insert(format!("page {} record", i).as_bytes())
+                .unwrap();
         }
         guard.mark_dirty();
     }
@@ -198,7 +195,7 @@ async fn test_multiple_pages() {
         let guard = pool.fetch_page(page_id).await.unwrap();
         let page = HeapPage::new(guard.data());
         let expected = format!("page {} record", i);
-        assert_eq!(page.read(0), Some(expected.as_bytes()));
+        assert_eq!(page.record(0), Some(expected.as_bytes()));
     }
 }
 
@@ -234,7 +231,7 @@ async fn test_page_eviction_and_reload() {
         let guard = pool.fetch_page(page_id).await.unwrap();
         let page = HeapPage::new(guard.data());
 
-        let data = page.read(0).expect("record should exist");
+        let data = page.record(0).expect("record should exist");
         let record = Record::deserialize(data, &schema).unwrap();
 
         assert_eq!(record.values[0], Value::Int32(i as i32));
@@ -279,12 +276,12 @@ async fn test_large_records_fill_page() {
     let guard = pool.fetch_page(page_id).await.unwrap();
     let page = HeapPage::new(guard.data());
 
-    for (slot_id, data) in page.iter() {
+    for (slot_id, data) in page.records() {
         let record = Record::deserialize(data, &schema).unwrap();
         assert_eq!(record.values[0], Value::Text(large_text.clone()));
         assert!(slot_id < inserted_count as u16);
     }
-    assert_eq!(page.record_count(), inserted_count);
+    assert_eq!(page.records().count(), inserted_count);
 }
 
 #[tokio::test]
@@ -317,9 +314,9 @@ async fn test_slot_reuse_after_delete() {
         assert_eq!(slot, 0);
 
         // Verify contents
-        assert_eq!(page.read(0), Some(b"newer".as_slice()));
-        assert_eq!(page.read(1), Some(b"new".as_slice()));
-        assert_eq!(page.read(2), Some(b"c".as_slice()));
+        assert_eq!(page.record(0), Some(b"newer".as_slice()));
+        assert_eq!(page.record(1), Some(b"new".as_slice()));
+        assert_eq!(page.record(2), Some(b"c".as_slice()));
     }
     guard.mark_dirty();
 }
