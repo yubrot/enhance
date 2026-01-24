@@ -9,17 +9,19 @@ pub enum FormatCode {
     Binary = 1,
 }
 
-impl FormatCode {
-    /// Creates a FormatCode from an i16 value.
-    /// Returns None if the value is invalid.
-    pub fn from_i16(value: i16) -> Option<Self> {
+impl TryFrom<i16> for FormatCode {
+    type Error = i16;
+
+    fn try_from(value: i16) -> Result<Self, Self::Error> {
         match value {
-            0 => Some(FormatCode::Text),
-            1 => Some(FormatCode::Binary),
-            _ => None,
+            0 => Ok(FormatCode::Text),
+            1 => Ok(FormatCode::Binary),
+            _ => Err(value),
         }
     }
+}
 
+impl FormatCode {
     /// Converts the FormatCode to an i16 value.
     pub fn as_i16(self) -> i16 {
         self as i16
@@ -69,33 +71,35 @@ pub enum ErrorFieldCode {
     Routine = b'R',
 }
 
-impl ErrorFieldCode {
-    /// Creates an ErrorFieldCode from a u8 value.
-    /// Returns None if the value doesn't match any known field code.
-    pub fn from_u8(value: u8) -> Option<Self> {
+impl TryFrom<u8> for ErrorFieldCode {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            b'S' => Some(ErrorFieldCode::Severity),
-            b'V' => Some(ErrorFieldCode::SeverityNonLocalized),
-            b'C' => Some(ErrorFieldCode::SqlState),
-            b'M' => Some(ErrorFieldCode::Message),
-            b'D' => Some(ErrorFieldCode::Detail),
-            b'H' => Some(ErrorFieldCode::Hint),
-            b'P' => Some(ErrorFieldCode::Position),
-            b'p' => Some(ErrorFieldCode::InternalPosition),
-            b'q' => Some(ErrorFieldCode::InternalQuery),
-            b'W' => Some(ErrorFieldCode::Where),
-            b's' => Some(ErrorFieldCode::Schema),
-            b't' => Some(ErrorFieldCode::Table),
-            b'c' => Some(ErrorFieldCode::Column),
-            b'd' => Some(ErrorFieldCode::DataType),
-            b'n' => Some(ErrorFieldCode::Constraint),
-            b'F' => Some(ErrorFieldCode::File),
-            b'L' => Some(ErrorFieldCode::Line),
-            b'R' => Some(ErrorFieldCode::Routine),
-            _ => None,
+            b'S' => Ok(ErrorFieldCode::Severity),
+            b'V' => Ok(ErrorFieldCode::SeverityNonLocalized),
+            b'C' => Ok(ErrorFieldCode::SqlState),
+            b'M' => Ok(ErrorFieldCode::Message),
+            b'D' => Ok(ErrorFieldCode::Detail),
+            b'H' => Ok(ErrorFieldCode::Hint),
+            b'P' => Ok(ErrorFieldCode::Position),
+            b'p' => Ok(ErrorFieldCode::InternalPosition),
+            b'q' => Ok(ErrorFieldCode::InternalQuery),
+            b'W' => Ok(ErrorFieldCode::Where),
+            b's' => Ok(ErrorFieldCode::Schema),
+            b't' => Ok(ErrorFieldCode::Table),
+            b'c' => Ok(ErrorFieldCode::Column),
+            b'd' => Ok(ErrorFieldCode::DataType),
+            b'n' => Ok(ErrorFieldCode::Constraint),
+            b'F' => Ok(ErrorFieldCode::File),
+            b'L' => Ok(ErrorFieldCode::Line),
+            b'R' => Ok(ErrorFieldCode::Routine),
+            _ => Err(value),
         }
     }
+}
 
+impl ErrorFieldCode {
     /// Converts the ErrorFieldCode to a u8 value.
     pub fn as_u8(self) -> u8 {
         self as u8

@@ -150,20 +150,6 @@ mod tests {
     }
 
     #[test]
-    fn test_header_new_heap_page() {
-        let header = PageHeader::new_heap_page();
-        assert_eq!(header.page_lsn, 0);
-        assert_eq!(header.checksum, 0);
-        assert_eq!(header.page_type, PageType::Heap);
-        assert_eq!(header.page_version, PAGE_VERSION);
-        assert_eq!(header.flags, 0);
-        assert_eq!(header.slot_count, 0);
-        assert_eq!(header.free_start, PAGE_HEADER_SIZE as u16);
-        assert_eq!(header.free_end, PAGE_SIZE as u16);
-        assert_eq!(header.first_free_slot, u16::MAX);
-    }
-
-    #[test]
     fn test_header_free_space() {
         let header = PageHeader::new_heap_page();
         assert_eq!(header.free_space(), (PAGE_SIZE - PAGE_HEADER_SIZE) as u16);

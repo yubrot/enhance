@@ -1,10 +1,10 @@
-//! Error types for the tuple module.
+//! Error types for the heap module.
 
 use std::fmt;
 
-/// Errors from slotted page operations.
+/// Errors from heap operations.
 #[derive(Debug)]
-pub enum SlottedPageError {
+pub enum HeapError {
     /// Page is full, cannot insert record.
     PageFull {
         /// Bytes required for the record and slot.
@@ -18,10 +18,10 @@ pub enum SlottedPageError {
     Corrupted(String),
 }
 
-impl fmt::Display for SlottedPageError {
+impl fmt::Display for HeapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SlottedPageError::PageFull {
+            HeapError::PageFull {
                 required,
                 available,
             } => {
@@ -31,21 +31,21 @@ impl fmt::Display for SlottedPageError {
                     required, available
                 )
             }
-            SlottedPageError::SlotNotFound(slot_id) => {
+            HeapError::SlotNotFound(slot_id) => {
                 write!(f, "slot {} not found or deleted", slot_id)
             }
-            SlottedPageError::Corrupted(msg) => {
+            HeapError::Corrupted(msg) => {
                 write!(f, "page corrupted: {}", msg)
             }
         }
     }
 }
 
-impl std::error::Error for SlottedPageError {}
+impl std::error::Error for HeapError {}
 
 /// Errors from record serialization/deserialization.
 #[derive(Debug)]
-pub enum SerdeError {
+pub enum SerializationError {
     /// Buffer too small for the operation.
     BufferTooSmall {
         /// Bytes required.
@@ -57,10 +57,10 @@ pub enum SerdeError {
     InvalidFormat(String),
 }
 
-impl fmt::Display for SerdeError {
+impl fmt::Display for SerializationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SerdeError::BufferTooSmall {
+            SerializationError::BufferTooSmall {
                 required,
                 available,
             } => {
@@ -70,11 +70,24 @@ impl fmt::Display for SerdeError {
                     required, available
                 )
             }
-            SerdeError::InvalidFormat(msg) => {
+            SerializationError::InvalidFormat(msg) => {
                 write!(f, "invalid format: {}", msg)
             }
         }
     }
 }
 
-impl std::error::Error for SerdeError {}
+impl std::error::Error for SerializationError {}
+
+/// Returns `SerializationError::BufferTooSmall` if the buffer is too small.
+#[macro_export]
+macro_rules! ensure_buf_len {
+    ($buf:expr, $required:expr) => {
+        if $buf.len() < $required {
+            return Err($crate::heap::SerializationError::BufferTooSmall {
+                required: $required,
+                available: $buf.len(),
+            });
+        }
+    };
+}

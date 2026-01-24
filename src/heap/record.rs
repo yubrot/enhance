@@ -3,8 +3,9 @@
 //! A [`Record`] represents a single row in a table, consisting of multiple
 //! [`Value`]s. Records can be serialized to a compact binary format for storage.
 
-use super::error::SerdeError;
+use super::error::SerializationError;
 use super::value::Value;
+use crate::ensure_buf_len;
 
 /// A record (tuple/row) consisting of multiple values.
 ///
@@ -69,12 +70,7 @@ impl Record {
     /// This includes the null bitmap and all non-null values.
     pub fn serialized_size(&self) -> usize {
         let null_bitmap_bytes = self.values.len().div_ceil(8);
-        let values_size: usize = self
-            .values
-            .iter()
-            .filter(|v| !v.is_null())
-            .map(|v| v.serialized_size())
-            .sum();
+        let values_size: usize = self.values.iter().map(|v| v.serialized_size()).sum();
         null_bitmap_bytes + values_size
     }
 
@@ -84,15 +80,10 @@ impl Record {
     ///
     /// # Errors
     ///
-    /// Returns `SerdeError::BufferTooSmall` if the buffer is too small.
-    pub fn serialize(&self, buf: &mut [u8]) -> Result<usize, SerdeError> {
+    /// Returns `SerializationError::BufferTooSmall` if the buffer is too small.
+    pub fn serialize(&self, buf: &mut [u8]) -> Result<usize, SerializationError> {
         let required = self.serialized_size();
-        if buf.len() < required {
-            return Err(SerdeError::BufferTooSmall {
-                required,
-                available: buf.len(),
-            });
-        }
+        ensure_buf_len!(buf, required);
 
         let num_cols = self.values.len();
         let null_bitmap_bytes = num_cols.div_ceil(8);
@@ -109,12 +100,10 @@ impl Record {
             *byte = b;
         }
 
-        // Write non-null values
+        // Write values (null values write 0 bytes)
         let mut offset = null_bitmap_bytes;
         for value in &self.values {
-            if !value.is_null() {
-                offset += value.serialize(&mut buf[offset..])?;
-            }
+            offset += value.serialize(&mut buf[offset..])?;
         }
 
         Ok(offset)
@@ -130,16 +119,10 @@ impl Record {
     /// # Errors
     ///
     /// Returns error if buffer is malformed or too small.
-    pub fn deserialize(buf: &[u8], schema: &[i32]) -> Result<Self, SerdeError> {
+    pub fn deserialize(buf: &[u8], schema: &[i32]) -> Result<Self, SerializationError> {
         let num_cols = schema.len();
         let null_bitmap_bytes = num_cols.div_ceil(8);
-
-        if buf.len() < null_bitmap_bytes {
-            return Err(SerdeError::BufferTooSmall {
-                required: null_bitmap_bytes,
-                available: buf.len(),
-            });
-        }
+        ensure_buf_len!(buf, null_bitmap_bytes);
 
         // Read null bitmap
         let is_null: Vec<bool> = (0..num_cols)
@@ -233,7 +216,12 @@ mod tests {
         let mut buf = vec![0u8; record.serialized_size()];
         record.serialize(&mut buf).unwrap();
 
-        let schema = [type_oid::INT4, type_oid::TEXT, type_oid::TEXT, type_oid::INT4];
+        let schema = [
+            type_oid::INT4,
+            type_oid::TEXT,
+            type_oid::TEXT,
+            type_oid::INT4,
+        ];
         let parsed = Record::deserialize(&buf, &schema).unwrap();
         assert_eq!(parsed, record);
     }
@@ -254,33 +242,7 @@ mod tests {
 
     #[test]
     fn test_null_bitmap_multiple_bytes() {
-        // 9 columns require 2 bytes for null bitmap
-        let record = Record::new(vec![
-            Value::Int32(1),
-            Value::Int32(2),
-            Value::Int32(3),
-            Value::Int32(4),
-            Value::Int32(5),
-            Value::Int32(6),
-            Value::Int32(7),
-            Value::Int32(8),
-            Value::Int32(9),
-        ]);
-
-        // 2 bytes bitmap + 9 * 4 bytes = 38 bytes
-        assert_eq!(record.serialized_size(), 2 + 36);
-
-        let mut buf = vec![0u8; record.serialized_size()];
-        record.serialize(&mut buf).unwrap();
-
-        let schema = vec![type_oid::INT4; 9];
-        let parsed = Record::deserialize(&buf, &schema).unwrap();
-        assert_eq!(parsed, record);
-    }
-
-    #[test]
-    fn test_mixed_nulls_multiple_bytes() {
-        // 9 columns, alternating null/non-null
+        // 9 columns require 2 bytes for null bitmap, with mixed nulls
         let record = Record::new(vec![
             Value::Int32(1),
             Value::Null,
@@ -292,6 +254,9 @@ mod tests {
             Value::Null,
             Value::Int32(9),
         ]);
+
+        // 2 bytes bitmap + 5 * 4 bytes = 22 bytes
+        assert_eq!(record.serialized_size(), 2 + 20);
 
         let mut buf = vec![0u8; record.serialized_size()];
         record.serialize(&mut buf).unwrap();
@@ -339,7 +304,7 @@ mod tests {
         let result = record.serialize(&mut buf);
         assert!(matches!(
             result,
-            Err(SerdeError::BufferTooSmall { required: 5, .. })
+            Err(SerializationError::BufferTooSmall { required: 5, .. })
         ));
     }
 
@@ -351,7 +316,7 @@ mod tests {
         let result = Record::deserialize(&buf, &schema);
         assert!(matches!(
             result,
-            Err(SerdeError::BufferTooSmall {
+            Err(SerializationError::BufferTooSmall {
                 required: 1,
                 available: 0
             })

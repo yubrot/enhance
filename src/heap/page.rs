@@ -1,6 +1,6 @@
-//! Slotted page structure for variable-length record storage.
+//! Heap page implementation using slotted page structure.
 //!
-//! A slotted page manages variable-length records within a fixed 8KB page.
+//! A heap page manages variable-length records within a fixed 8KB page.
 //! The page layout consists of:
 //!
 //! ```text
@@ -19,11 +19,8 @@
 //! grows downward from the header. This allows both to grow toward each other,
 //! maximizing space utilization.
 
-use super::error::SlottedPageError;
-use crate::storage::{PageHeader, PageId, PAGE_HEADER_SIZE, PAGE_SIZE};
-
-#[cfg(test)]
-use crate::storage::{PageType, PAGE_VERSION};
+use super::error::HeapError;
+use crate::storage::{PAGE_HEADER_SIZE, PAGE_SIZE, PageHeader, PageId};
 
 /// Size of each slot entry in bytes.
 pub const SLOT_SIZE: usize = 4;
@@ -122,10 +119,11 @@ impl RecordId {
     }
 }
 
-/// Generic slotted page wrapper.
+/// A heap page for storing variable-length records.
 ///
 /// This struct provides methods for manipulating records within a page.
-/// It operates directly on the underlying data without owning it.
+/// Internally uses a slotted page layout where records grow upward from
+/// the bottom and the slot array grows downward from the header.
 ///
 /// The type parameter `T` allows this to wrap:
 /// - `&[u8]` - read-only view
@@ -137,22 +135,22 @@ impl RecordId {
 ///
 /// ```no_run
 /// use enhance::storage::PAGE_SIZE;
-/// use enhance::heap::Slotted;
+/// use enhance::heap::HeapPage;
 ///
 /// let mut data = vec![0u8; PAGE_SIZE];
-/// let mut page = Slotted::new(&mut data);
+/// let mut page = HeapPage::new(&mut data);
 /// page.init();
 ///
 /// let slot_id = page.insert(b"hello world").unwrap();
 /// assert_eq!(page.read(slot_id), Some(b"hello world".as_slice()));
 /// ```
-pub struct Slotted<T> {
+pub struct HeapPage<T> {
     data: T,
 }
 
 // Read-only methods (available for any T: AsRef<[u8]>)
-impl<T: AsRef<[u8]>> Slotted<T> {
-    /// Creates a new Slotted page view over the given data.
+impl<T: AsRef<[u8]>> HeapPage<T> {
+    /// Creates a new HeapPage page view over the given data.
     ///
     /// # Panics
     ///
@@ -161,7 +159,7 @@ impl<T: AsRef<[u8]>> Slotted<T> {
         assert_eq!(
             data.as_ref().len(),
             PAGE_SIZE,
-            "Slotted requires exactly {} bytes, got {}",
+            "HeapPage requires exactly {} bytes, got {}",
             PAGE_SIZE,
             data.as_ref().len()
         );
@@ -244,7 +242,8 @@ impl<T: AsRef<[u8]>> Slotted<T> {
     /// Returns an iterator over all valid (non-deleted) records.
     pub fn iter(&self) -> impl Iterator<Item = (SlotId, &[u8])> {
         let header = self.header();
-        (0..header.slot_count).filter_map(move |slot_id| self.read(slot_id).map(|data| (slot_id, data)))
+        (0..header.slot_count)
+            .filter_map(move |slot_id| self.read(slot_id).map(|data| (slot_id, data)))
     }
 
     /// Returns the number of valid (non-deleted) records in this page.
@@ -257,7 +256,7 @@ impl<T: AsRef<[u8]>> Slotted<T> {
 }
 
 // Mutable methods (available for T: AsRef<[u8]> + AsMut<[u8]>)
-impl<T: AsRef<[u8]> + AsMut<[u8]>> Slotted<T> {
+impl<T: AsRef<[u8]> + AsMut<[u8]>> HeapPage<T> {
     /// Returns a mutable reference to the underlying data.
     fn data_mut(&mut self) -> &mut [u8] {
         self.data.as_mut()
@@ -286,11 +285,11 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Slotted<T> {
     ///
     /// # Errors
     ///
-    /// Returns `SlottedPageError::PageFull` if there is not enough space.
-    pub fn insert(&mut self, record_data: &[u8]) -> Result<SlotId, SlottedPageError> {
+    /// Returns `HeapError::PageFull` if there is not enough space.
+    pub fn insert(&mut self, record_data: &[u8]) -> Result<SlotId, HeapError> {
         let record_size = record_data.len();
         if !self.can_insert(record_size) {
-            return Err(SlottedPageError::PageFull {
+            return Err(HeapError::PageFull {
                 required: record_size + SLOT_SIZE,
                 available: self.free_space(),
             });
@@ -337,16 +336,16 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Slotted<T> {
     ///
     /// # Errors
     ///
-    /// Returns `SlottedPageError::SlotNotFound` if the slot doesn't exist or is already deleted.
-    pub fn delete(&mut self, slot_id: SlotId) -> Result<(), SlottedPageError> {
+    /// Returns `HeapError::SlotNotFound` if the slot doesn't exist or is already deleted.
+    pub fn delete(&mut self, slot_id: SlotId) -> Result<(), HeapError> {
         let header = self.header();
         if slot_id >= header.slot_count {
-            return Err(SlottedPageError::SlotNotFound(slot_id));
+            return Err(HeapError::SlotNotFound(slot_id));
         }
 
         let slot = self.get_slot(slot_id);
         if slot.is_empty() {
-            return Err(SlottedPageError::SlotNotFound(slot_id));
+            return Err(HeapError::SlotNotFound(slot_id));
         }
 
         // Mark slot as deleted and link to current free list head (O(1))
@@ -366,17 +365,17 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Slotted<T> {
     ///
     /// # Errors
     ///
-    /// Returns `SlottedPageError::SlotNotFound` if the slot doesn't exist or is deleted.
-    /// Returns `SlottedPageError::PageFull` if the new record doesn't fit.
-    pub fn update(&mut self, slot_id: SlotId, new_data: &[u8]) -> Result<(), SlottedPageError> {
+    /// Returns `HeapError::SlotNotFound` if the slot doesn't exist or is deleted.
+    /// Returns `HeapError::PageFull` if the new record doesn't fit.
+    pub fn update(&mut self, slot_id: SlotId, new_data: &[u8]) -> Result<(), HeapError> {
         let header = self.header();
         if slot_id >= header.slot_count {
-            return Err(SlottedPageError::SlotNotFound(slot_id));
+            return Err(HeapError::SlotNotFound(slot_id));
         }
 
         let old_slot = self.get_slot(slot_id);
         if old_slot.is_empty() {
-            return Err(SlottedPageError::SlotNotFound(slot_id));
+            return Err(HeapError::SlotNotFound(slot_id));
         }
 
         let old_len = old_slot.length as usize;
@@ -393,7 +392,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Slotted<T> {
             // Doesn't fit - check if we have enough total space
             let extra_needed = new_len - old_len;
             if self.free_space() < extra_needed {
-                return Err(SlottedPageError::PageFull {
+                return Err(HeapError::PageFull {
                     required: new_len,
                     available: old_len + self.free_space(),
                 });
@@ -448,7 +447,10 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Slotted<T> {
             new_free_end -= record_data.len() as u16;
             let start = new_free_end as usize;
             self.data_mut()[start..start + record_data.len()].copy_from_slice(record_data);
-            self.set_slot(*slot_id, &SlotEntry::new(new_free_end, record_data.len() as u16));
+            self.set_slot(
+                *slot_id,
+                &SlotEntry::new(new_free_end, record_data.len() as u16),
+            );
         }
 
         // Rebuild free list by scanning empty slots in reverse order
@@ -473,16 +475,18 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Slotted<T> {
 mod tests {
     use super::*;
 
+    use crate::storage::{PAGE_VERSION, PageType};
+
     fn create_page() -> Vec<u8> {
         let mut data = vec![0u8; PAGE_SIZE];
-        Slotted::new(&mut data).init();
+        HeapPage::new(&mut data).init();
         data
     }
 
     #[test]
     fn test_header_roundtrip() {
         let mut data = vec![0u8; PAGE_SIZE];
-        let mut page = Slotted::new(&mut data);
+        let mut page = HeapPage::new(&mut data);
         page.init();
 
         let header = page.header();
@@ -500,7 +504,7 @@ mod tests {
     #[test]
     fn test_insert_and_read() {
         let mut data = create_page();
-        let mut page = Slotted::new(&mut data);
+        let mut page = HeapPage::new(&mut data);
 
         let record = b"hello world";
         let slot_id = page.insert(record).unwrap();
@@ -513,13 +517,10 @@ mod tests {
     #[test]
     fn test_multiple_inserts() {
         let mut data = create_page();
-        let mut page = Slotted::new(&mut data);
+        let mut page = HeapPage::new(&mut data);
 
         let records: Vec<&[u8]> = vec![b"first", b"second", b"third"];
-        let slot_ids: Vec<_> = records
-            .iter()
-            .map(|r| page.insert(*r).unwrap())
-            .collect();
+        let slot_ids: Vec<_> = records.iter().map(|r| page.insert(*r).unwrap()).collect();
 
         assert_eq!(slot_ids, vec![0, 1, 2]);
         for (slot_id, expected) in slot_ids.iter().zip(records.iter()) {
@@ -531,7 +532,7 @@ mod tests {
     #[test]
     fn test_read_invalid_slot() {
         let mut data = create_page();
-        let page = Slotted::new(&mut data);
+        let page = HeapPage::new(&mut data);
 
         assert!(page.read(0).is_none());
         assert!(page.read(100).is_none());
@@ -540,7 +541,7 @@ mod tests {
     #[test]
     fn test_delete() {
         let mut data = create_page();
-        let mut page = Slotted::new(&mut data);
+        let mut page = HeapPage::new(&mut data);
 
         let slot0 = page.insert(b"record0").unwrap();
         let slot1 = page.insert(b"record1").unwrap();
@@ -555,27 +556,21 @@ mod tests {
     #[test]
     fn test_delete_invalid_slot() {
         let mut data = create_page();
-        let mut page = Slotted::new(&mut data);
+        let mut page = HeapPage::new(&mut data);
 
-        assert!(matches!(
-            page.delete(0),
-            Err(SlottedPageError::SlotNotFound(0))
-        ));
+        assert!(matches!(page.delete(0), Err(HeapError::SlotNotFound(0))));
 
         let slot = page.insert(b"test").unwrap();
         page.delete(slot).unwrap();
 
         // Deleting already deleted slot should fail
-        assert!(matches!(
-            page.delete(slot),
-            Err(SlottedPageError::SlotNotFound(_))
-        ));
+        assert!(matches!(page.delete(slot), Err(HeapError::SlotNotFound(_))));
     }
 
     #[test]
     fn test_slot_reuse() {
         let mut data = create_page();
-        let mut page = Slotted::new(&mut data);
+        let mut page = HeapPage::new(&mut data);
 
         let slot0 = page.insert(b"record0").unwrap();
         let _slot1 = page.insert(b"record1").unwrap();
@@ -591,7 +586,7 @@ mod tests {
     #[test]
     fn test_update_smaller() {
         let mut data = create_page();
-        let mut page = Slotted::new(&mut data);
+        let mut page = HeapPage::new(&mut data);
 
         let slot = page.insert(b"hello world").unwrap();
         page.update(slot, b"hi").unwrap();
@@ -602,7 +597,7 @@ mod tests {
     #[test]
     fn test_update_larger() {
         let mut data = create_page();
-        let mut page = Slotted::new(&mut data);
+        let mut page = HeapPage::new(&mut data);
 
         let slot = page.insert(b"hi").unwrap();
         page.update(slot, b"hello world").unwrap();
@@ -613,18 +608,18 @@ mod tests {
     #[test]
     fn test_update_invalid_slot() {
         let mut data = create_page();
-        let mut page = Slotted::new(&mut data);
+        let mut page = HeapPage::new(&mut data);
 
         assert!(matches!(
             page.update(0, b"test"),
-            Err(SlottedPageError::SlotNotFound(0))
+            Err(HeapError::SlotNotFound(0))
         ));
     }
 
     #[test]
     fn test_page_full() {
         let mut data = create_page();
-        let mut page = Slotted::new(&mut data);
+        let mut page = HeapPage::new(&mut data);
 
         // Insert large records until full
         let large_record = vec![0u8; 1000];
@@ -637,14 +632,14 @@ mod tests {
         assert!(count > 0);
         assert!(matches!(
             page.insert(&large_record),
-            Err(SlottedPageError::PageFull { .. })
+            Err(HeapError::PageFull { .. })
         ));
     }
 
     #[test]
     fn test_compact() {
         let mut data = create_page();
-        let mut page = Slotted::new(&mut data);
+        let mut page = HeapPage::new(&mut data);
 
         // Insert records
         let slot0 = page.insert(b"aaaa").unwrap();
@@ -672,7 +667,7 @@ mod tests {
     #[test]
     fn test_compact_recovers_space() {
         let mut data = create_page();
-        let mut page = Slotted::new(&mut data);
+        let mut page = HeapPage::new(&mut data);
 
         let large_record = vec![0u8; 2000];
         let slot0 = page.insert(&large_record).unwrap();
@@ -706,7 +701,7 @@ mod tests {
     #[test]
     fn test_iter() {
         let mut data = create_page();
-        let mut page = Slotted::new(&mut data);
+        let mut page = HeapPage::new(&mut data);
 
         page.insert(b"first").unwrap();
         let slot1 = page.insert(b"second").unwrap();
@@ -721,16 +716,16 @@ mod tests {
     }
 
     #[test]
-    fn test_slotted_read_only() {
+    fn test_heap_page_read_only() {
         let mut data = create_page();
         {
-            let mut page = Slotted::new(&mut data);
+            let mut page = HeapPage::new(&mut data);
             page.insert(b"hello").unwrap();
             page.insert(b"world").unwrap();
         }
 
         // Now use read-only view (with immutable reference)
-        let page_ref = Slotted::new(&data[..]);
+        let page_ref = HeapPage::new(&data[..]);
         assert_eq!(page_ref.read(0), Some(b"hello".as_slice()));
         assert_eq!(page_ref.read(1), Some(b"world".as_slice()));
         assert_eq!(page_ref.record_count(), 2);
@@ -742,7 +737,7 @@ mod tests {
     #[test]
     fn test_max_record_size() {
         let mut data = create_page();
-        let mut page = Slotted::new(&mut data);
+        let mut page = HeapPage::new(&mut data);
 
         // Should be able to insert a max-sized record
         let max_record = vec![0u8; MAX_RECORD_SIZE];
@@ -752,14 +747,14 @@ mod tests {
         // But not another one
         assert!(matches!(
             page.insert(&[0u8; 1]),
-            Err(SlottedPageError::PageFull { .. })
+            Err(HeapError::PageFull { .. })
         ));
     }
 
     #[test]
     fn test_free_space_calculation() {
         let mut data = create_page();
-        let mut page = Slotted::new(&mut data);
+        let mut page = HeapPage::new(&mut data);
 
         let initial_free = page.free_space();
         assert_eq!(initial_free, PAGE_SIZE - PAGE_HEADER_SIZE);
@@ -776,7 +771,7 @@ mod tests {
     #[test]
     fn test_empty_record() {
         let mut data = create_page();
-        let mut page = Slotted::new(&mut data);
+        let mut page = HeapPage::new(&mut data);
 
         let slot = page.insert(b"").unwrap();
         assert_eq!(page.read(slot), Some(b"".as_slice()));

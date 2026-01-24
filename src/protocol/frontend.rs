@@ -276,7 +276,7 @@ impl BindMessage {
         let mut param_format_codes = Vec::with_capacity(format_count);
         for _ in 0..format_count {
             let code = src.get_i16();
-            let format = FormatCode::from_i16(code).ok_or(ProtocolError::InvalidMessage)?;
+            let format = FormatCode::try_from(code).map_err(|_| ProtocolError::InvalidMessage)?;
             param_format_codes.push(format);
         }
 
@@ -304,7 +304,7 @@ impl BindMessage {
         let mut result_format_codes = Vec::with_capacity(result_format_count);
         for _ in 0..result_format_count {
             let code = src.get_i16();
-            let format = FormatCode::from_i16(code).ok_or(ProtocolError::InvalidMessage)?;
+            let format = FormatCode::try_from(code).map_err(|_| ProtocolError::InvalidMessage)?;
             result_format_codes.push(format);
         }
 

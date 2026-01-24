@@ -1,9 +1,9 @@
 //! Integration tests for the heap module with BufferPool.
 //!
-//! These tests verify that Slotted, Record, and Value work correctly
+//! These tests verify that HeapPage, Record, and Value work correctly
 //! when used with the BufferPool's page guards.
 
-use enhance::heap::{Record, Slotted, Value};
+use enhance::heap::{HeapPage, Record, Value};
 use enhance::protocol::type_oid;
 use enhance::storage::{BufferPool, LruReplacer, MemoryStorage};
 
@@ -19,7 +19,7 @@ async fn test_slotted_page_with_buffer_pool() {
 
     // Initialize as slotted page and insert raw bytes
     {
-        let mut page = Slotted::new(guard.data_mut());
+        let mut page = HeapPage::new(guard.data_mut());
         page.init();
 
         let slot0 = page.insert(b"hello").unwrap();
@@ -34,7 +34,7 @@ async fn test_slotted_page_with_buffer_pool() {
 
     // Read back using read-only guard
     let guard = pool.fetch_page(page_id).await.unwrap();
-    let page = Slotted::new(guard.data());
+    let page = HeapPage::new(guard.data());
 
     assert_eq!(page.read(0), Some(b"hello".as_slice()));
     assert_eq!(page.read(1), Some(b"world".as_slice()));
@@ -72,7 +72,7 @@ async fn test_record_serialization_with_buffer_pool() {
     ];
 
     {
-        let mut page = Slotted::new(guard.data_mut());
+        let mut page = HeapPage::new(guard.data_mut());
         page.init();
 
         for record in &records {
@@ -86,7 +86,7 @@ async fn test_record_serialization_with_buffer_pool() {
 
     // Read back and deserialize
     let guard = pool.fetch_page(page_id).await.unwrap();
-    let page = Slotted::new(guard.data());
+    let page = HeapPage::new(guard.data());
 
     let parsed_records: Vec<Record> = page
         .iter()
@@ -107,7 +107,7 @@ async fn test_update_record_in_buffer_pool() {
     let page_id = guard.page_id();
 
     {
-        let mut page = Slotted::new(guard.data_mut());
+        let mut page = HeapPage::new(guard.data_mut());
         page.init();
         page.insert(b"initial").unwrap();
     }
@@ -117,7 +117,7 @@ async fn test_update_record_in_buffer_pool() {
     // Update the record
     let mut guard = pool.fetch_page_mut(page_id).await.unwrap();
     {
-        let mut page = Slotted::new(guard.data_mut());
+        let mut page = HeapPage::new(guard.data_mut());
         page.update(0, b"updated value").unwrap();
     }
     guard.mark_dirty();
@@ -125,7 +125,7 @@ async fn test_update_record_in_buffer_pool() {
 
     // Verify update
     let guard = pool.fetch_page(page_id).await.unwrap();
-    let page = Slotted::new(guard.data());
+    let page = HeapPage::new(guard.data());
     assert_eq!(page.read(0), Some(b"updated value".as_slice()));
 }
 
@@ -139,7 +139,7 @@ async fn test_delete_and_compact_with_buffer_pool() {
     let page_id = guard.page_id();
 
     {
-        let mut page = Slotted::new(guard.data_mut());
+        let mut page = HeapPage::new(guard.data_mut());
         page.init();
 
         page.insert(b"record0").unwrap();
@@ -168,7 +168,7 @@ async fn test_delete_and_compact_with_buffer_pool() {
 
     // Verify persistence
     let guard = pool.fetch_page(page_id).await.unwrap();
-    let page = Slotted::new(guard.data());
+    let page = HeapPage::new(guard.data());
     assert_eq!(page.record_count(), 2);
 }
 
@@ -186,7 +186,7 @@ async fn test_multiple_pages() {
         page_ids.push(guard.page_id());
 
         {
-            let mut page = Slotted::new(guard.data_mut());
+            let mut page = HeapPage::new(guard.data_mut());
             page.init();
             page.insert(format!("page {} record", i).as_bytes()).unwrap();
         }
@@ -196,7 +196,7 @@ async fn test_multiple_pages() {
     // Verify all pages
     for (i, &page_id) in page_ids.iter().enumerate() {
         let guard = pool.fetch_page(page_id).await.unwrap();
-        let page = Slotted::new(guard.data());
+        let page = HeapPage::new(guard.data());
         let expected = format!("page {} record", i);
         assert_eq!(page.read(0), Some(expected.as_bytes()));
     }
@@ -217,7 +217,7 @@ async fn test_page_eviction_and_reload() {
         page_ids.push(guard.page_id());
 
         {
-            let mut page = Slotted::new(guard.data_mut());
+            let mut page = HeapPage::new(guard.data_mut());
             page.init();
 
             let record = Record::new(vec![Value::Int32(i as i32)]);
@@ -232,7 +232,7 @@ async fn test_page_eviction_and_reload() {
     let schema = [type_oid::INT4];
     for (i, &page_id) in page_ids.iter().enumerate() {
         let guard = pool.fetch_page(page_id).await.unwrap();
-        let page = Slotted::new(guard.data());
+        let page = HeapPage::new(guard.data());
 
         let data = page.read(0).expect("record should exist");
         let record = Record::deserialize(data, &schema).unwrap();
@@ -255,7 +255,7 @@ async fn test_large_records_fill_page() {
 
     let mut inserted_count = 0;
     {
-        let mut page = Slotted::new(guard.data_mut());
+        let mut page = HeapPage::new(guard.data_mut());
         page.init();
 
         loop {
@@ -277,7 +277,7 @@ async fn test_large_records_fill_page() {
 
     // Verify all records
     let guard = pool.fetch_page(page_id).await.unwrap();
-    let page = Slotted::new(guard.data());
+    let page = HeapPage::new(guard.data());
 
     for (slot_id, data) in page.iter() {
         let record = Record::deserialize(data, &schema).unwrap();
@@ -296,7 +296,7 @@ async fn test_slot_reuse_after_delete() {
     let mut guard = pool.new_page().await.unwrap();
 
     {
-        let mut page = Slotted::new(guard.data_mut());
+        let mut page = HeapPage::new(guard.data_mut());
         page.init();
 
         // Insert 3 records
