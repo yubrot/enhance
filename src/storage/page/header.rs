@@ -1,4 +1,4 @@
-//! Page header format for the storage layer.
+//! Page header format.
 //!
 //! This module defines the common page header structure used by all page types
 //! in the database. The header contains metadata for page identification,
@@ -25,19 +25,18 @@ pub const PAGE_VERSION: u8 = 1;
 pub enum PageType {
     /// Uninitialized or free page.
     Free = 0,
-    /// Data page with slotted records (heap).
-    Data = 1,
+    /// Heap page with slotted records.
+    Heap = 1,
 }
 
-impl PageType {
-    /// Creates a PageType from a raw u8 value.
-    ///
-    /// Returns `None` if the value doesn't match any known page type.
-    pub fn from_u8(v: u8) -> Option<Self> {
+impl TryFrom<u8> for PageType {
+    type Error = u8;
+
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
         match v {
-            0 => Some(PageType::Free),
-            1 => Some(PageType::Data),
-            _ => None,
+            0 => Ok(PageType::Free),
+            1 => Ok(PageType::Heap),
+            _ => Err(v),
         }
     }
 }
@@ -85,12 +84,12 @@ pub struct PageHeader {
 }
 
 impl PageHeader {
-    /// Creates a new header for an empty data page.
-    pub fn new_data_page() -> Self {
+    /// Creates a new header for an empty heap page.
+    pub fn new_heap_page() -> Self {
         Self {
             page_lsn: 0,
             checksum: 0,
-            page_type: PageType::Data,
+            page_type: PageType::Heap,
             page_version: PAGE_VERSION,
             flags: 0,
             slot_count: 0,
@@ -112,7 +111,7 @@ impl PageHeader {
                 data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
             ]),
             checksum: u16::from_le_bytes([data[8], data[9]]),
-            page_type: PageType::from_u8(data[10]).unwrap_or(PageType::Free),
+            page_type: PageType::try_from(data[10]).unwrap_or(PageType::Free),
             page_version: data[11],
             flags: u16::from_le_bytes([data[12], data[13]]),
             slot_count: u16::from_le_bytes([data[14], data[15]]),
@@ -143,19 +142,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_page_type_from_u8() {
-        assert_eq!(PageType::from_u8(0), Some(PageType::Free));
-        assert_eq!(PageType::from_u8(1), Some(PageType::Data));
-        assert_eq!(PageType::from_u8(2), None);
-        assert_eq!(PageType::from_u8(255), None);
+    fn test_page_type_try_from() {
+        assert_eq!(PageType::try_from(0), Ok(PageType::Free));
+        assert_eq!(PageType::try_from(1), Ok(PageType::Heap));
+        assert_eq!(PageType::try_from(2), Err(2));
+        assert_eq!(PageType::try_from(255), Err(255));
     }
 
     #[test]
-    fn test_header_new_data_page() {
-        let header = PageHeader::new_data_page();
+    fn test_header_new_heap_page() {
+        let header = PageHeader::new_heap_page();
         assert_eq!(header.page_lsn, 0);
         assert_eq!(header.checksum, 0);
-        assert_eq!(header.page_type, PageType::Data);
+        assert_eq!(header.page_type, PageType::Heap);
         assert_eq!(header.page_version, PAGE_VERSION);
         assert_eq!(header.flags, 0);
         assert_eq!(header.slot_count, 0);
@@ -166,11 +165,8 @@ mod tests {
 
     #[test]
     fn test_header_free_space() {
-        let header = PageHeader::new_data_page();
-        assert_eq!(
-            header.free_space(),
-            (PAGE_SIZE - PAGE_HEADER_SIZE) as u16
-        );
+        let header = PageHeader::new_heap_page();
+        assert_eq!(header.free_space(), (PAGE_SIZE - PAGE_HEADER_SIZE) as u16);
     }
 
     #[test]
@@ -178,7 +174,7 @@ mod tests {
         let original = PageHeader {
             page_lsn: 0x123456789ABCDEF0,
             checksum: 0xABCD,
-            page_type: PageType::Data,
+            page_type: PageType::Heap,
             page_version: 1,
             flags: 0x1234,
             slot_count: 42,

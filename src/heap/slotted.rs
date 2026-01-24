@@ -268,7 +268,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Slotted<T> {
     /// This zeroes the page and writes an empty data page header.
     pub fn init(&mut self) {
         self.data_mut().fill(0);
-        PageHeader::new_data_page().write_to(&mut self.data_mut()[..PAGE_HEADER_SIZE]);
+        PageHeader::new_heap_page().write_to(&mut self.data_mut()[..PAGE_HEADER_SIZE]);
     }
 
     /// Sets the page header.
@@ -488,7 +488,7 @@ mod tests {
         let header = page.header();
         assert_eq!(header.page_lsn, 0);
         assert_eq!(header.checksum, 0);
-        assert_eq!(header.page_type, PageType::Data);
+        assert_eq!(header.page_type, PageType::Heap);
         assert_eq!(header.page_version, PAGE_VERSION);
         assert_eq!(header.flags, 0);
         assert_eq!(header.slot_count, 0);
