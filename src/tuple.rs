@@ -1,7 +1,7 @@
 //! Tuple (record) storage and serialization.
 //!
 //! This module provides:
-//! - [`SlottedPage`]: Page-level record storage with variable-length records
+//! - [`Slotted`]: Page-level record storage with variable-length records
 //! - [`Value`]: Typed database value enum
 //! - [`Record`]: A row/tuple of values
 //!
@@ -11,8 +11,8 @@
 //!
 //! ```text
 //! +------------------+ offset 0
-//! | PageHeader (16B) |
-//! +------------------+ offset 16
+//! | PageHeader (24B) |
+//! +------------------+ offset 24
 //! | Slot Array       | (grows downward)
 //! +------------------+
 //! | Free Space       |
@@ -43,7 +43,7 @@ mod value;
 pub use error::{SerdeError, SlottedPageError};
 pub use record::Record;
 pub use slotted_page::{
-    PageHeader, PageType, RecordId, SlotEntry, SlotId, SlottedPage, SlottedPageRef,
-    MAX_RECORD_SIZE, PAGE_HEADER_SIZE, SLOT_SIZE,
+    PageHeader, PageType, RecordId, SlotEntry, SlotId, Slotted, MAX_RECORD_SIZE, PAGE_HEADER_SIZE,
+    SLOT_SIZE,
 };
 pub use value::Value;

@@ -5,8 +5,8 @@
 //!
 //! ```text
 //! +------------------+ offset 0
-//! | PageHeader (16B) |
-//! +------------------+ offset 16
+//! | PageHeader (24B) |
+//! +------------------+ offset 24
 //! | Slot Array       | (grows downward)
 //! +------------------+
 //! | Free Space       |
@@ -252,73 +252,66 @@ impl RecordId {
     }
 }
 
-/// Mutable view over a slotted page.
+/// Generic slotted page wrapper.
 ///
 /// This struct provides methods for manipulating records within a page.
-/// It operates directly on the underlying byte slice without owning it.
+/// It operates directly on the underlying data without owning it.
+///
+/// The type parameter `T` allows this to wrap:
+/// - `&[u8]` - read-only view
+/// - `&mut [u8]` - mutable view
+/// - `Vec<u8>` - owned data
+/// - Any type implementing `AsRef<[u8]>` (and optionally `AsMut<[u8]>`)
 ///
 /// # Example
 ///
 /// ```no_run
 /// use enhance::storage::PAGE_SIZE;
-/// use enhance::tuple::SlottedPage;
+/// use enhance::tuple::Slotted;
 ///
 /// let mut data = vec![0u8; PAGE_SIZE];
-/// let mut page = SlottedPage::new(&mut data);
+/// let mut page = Slotted::new(&mut data);
 /// page.init();
 ///
 /// let slot_id = page.insert(b"hello world").unwrap();
 /// assert_eq!(page.read(slot_id), Some(b"hello world".as_slice()));
 /// ```
-pub struct SlottedPage<'a> {
-    data: &'a mut [u8],
+pub struct Slotted<T> {
+    data: T,
 }
 
-impl<'a> SlottedPage<'a> {
-    /// Creates a new SlottedPage view over the given data.
+// Read-only methods (available for any T: AsRef<[u8]>)
+impl<T: AsRef<[u8]>> Slotted<T> {
+    /// Creates a new Slotted page view over the given data.
     ///
     /// # Panics
     ///
-    /// Panics if `data.len() != PAGE_SIZE`.
-    pub fn new(data: &'a mut [u8]) -> Self {
+    /// Panics if `data.as_ref().len() != PAGE_SIZE`.
+    pub fn new(data: T) -> Self {
         assert_eq!(
-            data.len(),
+            data.as_ref().len(),
             PAGE_SIZE,
-            "SlottedPage requires exactly {} bytes, got {}",
+            "Slotted requires exactly {} bytes, got {}",
             PAGE_SIZE,
-            data.len()
+            data.as_ref().len()
         );
         Self { data }
     }
 
-    /// Initializes this page as a new empty data page.
-    ///
-    /// This zeroes the page and writes an empty data page header.
-    pub fn init(&mut self) {
-        self.data.fill(0);
-        PageHeader::new_data_page().write_to(&mut self.data[..PAGE_HEADER_SIZE]);
+    /// Returns a reference to the underlying data.
+    fn data(&self) -> &[u8] {
+        self.data.as_ref()
     }
 
     /// Returns the page header.
     pub fn header(&self) -> PageHeader {
-        PageHeader::read_from(&self.data[..PAGE_HEADER_SIZE])
-    }
-
-    /// Sets the page header.
-    fn set_header(&mut self, header: &PageHeader) {
-        header.write_to(&mut self.data[..PAGE_HEADER_SIZE]);
+        PageHeader::read_from(&self.data()[..PAGE_HEADER_SIZE])
     }
 
     /// Returns the slot entry at the given index.
     fn get_slot(&self, slot_id: SlotId) -> SlotEntry {
         let offset = PAGE_HEADER_SIZE + (slot_id as usize) * SLOT_SIZE;
-        SlotEntry::read_from(&self.data[offset..offset + SLOT_SIZE])
-    }
-
-    /// Sets the slot entry at the given index.
-    fn set_slot(&mut self, slot_id: SlotId, entry: &SlotEntry) {
-        let offset = PAGE_HEADER_SIZE + (slot_id as usize) * SLOT_SIZE;
-        entry.write_to(&mut self.data[offset..offset + SLOT_SIZE]);
+        SlotEntry::read_from(&self.data()[offset..offset + SLOT_SIZE])
     }
 
     /// Returns the contiguous free space available for new records.
@@ -334,6 +327,89 @@ impl<'a> SlottedPage<'a> {
         let need_new_slot = header.first_free_slot == u16::MAX;
         let slot_overhead = if need_new_slot { SLOT_SIZE } else { 0 };
         self.free_space() >= record_size + slot_overhead
+    }
+
+    /// Reads a record by slot ID.
+    ///
+    /// Returns `None` if the slot is out of bounds or deleted.
+    pub fn read(&self, slot_id: SlotId) -> Option<&[u8]> {
+        let header = self.header();
+        if slot_id >= header.slot_count {
+            return None;
+        }
+
+        let slot = self.get_slot(slot_id);
+        if slot.is_empty() {
+            return None;
+        }
+
+        let start = slot.offset as usize;
+        let end = start + slot.length as usize;
+        Some(&self.data()[start..end])
+    }
+
+    /// Returns the fragmentation ratio (0.0 = no fragmentation, 1.0 = all garbage).
+    ///
+    /// Fragmentation is the ratio of wasted space to total record area.
+    pub fn fragmentation(&self) -> f32 {
+        let header = self.header();
+        let total_record_area = (PAGE_SIZE as u16 - header.free_end) as usize;
+
+        if total_record_area == 0 {
+            return 0.0;
+        }
+
+        let mut used_space = 0usize;
+        for slot_id in 0..header.slot_count {
+            let slot = self.get_slot(slot_id);
+            if !slot.is_empty() {
+                used_space += slot.length as usize;
+            }
+        }
+
+        let wasted = total_record_area.saturating_sub(used_space);
+        wasted as f32 / total_record_area as f32
+    }
+
+    /// Returns an iterator over all valid (non-deleted) records.
+    pub fn iter(&self) -> impl Iterator<Item = (SlotId, &[u8])> {
+        let header = self.header();
+        (0..header.slot_count).filter_map(move |slot_id| self.read(slot_id).map(|data| (slot_id, data)))
+    }
+
+    /// Returns the number of valid (non-deleted) records in this page.
+    pub fn record_count(&self) -> usize {
+        let header = self.header();
+        (0..header.slot_count)
+            .filter(|&slot_id| !self.get_slot(slot_id).is_empty())
+            .count()
+    }
+}
+
+// Mutable methods (available for T: AsRef<[u8]> + AsMut<[u8]>)
+impl<T: AsRef<[u8]> + AsMut<[u8]>> Slotted<T> {
+    /// Returns a mutable reference to the underlying data.
+    fn data_mut(&mut self) -> &mut [u8] {
+        self.data.as_mut()
+    }
+
+    /// Initializes this page as a new empty data page.
+    ///
+    /// This zeroes the page and writes an empty data page header.
+    pub fn init(&mut self) {
+        self.data_mut().fill(0);
+        PageHeader::new_data_page().write_to(&mut self.data_mut()[..PAGE_HEADER_SIZE]);
+    }
+
+    /// Sets the page header.
+    fn set_header(&mut self, header: &PageHeader) {
+        header.write_to(&mut self.data_mut()[..PAGE_HEADER_SIZE]);
+    }
+
+    /// Sets the slot entry at the given index.
+    fn set_slot(&mut self, slot_id: SlotId, entry: &SlotEntry) {
+        let offset = PAGE_HEADER_SIZE + (slot_id as usize) * SLOT_SIZE;
+        entry.write_to(&mut self.data_mut()[offset..offset + SLOT_SIZE]);
     }
 
     /// Inserts a record and returns its slot ID.
@@ -373,7 +449,7 @@ impl<'a> SlottedPage<'a> {
         // Write record data
         let start = record_offset as usize;
         let end = start + record_size;
-        self.data[start..end].copy_from_slice(record_data);
+        self.data_mut()[start..end].copy_from_slice(record_data);
 
         // Write slot entry
         self.set_slot(slot_id, &SlotEntry::new(record_offset, record_size as u16));
@@ -382,25 +458,6 @@ impl<'a> SlottedPage<'a> {
         self.set_header(&header);
 
         Ok(slot_id)
-    }
-
-    /// Reads a record by slot ID.
-    ///
-    /// Returns `None` if the slot is out of bounds or deleted.
-    pub fn read(&self, slot_id: SlotId) -> Option<&[u8]> {
-        let header = self.header();
-        if slot_id >= header.slot_count {
-            return None;
-        }
-
-        let slot = self.get_slot(slot_id);
-        if slot.is_empty() {
-            return None;
-        }
-
-        let start = slot.offset as usize;
-        let end = start + slot.length as usize;
-        Some(&self.data[start..end])
     }
 
     /// Deletes a record by slot ID.
@@ -458,7 +515,7 @@ impl<'a> SlottedPage<'a> {
         if new_len <= old_len {
             // Fits in place - overwrite at same location
             let start = old_slot.offset as usize;
-            self.data[start..start + new_len].copy_from_slice(new_data);
+            self.data_mut()[start..start + new_len].copy_from_slice(new_data);
             // Update slot length (may be smaller, leaving a gap until compaction)
             self.set_slot(slot_id, &SlotEntry::new(old_slot.offset, new_len as u16));
             Ok(())
@@ -478,7 +535,7 @@ impl<'a> SlottedPage<'a> {
             let new_offset = header.free_end;
 
             let start = new_offset as usize;
-            self.data[start..start + new_len].copy_from_slice(new_data);
+            self.data_mut()[start..start + new_len].copy_from_slice(new_data);
 
             // Update slot to point to new location (old space becomes garbage until compaction)
             self.set_slot(slot_id, &SlotEntry::new(new_offset, new_len as u16));
@@ -511,7 +568,7 @@ impl<'a> SlottedPage<'a> {
             if !slot.is_empty() {
                 let start = slot.offset as usize;
                 let end = start + slot.length as usize;
-                records.push((slot_id, self.data[start..end].to_vec()));
+                records.push((slot_id, self.data()[start..end].to_vec()));
             }
         }
 
@@ -520,7 +577,7 @@ impl<'a> SlottedPage<'a> {
         for (slot_id, record_data) in &records {
             new_free_end -= record_data.len() as u16;
             let start = new_free_end as usize;
-            self.data[start..start + record_data.len()].copy_from_slice(record_data);
+            self.data_mut()[start..start + record_data.len()].copy_from_slice(record_data);
             self.set_slot(*slot_id, &SlotEntry::new(new_free_end, record_data.len() as u16));
         }
 
@@ -540,121 +597,6 @@ impl<'a> SlottedPage<'a> {
         header.first_free_slot = first_free;
         self.set_header(&header);
     }
-
-    /// Returns the fragmentation ratio (0.0 = no fragmentation, 1.0 = all garbage).
-    ///
-    /// Fragmentation is the ratio of wasted space to total record area.
-    pub fn fragmentation(&self) -> f32 {
-        let header = self.header();
-        let total_record_area = (PAGE_SIZE as u16 - header.free_end) as usize;
-
-        if total_record_area == 0 {
-            return 0.0;
-        }
-
-        let mut used_space = 0usize;
-        for slot_id in 0..header.slot_count {
-            let slot = self.get_slot(slot_id);
-            if !slot.is_empty() {
-                used_space += slot.length as usize;
-            }
-        }
-
-        let wasted = total_record_area.saturating_sub(used_space);
-        wasted as f32 / total_record_area as f32
-    }
-
-    /// Returns an iterator over all valid (non-deleted) records.
-    pub fn iter(&self) -> impl Iterator<Item = (SlotId, &[u8])> {
-        let header = self.header();
-        (0..header.slot_count).filter_map(move |slot_id| {
-            self.read(slot_id).map(|data| (slot_id, data))
-        })
-    }
-
-    /// Returns the number of valid (non-deleted) records in this page.
-    pub fn record_count(&self) -> usize {
-        let header = self.header();
-        (0..header.slot_count)
-            .filter(|&slot_id| !self.get_slot(slot_id).is_empty())
-            .count()
-    }
-}
-
-/// Read-only view over a slotted page.
-///
-/// Use this when you only need to read records without modifying the page.
-pub struct SlottedPageRef<'a> {
-    data: &'a [u8],
-}
-
-impl<'a> SlottedPageRef<'a> {
-    /// Creates a new read-only SlottedPage view.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `data.len() != PAGE_SIZE`.
-    pub fn new(data: &'a [u8]) -> Self {
-        assert_eq!(
-            data.len(),
-            PAGE_SIZE,
-            "SlottedPageRef requires exactly {} bytes, got {}",
-            PAGE_SIZE,
-            data.len()
-        );
-        Self { data }
-    }
-
-    /// Returns the page header.
-    pub fn header(&self) -> PageHeader {
-        PageHeader::read_from(&self.data[..PAGE_HEADER_SIZE])
-    }
-
-    /// Returns the slot entry at the given index.
-    fn get_slot(&self, slot_id: SlotId) -> SlotEntry {
-        let offset = PAGE_HEADER_SIZE + (slot_id as usize) * SLOT_SIZE;
-        SlotEntry::read_from(&self.data[offset..offset + SLOT_SIZE])
-    }
-
-    /// Returns the contiguous free space available.
-    pub fn free_space(&self) -> usize {
-        self.header().free_space() as usize
-    }
-
-    /// Reads a record by slot ID.
-    ///
-    /// Returns `None` if the slot is out of bounds or deleted.
-    pub fn read(&self, slot_id: SlotId) -> Option<&[u8]> {
-        let header = self.header();
-        if slot_id >= header.slot_count {
-            return None;
-        }
-
-        let slot = self.get_slot(slot_id);
-        if slot.is_empty() {
-            return None;
-        }
-
-        let start = slot.offset as usize;
-        let end = start + slot.length as usize;
-        Some(&self.data[start..end])
-    }
-
-    /// Returns an iterator over all valid (non-deleted) records.
-    pub fn iter(&self) -> impl Iterator<Item = (SlotId, &[u8])> {
-        let header = self.header();
-        (0..header.slot_count).filter_map(move |slot_id| {
-            self.read(slot_id).map(|data| (slot_id, data))
-        })
-    }
-
-    /// Returns the number of valid (non-deleted) records in this page.
-    pub fn record_count(&self) -> usize {
-        let header = self.header();
-        (0..header.slot_count)
-            .filter(|&slot_id| !self.get_slot(slot_id).is_empty())
-            .count()
-    }
 }
 
 #[cfg(test)]
@@ -663,14 +605,14 @@ mod tests {
 
     fn create_page() -> Vec<u8> {
         let mut data = vec![0u8; PAGE_SIZE];
-        SlottedPage::new(&mut data).init();
+        Slotted::new(&mut data).init();
         data
     }
 
     #[test]
     fn test_header_roundtrip() {
         let mut data = vec![0u8; PAGE_SIZE];
-        let mut page = SlottedPage::new(&mut data);
+        let mut page = Slotted::new(&mut data);
         page.init();
 
         let header = page.header();
@@ -688,7 +630,7 @@ mod tests {
     #[test]
     fn test_insert_and_read() {
         let mut data = create_page();
-        let mut page = SlottedPage::new(&mut data);
+        let mut page = Slotted::new(&mut data);
 
         let record = b"hello world";
         let slot_id = page.insert(record).unwrap();
@@ -701,7 +643,7 @@ mod tests {
     #[test]
     fn test_multiple_inserts() {
         let mut data = create_page();
-        let mut page = SlottedPage::new(&mut data);
+        let mut page = Slotted::new(&mut data);
 
         let records: Vec<&[u8]> = vec![b"first", b"second", b"third"];
         let slot_ids: Vec<_> = records
@@ -719,7 +661,7 @@ mod tests {
     #[test]
     fn test_read_invalid_slot() {
         let mut data = create_page();
-        let page = SlottedPage::new(&mut data);
+        let page = Slotted::new(&mut data);
 
         assert!(page.read(0).is_none());
         assert!(page.read(100).is_none());
@@ -728,7 +670,7 @@ mod tests {
     #[test]
     fn test_delete() {
         let mut data = create_page();
-        let mut page = SlottedPage::new(&mut data);
+        let mut page = Slotted::new(&mut data);
 
         let slot0 = page.insert(b"record0").unwrap();
         let slot1 = page.insert(b"record1").unwrap();
@@ -743,7 +685,7 @@ mod tests {
     #[test]
     fn test_delete_invalid_slot() {
         let mut data = create_page();
-        let mut page = SlottedPage::new(&mut data);
+        let mut page = Slotted::new(&mut data);
 
         assert!(matches!(
             page.delete(0),
@@ -763,7 +705,7 @@ mod tests {
     #[test]
     fn test_slot_reuse() {
         let mut data = create_page();
-        let mut page = SlottedPage::new(&mut data);
+        let mut page = Slotted::new(&mut data);
 
         let slot0 = page.insert(b"record0").unwrap();
         let _slot1 = page.insert(b"record1").unwrap();
@@ -779,7 +721,7 @@ mod tests {
     #[test]
     fn test_update_smaller() {
         let mut data = create_page();
-        let mut page = SlottedPage::new(&mut data);
+        let mut page = Slotted::new(&mut data);
 
         let slot = page.insert(b"hello world").unwrap();
         page.update(slot, b"hi").unwrap();
@@ -790,7 +732,7 @@ mod tests {
     #[test]
     fn test_update_larger() {
         let mut data = create_page();
-        let mut page = SlottedPage::new(&mut data);
+        let mut page = Slotted::new(&mut data);
 
         let slot = page.insert(b"hi").unwrap();
         page.update(slot, b"hello world").unwrap();
@@ -801,7 +743,7 @@ mod tests {
     #[test]
     fn test_update_invalid_slot() {
         let mut data = create_page();
-        let mut page = SlottedPage::new(&mut data);
+        let mut page = Slotted::new(&mut data);
 
         assert!(matches!(
             page.update(0, b"test"),
@@ -812,7 +754,7 @@ mod tests {
     #[test]
     fn test_page_full() {
         let mut data = create_page();
-        let mut page = SlottedPage::new(&mut data);
+        let mut page = Slotted::new(&mut data);
 
         // Insert large records until full
         let large_record = vec![0u8; 1000];
@@ -832,7 +774,7 @@ mod tests {
     #[test]
     fn test_compact() {
         let mut data = create_page();
-        let mut page = SlottedPage::new(&mut data);
+        let mut page = Slotted::new(&mut data);
 
         // Insert records
         let slot0 = page.insert(b"aaaa").unwrap();
@@ -860,7 +802,7 @@ mod tests {
     #[test]
     fn test_compact_recovers_space() {
         let mut data = create_page();
-        let mut page = SlottedPage::new(&mut data);
+        let mut page = Slotted::new(&mut data);
 
         let large_record = vec![0u8; 2000];
         let slot0 = page.insert(&large_record).unwrap();
@@ -894,7 +836,7 @@ mod tests {
     #[test]
     fn test_iter() {
         let mut data = create_page();
-        let mut page = SlottedPage::new(&mut data);
+        let mut page = Slotted::new(&mut data);
 
         page.insert(b"first").unwrap();
         let slot1 = page.insert(b"second").unwrap();
@@ -909,16 +851,16 @@ mod tests {
     }
 
     #[test]
-    fn test_slotted_page_ref() {
+    fn test_slotted_read_only() {
         let mut data = create_page();
         {
-            let mut page = SlottedPage::new(&mut data);
+            let mut page = Slotted::new(&mut data);
             page.insert(b"hello").unwrap();
             page.insert(b"world").unwrap();
         }
 
-        // Now use read-only view
-        let page_ref = SlottedPageRef::new(&data);
+        // Now use read-only view (with immutable reference)
+        let page_ref = Slotted::new(&data[..]);
         assert_eq!(page_ref.read(0), Some(b"hello".as_slice()));
         assert_eq!(page_ref.read(1), Some(b"world".as_slice()));
         assert_eq!(page_ref.record_count(), 2);
@@ -930,7 +872,7 @@ mod tests {
     #[test]
     fn test_max_record_size() {
         let mut data = create_page();
-        let mut page = SlottedPage::new(&mut data);
+        let mut page = Slotted::new(&mut data);
 
         // Should be able to insert a max-sized record
         let max_record = vec![0u8; MAX_RECORD_SIZE];
@@ -947,7 +889,7 @@ mod tests {
     #[test]
     fn test_free_space_calculation() {
         let mut data = create_page();
-        let mut page = SlottedPage::new(&mut data);
+        let mut page = Slotted::new(&mut data);
 
         let initial_free = page.free_space();
         assert_eq!(initial_free, PAGE_SIZE - PAGE_HEADER_SIZE);
@@ -964,7 +906,7 @@ mod tests {
     #[test]
     fn test_empty_record() {
         let mut data = create_page();
-        let mut page = SlottedPage::new(&mut data);
+        let mut page = Slotted::new(&mut data);
 
         let slot = page.insert(b"").unwrap();
         assert_eq!(page.read(slot), Some(b"".as_slice()));
