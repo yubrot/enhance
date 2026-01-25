@@ -8,7 +8,6 @@ This document evaluates remaining roadmap items from the perspective of Agentic 
 
 | # | Item | Difficulty | Rationale |
 |---|------|:----------:|-----------|
-| 7 | **Lexer & Parser** | 2 | SQL-92 grammar is well-defined. Recursive descent is a textbook pattern. Knowledge-based, fast implementation expected |
 | 8 | **MVCC Core** | 4 | Subtle edge cases in visibility rules. Transaction Manager + Snapshot + Tuple Header are tightly coupled. PostgreSQL specs are clear, so knowledge helps |
 | 9 | **System Catalog** | 4 | Bootstrap problem (reading catalog requires catalog definition). Once design is fixed, implementation is mechanical |
 | 10 | **Basic Executor & EXPLAIN** | 2 | Volcano model is a clear Iterator pattern. SeqScan/Filter/Projection are straightforward |
