@@ -46,8 +46,9 @@ impl Connection {
 
     /// Parses a SQL query and returns the AST.
     ///
-    /// Returns None if the query is empty (should send EmptyQueryResponse).
-    fn parse_query(query: &str) -> Result<Option<Statement>, crate::sql::ParseError> {
+    /// Returns `Ok(None)` for empty queries, `Ok(Some(stmt))` for valid SQL,
+    /// or `Err` for syntax errors.
+    fn parse_query(query: &str) -> Result<Option<Statement>, crate::sql::SyntaxError> {
         let query = query.trim();
 
         if query.is_empty() {
@@ -177,7 +178,7 @@ impl Connection {
                         fields: vec![
                             ErrorField::new(ErrorFieldCode::Severity, "ERROR"),
                             ErrorField::new(ErrorFieldCode::SeverityNonLocalized, "ERROR"),
-                            ErrorField::new(ErrorFieldCode::SqlState, err.sql_state()),
+                            ErrorField::new(ErrorFieldCode::SqlState, sql_state::SYNTAX_ERROR),
                             ErrorField::new(ErrorFieldCode::Message, &err.message),
                             ErrorField::new(ErrorFieldCode::Position, err.position().to_string()),
                         ],
@@ -206,19 +207,24 @@ impl Connection {
 
         // Parse the SQL
         let ast = match Self::parse_query(&msg.query) {
-            Ok(ast) => ast,
+            Ok(Some(ast)) => ast,
+            Ok(None) => {
+                // Empty query not allowed in Extended Query Protocol
+                return self
+                    .send_error(sql_state::SYNTAX_ERROR, "empty query".to_string(), true)
+                    .await;
+            }
             Err(err) => {
                 // Parse error - send error response with position
                 let position = err.position();
                 return self
-                    .send_error_with_position(err.sql_state(), err.message, position, true)
+                    .send_error_with_position(sql_state::SYNTAX_ERROR, err.message, position, true)
                     .await;
             }
         };
 
         // Store the prepared statement
         let stmt = PreparedStatement {
-            query: msg.query,
             ast,
             param_types: msg.param_types,
         };
@@ -340,18 +346,10 @@ impl Connection {
 
         // Stub execution - use stored AST to determine response
         // NOTE: Real execution comes in later steps
-        match &stmt.ast {
-            None => {
-                // Empty query
-                self.framed.send(BackendMessage::EmptyQueryResponse).await?;
-            }
-            Some(ast) => {
-                let tag = Self::command_tag(ast);
-                self.framed
-                    .send(BackendMessage::CommandComplete { tag })
-                    .await?;
-            }
-        }
+        let tag = Self::command_tag(&stmt.ast);
+        self.framed
+            .send(BackendMessage::CommandComplete { tag })
+            .await?;
 
         Ok(())
     }

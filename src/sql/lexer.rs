@@ -3,7 +3,7 @@
 //! The [`Lexer`] converts a SQL string into a stream of [`Token`]s.
 //! It handles keywords, identifiers, literals, operators, and comments.
 
-use super::error::{ParseError, Span};
+use super::error::{SyntaxError, Span};
 use super::token::{Keyword, Token, TokenKind};
 
 /// SQL lexer that tokenizes input strings.
@@ -20,7 +20,7 @@ pub struct Lexer<'a> {
     input: &'a str,
     pos: usize,
     /// Accumulated errors during tokenization.
-    errors: Vec<ParseError>,
+    errors: Vec<SyntaxError>,
 }
 
 impl<'a> Lexer<'a> {
@@ -34,12 +34,12 @@ impl<'a> Lexer<'a> {
     }
 
     /// Returns all errors accumulated during tokenization.
-    pub fn errors(&self) -> &[ParseError] {
+    pub fn errors(&self) -> &[SyntaxError] {
         &self.errors
     }
 
     /// Takes all errors, leaving an empty error list.
-    pub fn take_errors(&mut self) -> Vec<ParseError> {
+    pub fn take_errors(&mut self) -> Vec<SyntaxError> {
         std::mem::take(&mut self.errors)
     }
 
@@ -174,7 +174,7 @@ impl<'a> Lexer<'a> {
                 }
             }
             if depth > 0 {
-                self.errors.push(ParseError::syntax_error(
+                self.errors.push(SyntaxError::new(
                     "unterminated block comment",
                     Span::new(start, self.pos),
                 ));
@@ -199,7 +199,7 @@ impl<'a> Lexer<'a> {
             match self.current_char() {
                 None => {
                     self.errors
-                        .push(ParseError::unterminated_string(Span::new(start, self.pos)));
+                        .push(SyntaxError::unterminated_string(Span::new(start, self.pos)));
                     break;
                 }
                 Some('\'') => {
@@ -232,7 +232,7 @@ impl<'a> Lexer<'a> {
         loop {
             match self.current_char() {
                 None => {
-                    self.errors.push(ParseError::syntax_error(
+                    self.errors.push(SyntaxError::new(
                         "unterminated quoted identifier",
                         Span::new(start, self.pos),
                     ));
@@ -274,7 +274,7 @@ impl<'a> Lexer<'a> {
 
         let num_str = &self.input[num_start..self.pos];
         if num_str.is_empty() {
-            self.errors.push(ParseError::syntax_error(
+            self.errors.push(SyntaxError::new(
                 "expected parameter number after '$'",
                 Span::new(start, self.pos),
             ));
@@ -284,7 +284,7 @@ impl<'a> Lexer<'a> {
         match num_str.parse::<u32>() {
             Ok(n) => Token::new(TokenKind::Parameter(n), Span::new(start, self.pos)),
             Err(_) => {
-                self.errors.push(ParseError::syntax_error(
+                self.errors.push(SyntaxError::new(
                     "parameter number too large",
                     Span::new(start, self.pos),
                 ));
@@ -339,7 +339,7 @@ impl<'a> Lexer<'a> {
             }
             if self.pos == exp_start {
                 self.errors
-                    .push(ParseError::invalid_number(Span::new(start, self.pos)));
+                    .push(SyntaxError::invalid_number(Span::new(start, self.pos)));
             }
         }
 
@@ -350,7 +350,7 @@ impl<'a> Lexer<'a> {
             match num_str.parse::<f64>() {
                 Ok(n) => Token::new(TokenKind::Float(n), span),
                 Err(_) => {
-                    self.errors.push(ParseError::invalid_number(span));
+                    self.errors.push(SyntaxError::invalid_number(span));
                     Token::new(TokenKind::Float(0.0), span)
                 }
             }
@@ -358,7 +358,7 @@ impl<'a> Lexer<'a> {
             match num_str.parse::<i64>() {
                 Ok(n) => Token::new(TokenKind::Integer(n), span),
                 Err(_) => {
-                    self.errors.push(ParseError::invalid_number(span));
+                    self.errors.push(SyntaxError::invalid_number(span));
                     Token::new(TokenKind::Integer(0), span)
                 }
             }
@@ -426,7 +426,7 @@ impl<'a> Lexer<'a> {
             '.' => TokenKind::Dot,
             ':' => TokenKind::Colon,
             _ => {
-                self.errors.push(ParseError::syntax_error(
+                self.errors.push(SyntaxError::new(
                     format!("unexpected character '{ch}'"),
                     Span::new(start, self.pos),
                 ));
@@ -459,7 +459,7 @@ mod tests {
         tokens.into_iter().map(|t| t.kind).collect()
     }
 
-    fn tokenize_with_errors(input: &str) -> (Vec<TokenKind>, Vec<ParseError>) {
+    fn tokenize_with_errors(input: &str) -> (Vec<TokenKind>, Vec<SyntaxError>) {
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize();
         let errors = lexer.take_errors();

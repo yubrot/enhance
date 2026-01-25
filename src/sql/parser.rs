@@ -5,7 +5,7 @@
 //! expression parsing.
 
 use super::ast::*;
-use super::error::{ParseError, Span};
+use super::error::{SyntaxError, Span};
 use super::lexer::Lexer;
 use super::token::{Keyword, Token, TokenKind};
 
@@ -39,8 +39,8 @@ impl<'a> Parser<'a> {
     ///
     /// # Errors
     ///
-    /// Returns a [`ParseError`] if the input is not valid SQL.
-    pub fn parse(&mut self) -> Result<Statement, ParseError> {
+    /// Returns a [`SyntaxError`] if the input is not valid SQL.
+    pub fn parse(&mut self) -> Result<Statement, SyntaxError> {
         let stmt = self.parse_statement()?;
 
         // Optional trailing semicolon
@@ -49,7 +49,7 @@ impl<'a> Parser<'a> {
         // Check for unexpected trailing tokens
         if !self.is_eof() {
             let span = self.current_span();
-            return Err(ParseError::unexpected_token(
+            return Err(SyntaxError::unexpected_token(
                 "end of input",
                 &self.current_token_name(),
                 span,
@@ -60,7 +60,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a single statement.
-    fn parse_statement(&mut self) -> Result<Statement, ParseError> {
+    fn parse_statement(&mut self) -> Result<Statement, SyntaxError> {
         // Handle EXPLAIN prefix
         if self.consume_keyword(Keyword::Explain) {
             let inner = self.parse_statement()?;
@@ -106,14 +106,14 @@ impl<'a> Parser<'a> {
             if unique {
                 // Had UNIQUE but not INDEX
                 let span = self.current_span();
-                return Err(ParseError::unexpected_token(
+                return Err(SyntaxError::unexpected_token(
                     "INDEX after UNIQUE",
                     &self.current_token_name(),
                     span,
                 ));
             }
             let span = self.current_span();
-            return Err(ParseError::unexpected_token(
+            return Err(SyntaxError::unexpected_token(
                 "TABLE or INDEX",
                 &self.current_token_name(),
                 span,
@@ -129,7 +129,7 @@ impl<'a> Parser<'a> {
                 return self.parse_drop_index_stmt();
             }
             let span = self.current_span();
-            return Err(ParseError::unexpected_token(
+            return Err(SyntaxError::unexpected_token(
                 "TABLE or INDEX",
                 &self.current_token_name(),
                 span,
@@ -158,7 +158,7 @@ impl<'a> Parser<'a> {
         }
 
         let span = self.current_span();
-        Err(ParseError::unexpected_token(
+        Err(SyntaxError::unexpected_token(
             "statement",
             &self.current_token_name(),
             span,
@@ -166,7 +166,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a SET statement.
-    fn parse_set_stmt(&mut self) -> Result<Statement, ParseError> {
+    fn parse_set_stmt(&mut self) -> Result<Statement, SyntaxError> {
         let name = self.expect_identifier()?;
 
         // SET name = value or SET name TO value
@@ -176,7 +176,7 @@ impl<'a> Parser<'a> {
                 if s.eq_ignore_ascii_case("to") {
                     self.advance();
                 } else {
-                    return Err(ParseError::unexpected_token(
+                    return Err(SyntaxError::unexpected_token(
                         "'=' or 'TO'",
                         &self.current_token_name(),
                         self.current_span(),
@@ -191,7 +191,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a CREATE TABLE statement.
-    fn parse_create_table_stmt(&mut self) -> Result<Statement, ParseError> {
+    fn parse_create_table_stmt(&mut self) -> Result<Statement, SyntaxError> {
         let name = self.expect_identifier()?;
 
         self.expect_token(TokenKind::LParen)?;
@@ -227,7 +227,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a column definition.
-    fn parse_column_def(&mut self) -> Result<ColumnDef, ParseError> {
+    fn parse_column_def(&mut self) -> Result<ColumnDef, SyntaxError> {
         let name = self.expect_identifier()?;
         let data_type = self.parse_data_type()?;
         let constraints = self.parse_column_constraints()?;
@@ -240,7 +240,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a data type.
-    pub(crate) fn parse_data_type(&mut self) -> Result<DataType, ParseError> {
+    pub(crate) fn parse_data_type(&mut self) -> Result<DataType, SyntaxError> {
         // BOOLEAN
         if self.consume_keyword(Keyword::Boolean) {
             return Ok(DataType::Boolean);
@@ -300,7 +300,7 @@ impl<'a> Parser<'a> {
         }
 
         let span = self.current_span();
-        Err(ParseError::unexpected_token(
+        Err(SyntaxError::unexpected_token(
             "data type",
             &self.current_token_name(),
             span,
@@ -308,7 +308,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses column constraints.
-    fn parse_column_constraints(&mut self) -> Result<Vec<ColumnConstraint>, ParseError> {
+    fn parse_column_constraints(&mut self) -> Result<Vec<ColumnConstraint>, SyntaxError> {
         let mut constraints = Vec::new();
 
         loop {
@@ -349,7 +349,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a table-level constraint.
-    fn parse_table_constraint(&mut self) -> Result<TableConstraint, ParseError> {
+    fn parse_table_constraint(&mut self) -> Result<TableConstraint, SyntaxError> {
         let name = if self.consume_keyword(Keyword::Constraint) {
             Some(self.expect_identifier()?)
         } else {
@@ -389,7 +389,7 @@ impl<'a> Parser<'a> {
             }
         } else {
             let span = self.current_span();
-            return Err(ParseError::unexpected_token(
+            return Err(SyntaxError::unexpected_token(
                 "constraint type",
                 &self.current_token_name(),
                 span,
@@ -400,7 +400,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a SELECT statement.
-    pub(crate) fn parse_select_stmt(&mut self) -> Result<SelectStmt, ParseError> {
+    pub(crate) fn parse_select_stmt(&mut self) -> Result<SelectStmt, SyntaxError> {
         self.expect_keyword(Keyword::Select)?;
 
         // DISTINCT / ALL
@@ -487,7 +487,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses the select list (columns/expressions).
-    fn parse_select_list(&mut self) -> Result<Vec<SelectItem>, ParseError> {
+    fn parse_select_list(&mut self) -> Result<Vec<SelectItem>, SyntaxError> {
         let mut items = Vec::new();
 
         loop {
@@ -501,7 +501,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a single select item.
-    fn parse_select_item(&mut self) -> Result<SelectItem, ParseError> {
+    fn parse_select_item(&mut self) -> Result<SelectItem, SyntaxError> {
         // Check for *
         if self.consume_token(TokenKind::Asterisk) {
             return Ok(SelectItem::Wildcard);
@@ -547,7 +547,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses the FROM clause.
-    fn parse_from_clause(&mut self) -> Result<FromClause, ParseError> {
+    fn parse_from_clause(&mut self) -> Result<FromClause, SyntaxError> {
         let mut tables = Vec::new();
 
         loop {
@@ -563,7 +563,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a table reference.
-    fn parse_table_ref(&mut self) -> Result<TableRef, ParseError> {
+    fn parse_table_ref(&mut self) -> Result<TableRef, SyntaxError> {
         let mut table_ref = self.parse_primary_table_ref()?;
 
         // Handle JOINs
@@ -623,7 +623,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a primary table reference (table name or subquery).
-    fn parse_primary_table_ref(&mut self) -> Result<TableRef, ParseError> {
+    fn parse_primary_table_ref(&mut self) -> Result<TableRef, SyntaxError> {
         // Subquery
         if self.consume_token(TokenKind::LParen) {
             let query = self.parse_select_stmt()?;
@@ -662,7 +662,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses ORDER BY item list.
-    fn parse_order_by_list(&mut self) -> Result<Vec<OrderByItem>, ParseError> {
+    fn parse_order_by_list(&mut self) -> Result<Vec<OrderByItem>, SyntaxError> {
         let mut items = Vec::new();
 
         loop {
@@ -683,7 +683,7 @@ impl<'a> Parser<'a> {
                     NullOrdering::Last
                 } else {
                     let span = self.current_span();
-                    return Err(ParseError::unexpected_token(
+                    return Err(SyntaxError::unexpected_token(
                         "FIRST or LAST",
                         &self.current_token_name(),
                         span,
@@ -708,14 +708,14 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses FOR UPDATE/SHARE clause.
-    fn parse_locking_clause(&mut self) -> Result<LockingClause, ParseError> {
+    fn parse_locking_clause(&mut self) -> Result<LockingClause, SyntaxError> {
         let mode = if self.consume_keyword(Keyword::Update) {
             LockMode::Update
         } else if self.consume_keyword(Keyword::Share) {
             LockMode::Share
         } else {
             let span = self.current_span();
-            return Err(ParseError::unexpected_token(
+            return Err(SyntaxError::unexpected_token(
                 "UPDATE or SHARE",
                 &self.current_token_name(),
                 span,
@@ -726,7 +726,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses an INSERT statement.
-    fn parse_insert_stmt(&mut self) -> Result<Statement, ParseError> {
+    fn parse_insert_stmt(&mut self) -> Result<Statement, SyntaxError> {
         self.expect_keyword(Keyword::Into)?;
         let table = self.expect_identifier()?;
 
@@ -762,7 +762,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses an UPDATE statement.
-    fn parse_update_stmt(&mut self) -> Result<Statement, ParseError> {
+    fn parse_update_stmt(&mut self) -> Result<Statement, SyntaxError> {
         let table = self.expect_identifier()?;
         self.expect_keyword(Keyword::Set)?;
 
@@ -792,7 +792,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a DELETE statement.
-    fn parse_delete_stmt(&mut self) -> Result<Statement, ParseError> {
+    fn parse_delete_stmt(&mut self) -> Result<Statement, SyntaxError> {
         self.expect_keyword(Keyword::From)?;
         let table = self.expect_identifier()?;
 
@@ -809,7 +809,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a DROP TABLE statement.
-    fn parse_drop_table_stmt(&mut self) -> Result<Statement, ParseError> {
+    fn parse_drop_table_stmt(&mut self) -> Result<Statement, SyntaxError> {
         // DROP TABLE [IF EXISTS] name
         let if_exists = if self.consume_keyword(Keyword::If) {
             self.expect_keyword(Keyword::Exists)?;
@@ -824,7 +824,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a CREATE INDEX statement.
-    fn parse_create_index_stmt(&mut self, unique: bool) -> Result<Statement, ParseError> {
+    fn parse_create_index_stmt(&mut self, unique: bool) -> Result<Statement, SyntaxError> {
         // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (columns)
         let if_not_exists = if self.consume_keyword(Keyword::If) {
             self.expect_keyword(Keyword::Not)?;
@@ -852,7 +852,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a DROP INDEX statement.
-    fn parse_drop_index_stmt(&mut self) -> Result<Statement, ParseError> {
+    fn parse_drop_index_stmt(&mut self) -> Result<Statement, SyntaxError> {
         // DROP INDEX [IF EXISTS] name
         let if_exists = if self.consume_keyword(Keyword::If) {
             self.expect_keyword(Keyword::Exists)?;
@@ -867,7 +867,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a comma-separated list of index columns.
-    fn parse_index_column_list(&mut self) -> Result<Vec<IndexColumn>, ParseError> {
+    fn parse_index_column_list(&mut self) -> Result<Vec<IndexColumn>, SyntaxError> {
         let mut columns = Vec::new();
 
         loop {
@@ -950,12 +950,12 @@ impl<'a> Parser<'a> {
     }
 
     /// Expects a specific keyword, returning an error if not found.
-    pub(crate) fn expect_keyword(&mut self, kw: Keyword) -> Result<(), ParseError> {
+    pub(crate) fn expect_keyword(&mut self, kw: Keyword) -> Result<(), SyntaxError> {
         if self.consume_keyword(kw) {
             Ok(())
         } else {
             let span = self.current_span();
-            Err(ParseError::unexpected_token(
+            Err(SyntaxError::unexpected_token(
                 &format!("keyword '{}'", kw.as_str()),
                 &self.current_token_name(),
                 span,
@@ -979,12 +979,12 @@ impl<'a> Parser<'a> {
     }
 
     /// Expects a specific token, returning an error if not found.
-    pub(crate) fn expect_token(&mut self, kind: TokenKind) -> Result<(), ParseError> {
+    pub(crate) fn expect_token(&mut self, kind: TokenKind) -> Result<(), SyntaxError> {
         if self.consume_token(kind.clone()) {
             Ok(())
         } else {
             let span = self.current_span();
-            Err(ParseError::unexpected_token(
+            Err(SyntaxError::unexpected_token(
                 &kind.display_name(),
                 &self.current_token_name(),
                 span,
@@ -993,7 +993,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Expects an identifier, returning its name.
-    pub(crate) fn expect_identifier(&mut self) -> Result<String, ParseError> {
+    pub(crate) fn expect_identifier(&mut self) -> Result<String, SyntaxError> {
         match self.peek_kind() {
             Some(TokenKind::Identifier(name) | TokenKind::QuotedIdentifier(name)) => {
                 let name = name.clone();
@@ -1002,7 +1002,7 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 let span = self.current_span();
-                Err(ParseError::unexpected_token(
+                Err(SyntaxError::unexpected_token(
                     "identifier",
                     &self.current_token_name(),
                     span,
@@ -1012,7 +1012,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Expects an integer literal.
-    fn expect_integer(&mut self) -> Result<i64, ParseError> {
+    fn expect_integer(&mut self) -> Result<i64, SyntaxError> {
         match self.peek_kind() {
             Some(TokenKind::Integer(n)) => {
                 let n = *n;
@@ -1021,7 +1021,7 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 let span = self.current_span();
-                Err(ParseError::unexpected_token(
+                Err(SyntaxError::unexpected_token(
                     "integer",
                     &self.current_token_name(),
                     span,
@@ -1031,7 +1031,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a comma-separated list of identifiers.
-    fn parse_identifier_list(&mut self) -> Result<Vec<String>, ParseError> {
+    fn parse_identifier_list(&mut self) -> Result<Vec<String>, SyntaxError> {
         let mut list = vec![self.expect_identifier()?];
         while self.consume_token(TokenKind::Comma) {
             list.push(self.expect_identifier()?);
@@ -1040,7 +1040,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a comma-separated list of expressions.
-    fn parse_expr_list(&mut self) -> Result<Vec<Expr>, ParseError> {
+    fn parse_expr_list(&mut self) -> Result<Vec<Expr>, SyntaxError> {
         let mut list = vec![self.parse_expr()?];
         while self.consume_token(TokenKind::Comma) {
             list.push(self.parse_expr()?);
@@ -1053,7 +1053,7 @@ impl<'a> Parser<'a> {
 mod tests {
     use super::*;
 
-    fn parse(sql: &str) -> Result<Statement, ParseError> {
+    fn parse(sql: &str) -> Result<Statement, SyntaxError> {
         Parser::new(sql).parse()
     }
 

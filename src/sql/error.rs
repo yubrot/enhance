@@ -1,11 +1,9 @@
-//! SQL parsing error types.
+//! SQL syntax error types.
 //!
-//! This module provides the [`ParseError`] type for representing SQL syntax errors
+//! This module provides the [`SyntaxError`] type for representing SQL syntax errors
 //! with source position information for user-friendly error messages.
 
 use std::fmt;
-
-use crate::protocol::sql_state;
 
 /// A span in the source SQL string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,48 +37,32 @@ impl Span {
     }
 }
 
-/// SQL parsing error with source position information.
+/// SQL syntax error with source position information.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseError {
+pub struct SyntaxError {
     /// Error message.
     pub message: String,
     /// Position in the source where the error occurred.
     pub span: Span,
-    /// Error kind for SQL state code determination.
-    pub kind: ParseErrorKind,
 }
 
-/// Kind of parse error for determining SQL state code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParseErrorKind {
-    /// General syntax error.
-    SyntaxError,
-    /// Undefined table reference.
-    UndefinedTable,
-    /// Undefined column reference.
-    UndefinedColumn,
-    /// Undefined function reference.
-    UndefinedFunction,
-}
-
-impl ParseError {
+impl SyntaxError {
     /// Creates a new syntax error at the given position.
-    pub fn syntax_error(message: impl Into<String>, span: Span) -> Self {
+    pub fn new(message: impl Into<String>, span: Span) -> Self {
         Self {
             message: message.into(),
             span,
-            kind: ParseErrorKind::SyntaxError,
         }
     }
 
     /// Creates a new error for an unexpected token.
     pub fn unexpected_token(expected: &str, found: &str, span: Span) -> Self {
-        Self::syntax_error(format!("expected {expected}, found {found}"), span)
+        Self::new(format!("expected {expected}, found {found}"), span)
     }
 
     /// Creates a new error for an unexpected end of input.
     pub fn unexpected_eof(expected: &str, pos: usize) -> Self {
-        Self::syntax_error(
+        Self::new(
             format!("unexpected end of input, expected {expected}"),
             Span::at(pos),
         )
@@ -88,44 +70,32 @@ impl ParseError {
 
     /// Creates a new error for an invalid number literal.
     pub fn invalid_number(span: Span) -> Self {
-        Self::syntax_error("invalid number literal", span)
+        Self::new("invalid number literal", span)
     }
 
     /// Creates a new error for an unterminated string literal.
     pub fn unterminated_string(span: Span) -> Self {
-        Self::syntax_error("unterminated string literal", span)
+        Self::new("unterminated string literal", span)
     }
 
     /// Creates a new error for an invalid escape sequence.
     pub fn invalid_escape(span: Span) -> Self {
-        Self::syntax_error("invalid escape sequence", span)
+        Self::new("invalid escape sequence", span)
     }
 
-    /// Returns the PostgreSQL SQL state code for this error.
-    pub fn sql_state(&self) -> &'static str {
-        match self.kind {
-            ParseErrorKind::SyntaxError => sql_state::SYNTAX_ERROR,
-            ParseErrorKind::UndefinedTable => sql_state::UNDEFINED_TABLE,
-            ParseErrorKind::UndefinedColumn => sql_state::UNDEFINED_COLUMN,
-            ParseErrorKind::UndefinedFunction => sql_state::UNDEFINED_FUNCTION,
-        }
-    }
-
-    /// Returns the 1-based character position for PostgreSQL error reporting.
-    ///
-    /// PostgreSQL uses 1-based character positions in error messages.
+    /// Returns the 1-based character position for error reporting.
     pub fn position(&self) -> usize {
         self.span.start + 1
     }
 }
 
-impl fmt::Display for ParseError {
+impl fmt::Display for SyntaxError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} at position {}", self.message, self.position())
     }
 }
 
-impl std::error::Error for ParseError {}
+impl std::error::Error for SyntaxError {}
 
 #[cfg(test)]
 mod tests {
@@ -148,20 +118,14 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_error_sql_state() {
-        let err = ParseError::syntax_error("test", Span::at(0));
-        assert_eq!(err.sql_state(), sql_state::SYNTAX_ERROR);
-    }
-
-    #[test]
-    fn test_parse_error_position() {
-        let err = ParseError::syntax_error("test", Span::at(10));
+    fn test_syntax_error_position() {
+        let err = SyntaxError::new("test", Span::at(10));
         assert_eq!(err.position(), 11); // 1-based
     }
 
     #[test]
-    fn test_parse_error_display() {
-        let err = ParseError::syntax_error("unexpected token", Span::at(5));
+    fn test_syntax_error_display() {
+        let err = SyntaxError::new("unexpected token", Span::at(5));
         assert_eq!(err.to_string(), "unexpected token at position 6");
     }
 }

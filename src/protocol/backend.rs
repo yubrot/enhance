@@ -89,22 +89,10 @@ impl BackendMessage {
     pub fn error(sql_state: &str, message: impl Into<String>) -> Self {
         BackendMessage::ErrorResponse {
             fields: vec![
-                ErrorField {
-                    code: ErrorFieldCode::Severity,
-                    value: "ERROR".to_string(),
-                },
-                ErrorField {
-                    code: ErrorFieldCode::SeverityNonLocalized,
-                    value: "ERROR".to_string(),
-                },
-                ErrorField {
-                    code: ErrorFieldCode::SqlState,
-                    value: sql_state.to_string(),
-                },
-                ErrorField {
-                    code: ErrorFieldCode::Message,
-                    value: message.into(),
-                },
+                ErrorField::new(ErrorFieldCode::Severity, "ERROR"),
+                ErrorField::new(ErrorFieldCode::SeverityNonLocalized, "ERROR"),
+                ErrorField::new(ErrorFieldCode::SqlState, sql_state),
+                ErrorField::new(ErrorFieldCode::Message, message),
             ],
         }
     }

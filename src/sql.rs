@@ -4,17 +4,6 @@
 //! into an Abstract Syntax Tree (AST) that can be processed by the query planner
 //! and executor.
 //!
-//! # Supported Statements
-//!
-//! - `CREATE TABLE` - with column definitions and constraints
-//! - `SELECT` - with FROM, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET
-//! - `INSERT` - with column list and VALUES
-//! - `UPDATE` - with SET and WHERE
-//! - `DELETE` - with WHERE
-//! - `BEGIN`/`START TRANSACTION`, `COMMIT`, `ROLLBACK`
-//! - `SET` - session variable assignment
-//! - `EXPLAIN` - query plan visualization
-//!
 //! # Example
 //!
 //! ```
@@ -40,7 +29,7 @@ mod parser;
 mod token;
 
 pub use ast::*;
-pub use error::{ParseError, ParseErrorKind, Span};
+pub use error::{Span, SyntaxError};
 pub use lexer::Lexer;
 pub use parser::Parser;
 pub use token::{Keyword, Token, TokenKind};

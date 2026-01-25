@@ -4,7 +4,7 @@
 //! which handles operator precedence and associativity correctly.
 
 use super::ast::{BinaryOperator, Expr, UnaryOperator, WhenClause};
-use super::error::ParseError;
+use super::error::SyntaxError;
 use super::parser::Parser;
 use super::token::{Keyword, TokenKind};
 
@@ -51,12 +51,12 @@ impl Precedence {
 
 impl<'a> Parser<'a> {
     /// Parses an expression.
-    pub fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+    pub fn parse_expr(&mut self) -> Result<Expr, SyntaxError> {
         self.parse_expr_with_precedence(Precedence::Lowest)
     }
 
     /// Parses an expression with minimum precedence.
-    pub fn parse_expr_with_precedence(&mut self, min_prec: Precedence) -> Result<Expr, ParseError> {
+    pub fn parse_expr_with_precedence(&mut self, min_prec: Precedence) -> Result<Expr, SyntaxError> {
         let mut left = self.parse_unary_expr()?;
 
         loop {
@@ -96,7 +96,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a unary expression (NOT, -, +) or primary expression.
-    fn parse_unary_expr(&mut self) -> Result<Expr, ParseError> {
+    fn parse_unary_expr(&mut self) -> Result<Expr, SyntaxError> {
         // NOT
         if self.consume_keyword(Keyword::Not) {
             let operand = self.parse_expr_with_precedence(Precedence::Not)?;
@@ -128,7 +128,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses postfix expressions (IS NULL, IN, BETWEEN, LIKE, ::, etc.).
-    fn parse_postfix_expr(&mut self) -> Result<Expr, ParseError> {
+    fn parse_postfix_expr(&mut self) -> Result<Expr, SyntaxError> {
         let mut expr = self.parse_primary_expr()?;
 
         loop {
@@ -238,7 +238,7 @@ impl<'a> Parser<'a> {
                 // We need to push it back, but since we can't, treat this as end of postfix
                 // and let caller handle it. Actually, this is a parse error in most cases.
                 let span = self.current_span();
-                return Err(ParseError::unexpected_token(
+                return Err(SyntaxError::unexpected_token(
                     "IN, BETWEEN, or LIKE after NOT",
                     &self.current_token_name(),
                     span,
@@ -262,7 +262,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a comma-separated list of expressions (internal, for IN list).
-    fn parse_expr_list_inner(&mut self) -> Result<Vec<Expr>, ParseError> {
+    fn parse_expr_list_inner(&mut self) -> Result<Vec<Expr>, SyntaxError> {
         let mut list = vec![self.parse_expr()?];
         while self.consume_token(TokenKind::Comma) {
             list.push(self.parse_expr()?);
@@ -271,7 +271,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a primary expression (literals, identifiers, function calls, etc.).
-    fn parse_primary_expr(&mut self) -> Result<Expr, ParseError> {
+    fn parse_primary_expr(&mut self) -> Result<Expr, SyntaxError> {
         // NULL
         if self.consume_keyword(Keyword::Null) {
             return Ok(Expr::Null);
@@ -397,7 +397,7 @@ impl<'a> Parser<'a> {
         }
 
         let span = self.current_span();
-        Err(ParseError::unexpected_token(
+        Err(SyntaxError::unexpected_token(
             "expression",
             &self.current_token_name(),
             span,
@@ -405,7 +405,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a function call with arguments.
-    fn parse_function_call(&mut self, name: String) -> Result<Expr, ParseError> {
+    fn parse_function_call(&mut self, name: String) -> Result<Expr, SyntaxError> {
         self.expect_token(TokenKind::LParen)?;
 
         // Check for DISTINCT
@@ -452,7 +452,7 @@ impl<'a> Parser<'a> {
     ///
     /// Supports both simple CASE (CASE expr WHEN value THEN result)
     /// and searched CASE (CASE WHEN condition THEN result).
-    fn parse_case_expr(&mut self) -> Result<Expr, ParseError> {
+    fn parse_case_expr(&mut self) -> Result<Expr, SyntaxError> {
         // Check for simple CASE (has operand)
         let operand = if !self.check_keyword(Keyword::When) {
             Some(Box::new(self.parse_expr()?))
@@ -471,7 +471,7 @@ impl<'a> Parser<'a> {
 
         if when_clauses.is_empty() {
             let span = self.current_span();
-            return Err(ParseError::unexpected_token(
+            return Err(SyntaxError::unexpected_token(
                 "WHEN in CASE expression",
                 &self.current_token_name(),
                 span,
@@ -520,7 +520,7 @@ impl<'a> Parser<'a> {
 mod tests {
     use super::*;
 
-    fn parse_expr(input: &str) -> Result<Expr, ParseError> {
+    fn parse_expr(input: &str) -> Result<Expr, SyntaxError> {
         let mut parser = Parser::new(input);
         parser.parse_expr()
     }
