@@ -32,4 +32,4 @@ pub use buffer::{
 };
 pub use error::StorageError;
 pub use io::{FileStorage, MemoryStorage, Storage};
-pub use page::{PAGE_SIZE, PageData, PageId};
+pub use page::{PAGE_HEADER_SIZE, PAGE_SIZE, PAGE_VERSION, PageData, PageHeader, PageId, PageType};

@@ -4,8 +4,10 @@
 //! engine, including page identifiers and page data structures.
 
 pub mod data;
+pub mod header;
 
 pub use data::PageData;
+pub use header::{PageHeader, PageType, PAGE_HEADER_SIZE, PAGE_VERSION};
 
 /// 8KB page size (aligned with OS page size and PostgreSQL standard).
 pub const PAGE_SIZE: usize = 8192;

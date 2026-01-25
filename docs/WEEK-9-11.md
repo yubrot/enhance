@@ -1,0 +1,153 @@
+# Week 9-11: Slotted Page & Record Management
+
+> Implement the slotted page structure (header and slot array), binary serialization for records, and CRUD operations (Insert, Delete, Update) with free space reclamation.
+
+# This Week I Learned
+
+## Slotted (Heap) Page Design
+
+Fixed-size 8KB pages must store **variable-length records**. The slotted page structure solves this with a level of indirection: a **slot** is a fixed-size (4-byte) entry that points to a record's location within the page. Instead of storing records at fixed positions, each record is accessed through its slot index (SlotId). This indirection allows records to be relocated during compaction without changing their external identifier.
+
+The page is split into three regions that grow toward each other:
+
+```
++------------------+ offset 0
+| PageHeader (24B) |
++------------------+ offset 24
+| Slot Array       | (grows downward)
++------------------+
+|                  |
+| (Free Space)     |
+|                  |
++------------------+
+| Records          | (grows upward from bottom)
++------------------+ offset 8192
+```
+
+This layout maximizes space utilization. Records are stored from the page bottom upward, while the slot array grows downward from the header. Both grow toward the contiguous free space in the middle.
+
+The 24-byte header tracks page state, inspired by [PostgreSQL's PageHeaderData](https://www.postgresql.org/docs/current/storage-page-layout.html).
+
+### Slot Array and Free List
+
+Each slot is a 4-byte entry: `offset` (2 bytes) pointing to record data, and `length` (2 bytes) for record size. Using `offset = 0` marks deleted slots—valid records cannot start at offset 0 (that's where the header is), so 0 is a safe sentinel value.
+
+Deleted slots form a free list: `first_free_slot` in the header points to the first deleted slot, and each deleted slot's `length` field chains to the next (with `u16::MAX` indicating end of list). This enables:
+
+- **Insert**: Reuse slot from free list head (O(1)), or allocate new slot. Record is written at `free_end` (growing upward).
+- **Delete**: Mark slot empty, prepend to free list (O(1)). Record data remains until compaction.
+- **Update**: Overwrite in place if new ≤ old; otherwise allocate new space, leaving old as garbage.
+- **Compaction**: Rewrite valid records contiguously, update slot offsets. O(n), called only when fragmented insert fails.
+
+### Why Not Store Records Contiguously?
+
+Alternative designs like a simple heap with a free list have drawbacks:
+
+1. **External fragmentation**: Variable-length records leave gaps that may not fit new records
+2. **Compaction complexity**: Moving records requires updating all external references
+
+The slot array provides **record address stability**. The record id (page_id + slot_id) remains valid even when records are compacted or relocated—only the slot entry's offset changes.
+
+### Alignment
+
+Unlike PostgreSQL (which aligns records to MAXALIGN boundaries and pads values for CPU efficiency), we use no alignment—records are packed contiguously like SQLite. This trades CPU efficiency for space efficiency and simplicity. Modern x86/x64 CPUs handle misaligned access in hardware with minimal penalty (~10%), making this acceptable for a learning project.
+
+## Binary Serialization
+
+### Value Types
+
+The `Value` enum supports common PostgreSQL types with a compact binary format:
+
+| Type    | Size        | Format                |
+| ------- | ----------- | --------------------- |
+| Boolean | 1 byte      | 0 = false, 1 = true   |
+| Int16   | 2 bytes     | Little-endian         |
+| Int32   | 4 bytes     | Little-endian         |
+| Int64   | 8 bytes     | Little-endian         |
+| Float32 | 4 bytes     | IEEE 754 LE           |
+| Float64 | 8 bytes     | IEEE 754 LE           |
+| Text    | 4 + n bytes | Length prefix + UTF-8 |
+| Bytea   | 4 + n bytes | Length prefix + raw   |
+
+Using little-endian matches x86/x64 native byte order, avoiding conversion overhead on most systems.
+
+### Record Format
+
+A record is serialized as:
+
+```
++---------------------------+
+| Null Bitmap (ceil(n/8) B) |  bit=1: NOT NULL, bit=0: NULL
++---------------------------+
+| Value[0] (if not null)    |
+| Value[1] (if not null)    |
+| ...                       |
++---------------------------+
+```
+
+The null bitmap packs 8 columns per byte. This is more compact than storing a null indicator per column (1 bit vs 1+ bytes). NULL values consume no space beyond their bitmap bit.
+
+### Why Schema is Needed for Deserialization
+
+Unlike self-describing formats (JSON, MessagePack), this binary format requires the schema (column type OIDs) to deserialize. Trade-offs:
+
+**Compact format (our choice)**:
+
+- Smaller on-disk size (no type tags per value)
+- Faster serialization (no type tag writes)
+- Requires schema at read time
+
+**Self-describing format**:
+
+- Larger size (type tag per value)
+- Can deserialize without external schema
+- Useful for schema evolution
+
+For a database where schema is always available at query time, the compact format is preferred.
+
+# Looking Forward
+
+## Week 12: Minimal System Catalog
+
+The slotted page provides the storage primitive; next we need to persist **table metadata**. This includes:
+
+- Table names and IDs
+- Column definitions (name, type, constraints)
+- Reserved pages for catalog storage
+
+## Production Readiness Gaps
+
+### Overflow/TOAST Records
+
+Records larger than `PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE` (~8KB) cannot be stored. Production systems use:
+
+- **TOAST** (The Oversized-Attribute Storage Technique): Store large values in a separate table
+- **External storage**: Keep only a pointer in the main record
+
+### Checksums and Corruption Detection
+
+The header includes a `checksum` field, but checksum computation and validation are not yet implemented. Production systems:
+
+- Compute checksums on every page write
+- Validate checksums on every page read
+- Provide automatic repair hints or fallback to replicas
+
+### Slot Array Shrinking
+
+The current implementation never shrinks the slot array. `slot_count` only increases—deleted slots are reused via the free list but never removed.
+
+Production systems address this with:
+
+- **VACUUM FULL** (PostgreSQL): Rewrites the entire table, reassigning SlotIds
+- **Page-level recycling**: When all slots in a page are deleted, the page itself is returned to a free list
+- **Slot array compaction**: Periodically renumber slots (requires updating all index references)
+
+Our design prioritizes simplicity: record id (page_id + slot_id) remains stable after deletion, which simplifies index maintenance at the cost of space efficiency.
+
+### Defragmentation Strategies
+
+Current compaction is all-or-nothing. Smarter strategies:
+
+- **Incremental**: Compact one record per operation
+- **Background**: Async defragmentation during idle time
+- **Threshold-based**: Auto-compact when fragmentation > X%
