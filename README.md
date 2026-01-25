@@ -2,7 +2,7 @@
 
 enhance is a relational database management system (RDBMS) built from the ground up in Rust. The primary goal of this project is to bridge the gap between being a high-level database user and understanding the "magic" that happens beneath the surface of systems like PostgreSQL.
 
-This project is designed as a 6-month intensive learning journey, focusing on core database internals, asynchronous systems, and low-level memory management.
+This project is designed as an intensive learning journey, focusing on core database internals, asynchronous systems, and low-level memory management.
 
 ## Project Vision & Philosophy
 
@@ -13,73 +13,88 @@ This project is designed as a 6-month intensive learning journey, focusing on co
 
 ### Architectural Decisions
 
-| Component           | Decision                      | Rationale                                                                                 |
-| ------------------- | ----------------------------- | ----------------------------------------------------------------------------------------- |
-| Language & Runtime  | Rust + Tokio (Async)          | Deep dive into async Rust; suitable for handling concurrent database sessions.            |
-| Protocol            | PostgreSQL v3.0 (Handwritten) | Support for Extended Query Protocol (Parse/Bind/Execute) to work with modern drivers.     |
-| Storage Unit        | 8KB Fixed-size Pages          | Aligns with OS page sizes and PostgreSQL standards for efficient I/O.                     |
-| Storage Abstraction | Trait-based                   | Allows seamless switching between MemoryStorage and FileStorage (Disk).                   |
-| Concurrency Control | Page-level Latching           | High concurrency using Arc<RwLock<Page>>. Requires strict latch hierarchy.                |
-| Data Layout         | Slotted Page Structure        | Efficiently manages variable-length records within fixed 8KB pages.                       |
-| Parser              | Handwritten Recursive Descent | Deep learning of SQL-92 grammar without using parser generators.                          |
-| Execution Model     | Volcano Model                 | Standard iterator-based processing; composable and intuitive for single-query efficiency. |
+| Component           | Decision                           | Rationale                                                                                 |
+| ------------------- | ---------------------------------- | ----------------------------------------------------------------------------------------- |
+| Language & Runtime  | Rust + Tokio (Async)               | Deep dive into async Rust; suitable for handling concurrent database sessions.            |
+| Protocol            | PostgreSQL v3.0 (Handwritten)      | Support for Extended Query Protocol (Parse/Bind/Execute) to work with modern drivers.     |
+| Storage Unit        | 8KB Fixed-size Pages               | Aligns with OS page sizes and PostgreSQL standards for efficient I/O.                     |
+| Storage Abstraction | Trait-based                        | Allows seamless switching between MemoryStorage and FileStorage (Disk).                   |
+| Concurrency Control | Page-level Latching                | High concurrency using Arc<RwLock<Page>>. Requires strict latch hierarchy.                |
+| Transaction Model   | MVCC (Multi-Version)               | PostgreSQL-style xmin/xmax in tuple header. Readers never block writers.                  |
+| Isolation Level     | READ COMMITTED only                | Snapshot per statement. REPEATABLE READ/SERIALIZABLE out of scope for simplicity.         |
+| Row-Level Locking   | xmax-based with Deadlock Detection | FOR UPDATE/SHARE via tuple header. Wait-for graph for deadlock detection.                 |
+| Data Layout         | Slotted Page Structure             | Efficiently manages variable-length records within fixed 8KB pages.                       |
+| B+Tree Concurrency  | Latch Coupling (Crabbing)          | Acquire child latch before releasing parent. Enables concurrent tree traversal.           |
+| System Catalog      | Self-hosted Heap Tables            | Catalog tables stored as regular heap tuples with MVCC. No "faking" approach.             |
+| Parser              | Handwritten Recursive Descent      | Deep learning of SQL-92 grammar without using parser generators.                          |
+| Query Planner       | Rule-based                         | Simple predicate matching for index selection. Cost-based optimization out of scope.      |
+| Execution Model     | Volcano Model                      | Standard iterator-based processing; composable and intuitive for single-query efficiency. |
+| Durability          | WAL + REDO Recovery                | Write-ahead logging with checkpoint. UNDO not needed due to MVCC design.                  |
+| Storage Maintenance | VACUUM                             | Dead tuple cleanup essential for MVCC. Reclaims space within pages.                       |
 
 ### Technical Constraints & Guardrails
 
-- **Deadlock Prevention**: Since we use page-level locking, a strict Latch Hierarchy must be followed. Locks must always be acquired in a predetermined order (e.g., by Page ID) to avoid circular waits.
-- **System Catalog "Faking"**: Tools like `psql` query `pg_catalog` extensively upon connection. We will implement "dummy" responses for these system queries initially to maintain compatibility without over-engineering metadata.
+- **Latch Hierarchy**: Page-level latches must be acquired in a predetermined order (e.g., by Page ID) to prevent deadlocks. Row-level locks use wait-for graph for deadlock detection.
+- **Catalog Bootstrap**: System catalog tables must be initialized before any user operations. Catalog schema is hardcoded at startup, then stored as regular tuples.
 - **Async/Blocking I/O**: Standard file I/O is blocking. We will use `tokio::fs` and carefully manage the transition between async code and disk operations to avoid stalling the executor.
+- **Error Handling in Transactions**: When a statement fails within a transaction, the transaction enters an aborted state and only accepts ROLLBACK. No partial rollback or SAVEPOINT support.
 
-## 6-Month Detailed Roadmap (24 Weeks)
+## Detailed Roadmap
 
 ### Month 1: Networking & Extended Protocol Foundation
 
 Goal: Connect via `psql` and handle the stateful Parse/Bind/Execute flow.
 
-- ✅ Week 1: TCP Server & Handshake: Implement Tokio listener. Handle StartupMessage (Big Endian) and SSLRequest. Achieve a "Trust" authentication state.
-- ✅ Week 2: Simple Query Protocol: Handle the 'Q' message. Implement the basic loop to return CommandComplete.
-- ✅ Week 3-4: Extended Query Protocol (Parse/Bind/Execute): Implement stateful storage for PreparedStatement and Portal concept. Handle the complete flow from Parse, Describe, Bind, to Execute messages.
+1. ✅ TCP Server & Handshake: Implement Tokio listener. Handle StartupMessage (Big Endian) and SSLRequest. Achieve a "Trust" authentication state.
+2. ✅ Simple Query Protocol: Handle the 'Q' message. Implement the basic loop to return CommandComplete.
+3. ✅ Extended Query Protocol (Parse/Bind/Execute): Implement stateful storage for PreparedStatement and Portal concept. Handle the complete flow from Parse, Describe, Bind, to Execute messages.
 
 ### Month 2: Concurrent Storage Engine
 
 Goal: Manage 8KB pages safely across threads with disk persistence.
 
-- ✅ Week 5-6: Storage Trait & Implementations: Define the Storage trait. Implement memory-backed and file-backed storage for 8KB page I/O.
-- ✅ Week 7-8: Buffer Pool & LRU Policy: Implement fetch_page, unpin_page, and LRU eviction. Map PageId to memory Frames. Design latch hierarchy to ensure deadlock-free operation.
+4. ✅ Storage Trait & Implementations: Define the Storage trait. Implement memory-backed and file-backed storage for 8KB page I/O.
+5. ✅ Buffer Pool & LRU Policy: Implement fetch_page, unpin_page, and LRU eviction. Map PageId to memory Frames. Design latch hierarchy to ensure deadlock-free operation.
 
-### Month 3: Data Layout & Serialization
+### Month 3: Data Layout & Serialization & SQL Parsing
 
-Goal: Manage variable-length records within the 8KB limit.
+Goal: Manage variable-length records within the 8KB limit and parse SQL into AST.
 
-- ✅ Week 9-11: Slotted Page & Record Management: Implement the slotted page structure (header and slot array), binary serialization for records, and CRUD operations (Insert, Delete, Update) with free space reclamation.
-- Week 12: Minimal System Catalog: Implement a way to persist table definitions (schema) in a reserved page (e.g., Page 0).
+6. ✅ Slotted Page & Record Management: Implement the slotted page structure (header and slot array), binary serialization for records, and CRUD operations (Insert, Delete, Update) with free space reclamation.
+7. Lexer & Parser: Tokenize SQL strings. Implement recursive descent parser for CREATE TABLE, INSERT, SELECT, UPDATE, DELETE. Design AST structure.
 
-### Month 4: SQL Parsing & Execution Engine
+### Month 4: MVCC Foundation
 
-Goal: Turn SQL strings into a stream of rows using the Volcano Model.
+Goal: Establish MVCC infrastructure with transaction visibility and self-hosted catalog.
 
-- Week 13: Lexical Analyzer (Lexer): Tokenize SQL strings.
-- Week 14: Recursive Descent Parser: Support CREATE TABLE, INSERT, and SELECT (FROM/WHERE). Output an Abstract Syntax Tree (AST).
-- Week 15: Volcano Executor Interface: Define the Executor trait with a next() method. Implement SeqScan.
-- Week 16: Filter & Projection: Implement operators for the WHERE clause and column selection.
+8. MVCC Core: Transaction manager (TxId allocation, active transaction tracking, commit/abort state machine), tuple header extension (xmin/xmax/cid/infomask), Snapshot structure, visibility rules (`HeapTupleSatisfiesMVCC`). These components are tightly coupled and must be implemented together.
+9. System Catalog: Store table/column definitions as heap tuples with MVCC. Bootstrap reserved catalog tables (pg_class, pg_attribute equivalent). Implement auto-increment sequences for SERIAL columns.
 
-### Month 5: Advanced Operators & Indexing
+### Month 5: Query Execution
 
-Goal: Support table JOINS and speed up lookups with B+Trees.
+Goal: Execute queries with MVCC awareness.
 
-- Week 17: Join Syntax & Planning: Extend the parser and AST to handle multiple table references.
-- Week 18: Nested Loop Join: Implement the first join operator (iterating the inner table for every row of the outer).
-- Week 19: B+Tree Physical Layout: Design internal and leaf node structures as 8KB pages.
-- Week 20: B+Tree Logic (Search/Insert): Implement node splitting and the IndexScan operator.
+10. Basic Executor & EXPLAIN: Implement Volcano trait (`next() -> Option<Tuple>`), SeqScan (heap iteration with visibility check), Filter (WHERE evaluation), Projection (column selection), and EXPLAIN output for plan visualization.
+11. DML Operations: INSERT (set xmin), DELETE (set xmax), UPDATE (delete + insert as new version). Implement type coercion for mixed-type expressions.
+12. Sort & Aggregation: ORDER BY with in-memory sort, GROUP BY, aggregate functions (COUNT, SUM, AVG, MIN, MAX).
 
-### Month 6: Transactions (ACID) & Final Polish
+### Month 6: Durability
 
-Goal: Ensure reliability through WAL and measure performance.
+Goal: Crash recovery and storage maintenance.
 
-- Week 21: Write-Ahead Log (WAL): Implement log records and the fsync dance (log before data).
-- Week 22: Transaction Manager: Manage TransactionID and states (Running/Committed/Aborted).
-- Week 23: Crash Recovery: Implement the REDO logic to replay the WAL on startup.
-- Week 24: Benchmarking & Finalization: Run performance tests. Compare indexed vs. non-indexed scans. Celebrate.
+13. Write-Ahead Log: Log record types (INSERT/UPDATE/DELETE/COMMIT), WAL buffer management, write-ahead principle enforcement, fsync discipline.
+14. Checkpoint & Recovery: Dirty page tracking in buffer pool, checkpoint record writing, flush policy, REDO replay sequence on startup.
+15. VACUUM & FSM: Dead tuple identification via visibility rules, space reclamation within pages. Implement Free Space Map (FSM) as a separate structure tracking available space per heap page, enabling efficient page selection for INSERT operations.
+
+### Month 7: Indexing & Advanced Features
+
+Goal: Fast lookups, multi-table queries, and fine-grained concurrency.
+
+16. B+Tree Index: Internal/leaf node layout as 8KB pages, search algorithm, insert with node splitting.
+17. IndexScan, Planner & Constraints: Index traversal with visibility check. Simple rule-based planner for SeqScan vs IndexScan selection. Implement PRIMARY KEY and UNIQUE constraints using B+Tree index for uniqueness validation during INSERT/UPDATE.
+18. HOT (Heap-Only Tuples): Same-page UPDATE chains to avoid unnecessary index updates.
+19. Nested Loop Join: Iterate inner table for each outer row. Support equi-join predicates.
+20. Row-Level Lock: FOR UPDATE/FOR SHARE via xmax-based locking, wait queue for lock conflicts, deadlock detection (wait-for graph).
 
 ## Development Methodology
 
