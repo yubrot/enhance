@@ -251,9 +251,9 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> HeapPage<T> {
         }
     }
 
-    /// Initializes this page as a new empty data page.
+    /// Initializes this page as a new empty heap page.
     ///
-    /// This zeroes the page and writes an empty data page header.
+    /// This zeroes the page and writes an empty heap page header.
     pub fn init(&mut self) {
         self.data_mut().fill(0);
         PageHeader::new_heap_page().write(&mut self.data_mut()[..PAGE_HEADER_SIZE]);
