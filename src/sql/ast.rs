@@ -34,27 +34,6 @@ pub enum Statement {
     Explain(Box<Statement>),
 }
 
-impl Statement {
-    /// Returns the command tag for PostgreSQL's CommandComplete message.
-    pub fn command_tag(&self) -> &'static str {
-        match self {
-            Statement::Select(_) => "SELECT",
-            Statement::Insert(_) => "INSERT",
-            Statement::Update(_) => "UPDATE",
-            Statement::Delete(_) => "DELETE",
-            Statement::CreateTable(_) => "CREATE TABLE",
-            Statement::DropTable(_) => "DROP TABLE",
-            Statement::CreateIndex(_) => "CREATE INDEX",
-            Statement::DropIndex(_) => "DROP INDEX",
-            Statement::Begin => "BEGIN",
-            Statement::Commit => "COMMIT",
-            Statement::Rollback => "ROLLBACK",
-            Statement::Set(_) => "SET",
-            Statement::Explain(_) => "EXPLAIN",
-        }
-    }
-}
-
 /// SELECT statement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
@@ -88,10 +67,7 @@ pub enum SelectItem {
     /// SELECT table.* - all columns from a table.
     QualifiedWildcard(String),
     /// An expression with optional alias.
-    Expr {
-        expr: Expr,
-        alias: Option<String>,
-    },
+    Expr { expr: Expr, alias: Option<String> },
 }
 
 /// FROM clause.
@@ -105,10 +81,7 @@ pub struct FromClause {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableRef {
     /// Simple table reference.
-    Table {
-        name: String,
-        alias: Option<String>,
-    },
+    Table { name: String, alias: Option<String> },
     /// Join between tables.
     Join {
         left: Box<TableRef>,
@@ -433,10 +406,7 @@ pub enum Expr {
         operand: Box<Expr>,
     },
     /// IS NULL / IS NOT NULL.
-    IsNull {
-        expr: Box<Expr>,
-        negated: bool,
-    },
+    IsNull { expr: Box<Expr>, negated: bool },
     /// IN list: expr [NOT] IN (value1, value2, ...).
     InList {
         expr: Box<Expr>,
@@ -488,8 +458,6 @@ pub enum Expr {
     },
     /// Subquery expression (scalar subquery).
     Subquery(Box<SelectStmt>),
-    /// Parenthesized expression.
-    Nested(Box<Expr>),
 }
 
 /// A WHEN clause in a CASE expression.
@@ -588,13 +556,6 @@ impl UnaryOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_statement_command_tag() {
-        assert_eq!(Statement::Begin.command_tag(), "BEGIN");
-        assert_eq!(Statement::Commit.command_tag(), "COMMIT");
-        assert_eq!(Statement::Rollback.command_tag(), "ROLLBACK");
-    }
 
     #[test]
     fn test_data_type_display() {

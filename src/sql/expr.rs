@@ -358,7 +358,7 @@ impl<'a> Parser<'a> {
 
             let expr = self.parse_expr()?;
             self.expect_token(TokenKind::RParen)?;
-            return Ok(Expr::Nested(Box::new(expr)));
+            return Ok(expr);
         }
 
         // Identifier (column reference or function call)
@@ -674,12 +674,14 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_expr() {
+    fn test_parenthesized_expr() {
+        // Parentheses control precedence but don't create AST nodes
         let expr = parse_expr("(1 + 2) * 3").unwrap();
         match expr {
             Expr::BinaryOp { op, left, .. } => {
                 assert_eq!(op, BinaryOperator::Mul);
-                assert!(matches!(*left, Expr::Nested(_)));
+                // Inner expression is directly BinaryOp, not wrapped in Nested
+                assert!(matches!(*left, Expr::BinaryOp { op: BinaryOperator::Add, .. }));
             }
             _ => panic!("expected BinaryOp"),
         }

@@ -29,7 +29,6 @@ impl PsqlOutput {
     }
 
     /// Asserts that the output contains the given substring.
-    #[allow(dead_code)]
     pub fn assert_output_contains(&self, expected: &str) {
         assert!(
             self.output.contains(expected),
@@ -40,14 +39,12 @@ impl PsqlOutput {
     }
 
     /// Asserts that the output contains any of the given substrings.
-    #[allow(dead_code)]
     pub fn assert_contains_any(&self, expected: &[&str]) {
         let contains_any = expected.iter().any(|s| self.output.contains(s));
         assert!(
             contains_any,
             "output should contain one of {:?}: {}",
-            expected,
-            self.output
+            expected, self.output
         );
     }
 }
