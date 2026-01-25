@@ -16,7 +16,7 @@ use crate::protocol::type_oid;
 /// - Numeric/Decimal type for exact decimal arithmetic
 /// - Date/Time types
 /// - Array types
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
 pub enum Value {
     /// SQL NULL (type is unknown/any).
     Null,

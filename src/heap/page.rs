@@ -26,6 +26,9 @@
 use super::error::HeapError;
 use crate::storage::{PAGE_HEADER_SIZE, PAGE_SIZE, PageHeader};
 
+// Should be able to insert a max-sized record
+pub const MAX_RECORD_SIZE: usize = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE;
+
 /// Size of each slot entry in bytes.
 pub const SLOT_SIZE: usize = 4;
 
@@ -631,9 +634,6 @@ mod tests {
     #[test]
     fn test_max_record_size() {
         let mut page = create_page();
-
-        // Should be able to insert a max-sized record
-        const MAX_RECORD_SIZE: usize = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE;
 
         let max_record = vec![0u8; MAX_RECORD_SIZE];
         let slot = page.insert(&max_record).unwrap();

@@ -36,22 +36,22 @@ This project is designed as a 6-month intensive learning journey, focusing on co
 
 Goal: Connect via `psql` and handle the stateful Parse/Bind/Execute flow.
 
-- Week 1: TCP Server & Handshake: Implement Tokio listener. Handle StartupMessage (Big Endian) and SSLRequest. Achieve a "Trust" authentication state. ✅
-- Week 2: Simple Query Protocol: Handle the 'Q' message. Implement the basic loop to return CommandComplete. ✅
-- Week 3-4: Extended Query Protocol (Parse/Bind/Execute): Implement stateful storage for PreparedStatement and Portal concept. Handle the complete flow from Parse, Describe, Bind, to Execute messages. ✅
+- ✅ Week 1: TCP Server & Handshake: Implement Tokio listener. Handle StartupMessage (Big Endian) and SSLRequest. Achieve a "Trust" authentication state.
+- ✅ Week 2: Simple Query Protocol: Handle the 'Q' message. Implement the basic loop to return CommandComplete.
+- ✅ Week 3-4: Extended Query Protocol (Parse/Bind/Execute): Implement stateful storage for PreparedStatement and Portal concept. Handle the complete flow from Parse, Describe, Bind, to Execute messages.
 
 ### Month 2: Concurrent Storage Engine
 
 Goal: Manage 8KB pages safely across threads with disk persistence.
 
-- Week 5-6: Storage Trait & Implementations: Define the Storage trait. Implement memory-backed and file-backed storage for 8KB page I/O. ✅
-- Week 7-8: Buffer Pool & LRU Policy: Implement fetch_page, unpin_page, and LRU eviction. Map PageId to memory Frames. Design latch hierarchy to ensure deadlock-free operation. ✅
+- ✅ Week 5-6: Storage Trait & Implementations: Define the Storage trait. Implement memory-backed and file-backed storage for 8KB page I/O.
+- ✅ Week 7-8: Buffer Pool & LRU Policy: Implement fetch_page, unpin_page, and LRU eviction. Map PageId to memory Frames. Design latch hierarchy to ensure deadlock-free operation.
 
 ### Month 3: Data Layout & Serialization
 
 Goal: Manage variable-length records within the 8KB limit.
 
-- Week 9-11: Slotted Page & Record Management: Implement the slotted page structure (header and slot array), binary serialization for records, and CRUD operations (Insert, Delete, Update) with free space reclamation.
+- ✅ Week 9-11: Slotted Page & Record Management: Implement the slotted page structure (header and slot array), binary serialization for records, and CRUD operations (Insert, Delete, Update) with free space reclamation.
 - Week 12: Minimal System Catalog: Implement a way to persist table definitions (schema) in a reserved page (e.g., Page 0).
 
 ### Month 4: SQL Parsing & Execution Engine
