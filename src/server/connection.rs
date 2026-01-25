@@ -11,8 +11,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::protocol::{
     BackendMessage, BindMessage, CloseMessage, CloseTarget, DescribeMessage, DescribeTarget,
-    ExecuteMessage, FrontendMessage, ParseMessage, PostgresCodec, TransactionStatus, sql_state,
+    ErrorInfo, ExecuteMessage, FrontendMessage, ParseMessage, PostgresCodec, TransactionStatus,
+    sql_state,
 };
+use crate::sql::{Parser, Statement};
 
 /// A single client connection.
 ///
@@ -42,43 +44,24 @@ impl Connection {
         }
     }
 
-    /// Classify a query and return the appropriate command completion tag.
-    /// Returns None if the query is empty (should send EmptyQueryResponse).
+    /// Returns the command completion tag for a statement.
     ///
-    /// NOTE: This is a stub implementation. Real SQL parsing comes in Weeks 13-14.
-    fn classify_query(query: &str) -> Option<&'static str> {
-        let query = query.trim();
-
-        if query.is_empty() {
-            return None;
-        }
-
-        // Use case-insensitive ASCII comparison without allocation
-        if query.len() >= 6 && query[..6].eq_ignore_ascii_case("SELECT") {
-            Some("SELECT 0")
-        } else if query.len() >= 3 && query[..3].eq_ignore_ascii_case("SET") {
-            Some("SET")
-        } else if query.len() >= 12 && query[..12].eq_ignore_ascii_case("CREATE TABLE") {
-            Some("CREATE TABLE")
-        } else if query.len() >= 6 && query[..6].eq_ignore_ascii_case("CREATE") {
-            Some("CREATE")
-        } else if query.len() >= 6 && query[..6].eq_ignore_ascii_case("INSERT") {
-            Some("INSERT 0 0")
-        } else if query.len() >= 6 && query[..6].eq_ignore_ascii_case("UPDATE") {
-            Some("UPDATE 0")
-        } else if query.len() >= 6 && query[..6].eq_ignore_ascii_case("DELETE") {
-            Some("DELETE 0")
-        } else if (query.len() >= 5 && query[..5].eq_ignore_ascii_case("BEGIN"))
-            || (query.len() >= 17 && query[..17].eq_ignore_ascii_case("START TRANSACTION"))
-        {
-            Some("BEGIN")
-        } else if query.len() >= 6 && query[..6].eq_ignore_ascii_case("COMMIT") {
-            Some("COMMIT")
-        } else if query.len() >= 8 && query[..8].eq_ignore_ascii_case("ROLLBACK") {
-            Some("ROLLBACK")
-        } else {
-            // Unknown query type
-            Some("UNKNOWN")
+    /// NOTE: Row counts are stubbed to 0 for now. Real execution comes in later steps.
+    fn command_tag(stmt: &Statement) -> String {
+        match stmt {
+            Statement::Select(_) => "SELECT 0".to_string(),
+            Statement::Insert(_) => "INSERT 0 0".to_string(),
+            Statement::Update(_) => "UPDATE 0".to_string(),
+            Statement::Delete(_) => "DELETE 0".to_string(),
+            Statement::CreateTable(_) => "CREATE TABLE".to_string(),
+            Statement::DropTable(_) => "DROP TABLE".to_string(),
+            Statement::CreateIndex(_) => "CREATE INDEX".to_string(),
+            Statement::DropIndex(_) => "DROP INDEX".to_string(),
+            Statement::Begin => "BEGIN".to_string(),
+            Statement::Commit => "COMMIT".to_string(),
+            Statement::Rollback => "ROLLBACK".to_string(),
+            Statement::Set(_) => "SET".to_string(),
+            Statement::Explain(_) => "EXPLAIN".to_string(),
         }
     }
 
@@ -109,7 +92,7 @@ impl Connection {
 
         match message {
             FrontendMessage::Query(query) => {
-                self.handle_query(query.trim()).await?;
+                self.handle_query(&query).await?;
             }
             FrontendMessage::Terminate => return Ok(true),
             FrontendMessage::Parse(_)
@@ -146,50 +129,38 @@ impl Connection {
         Ok(false)
     }
 
-    /// Handle a query from the client.
+    /// Handle a query from the client (Simple Query Protocol).
     ///
-    /// NOTE: This is a minimal implementation that returns dummy responses.
-    /// Real SQL parsing and execution will be implemented in Weeks 13-14.
+    /// Parses the SQL, and returns appropriate responses.
+    /// NOTE: Actual execution is stubbed - real execution comes in later steps.
     async fn handle_query(&mut self, query: &str) -> Result<(), ConnectionError> {
         println!("(pid={}) Query: {}", self.pid, query);
 
-        match Self::classify_query(query) {
-            None => {
+        match Parser::new(query).parse() {
+            Ok(None) => {
                 // Empty query
                 self.framed.send(BackendMessage::EmptyQueryResponse).await?;
             }
-            Some("SELECT 0") => {
-                // SELECT: return empty result set
-                // https://www.postgresql.org/docs/current/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-COMMANDCOMPLETE
+            Ok(Some(stmt)) => {
+                // Successfully parsed
+                let tag = Self::command_tag(&stmt);
+
+                // For SELECT, send RowDescription before CommandComplete
+                if matches!(stmt, Statement::Select(_)) {
+                    self.framed
+                        .send(BackendMessage::RowDescription { fields: vec![] })
+                        .await?;
+                }
+
                 self.framed
-                    .send(BackendMessage::RowDescription { fields: vec![] })
-                    .await?;
-                self.framed
-                    .send(BackendMessage::CommandComplete {
-                        tag: "SELECT 0".to_string(),
-                    })
+                    .send(BackendMessage::CommandComplete { tag })
                     .await?;
             }
-            Some("UNKNOWN") => {
-                // Unknown query type - return error
-                // https://www.postgresql.org/docs/current/protocol-error-fields.html
-                self.send_error(
-                    sql_state::SYNTAX_ERROR,
-                    format!(
-                        "Unrecognized query type: {}",
-                        query.chars().take(50).collect::<String>()
-                    ),
-                    false,
-                )
-                .await?;
-            }
-            Some(tag) => {
-                // All other recognized query types
-                self.framed
-                    .send(BackendMessage::CommandComplete {
-                        tag: tag.to_string(),
-                    })
-                    .await?;
+            Err(err) => {
+                // Parse error - send error response with position
+                let error = ErrorInfo::new(sql_state::SYNTAX_ERROR, &err.message)
+                    .with_position(err.position());
+                self.framed.send(error.into()).await?;
             }
         }
 
@@ -211,10 +182,25 @@ impl Connection {
             self.pid, msg.statement_name, msg.query
         );
 
+        // Parse the SQL
+        let ast = match Parser::new(&msg.query).parse() {
+            Ok(Some(ast)) => ast,
+            Ok(None) => {
+                // Empty query not allowed in Extended Query Protocol
+                let error = ErrorInfo::new(sql_state::SYNTAX_ERROR, "empty query");
+                return self.send_error(error, true).await;
+            }
+            Err(err) => {
+                // Parse error - send error response with position
+                let error = ErrorInfo::new(sql_state::SYNTAX_ERROR, &err.message)
+                    .with_position(err.position());
+                return self.send_error(error, true).await;
+            }
+        };
+
         // Store the prepared statement
-        // NOTE: In future weeks, this is where SQL parsing/validation happens
         let stmt = PreparedStatement {
-            query: msg.query,
+            ast,
             param_types: msg.param_types,
         };
         self.state.put_statement(msg.statement_name, stmt);
@@ -233,16 +219,14 @@ impl Connection {
 
         // Verify statement exists
         if self.state.get_statement(&msg.statement_name).is_none() {
-            return self
-                .send_error(
-                    sql_state::INVALID_SQL_STATEMENT_NAME,
-                    format!(
-                        "prepared statement \"{}\" does not exist",
-                        msg.statement_name
-                    ),
-                    true,
-                )
-                .await;
+            let error = ErrorInfo::new(
+                sql_state::INVALID_SQL_STATEMENT_NAME,
+                format!(
+                    "prepared statement \"{}\" does not exist",
+                    msg.statement_name
+                ),
+            );
+            return self.send_error(error, true).await;
         }
 
         // Create portal
@@ -268,13 +252,11 @@ impl Connection {
         match msg.target_type {
             DescribeTarget::Statement => {
                 let Some(stmt) = self.state.get_statement(&msg.name) else {
-                    return self
-                        .send_error(
-                            sql_state::INVALID_SQL_STATEMENT_NAME,
-                            format!("prepared statement \"{}\" does not exist", msg.name),
-                            true,
-                        )
-                        .await;
+                    let error = ErrorInfo::new(
+                        sql_state::INVALID_SQL_STATEMENT_NAME,
+                        format!("prepared statement \"{}\" does not exist", msg.name),
+                    );
+                    return self.send_error(error, true).await;
                 };
 
                 // Send ParameterDescription
@@ -290,13 +272,11 @@ impl Connection {
             }
             DescribeTarget::Portal => {
                 let Some(_portal) = self.state.get_portal(&msg.name) else {
-                    return self
-                        .send_error(
-                            sql_state::INVALID_CURSOR_NAME,
-                            format!("portal \"{}\" does not exist", msg.name),
-                            true,
-                        )
-                        .await;
+                    let error = ErrorInfo::new(
+                        sql_state::INVALID_CURSOR_NAME,
+                        format!("portal \"{}\" does not exist", msg.name),
+                    );
+                    return self.send_error(error, true).await;
                 };
 
                 // For stub: Send NoData (no result columns yet)
@@ -314,41 +294,27 @@ impl Connection {
         );
 
         let Some(portal) = self.state.get_portal(&msg.portal_name) else {
-            return self
-                .send_error(
-                    sql_state::INVALID_CURSOR_NAME,
-                    format!("portal \"{}\" does not exist", msg.portal_name),
-                    true,
-                )
-                .await;
+            let error = ErrorInfo::new(
+                sql_state::INVALID_CURSOR_NAME,
+                format!("portal \"{}\" does not exist", msg.portal_name),
+            );
+            return self.send_error(error, true).await;
         };
 
         let Some(stmt) = self.state.get_statement(&portal.statement_name) else {
-            return self
-                .send_error(
-                    sql_state::INVALID_SQL_STATEMENT_NAME,
-                    "statement for portal does not exist".to_string(),
-                    true,
-                )
-                .await;
+            let error = ErrorInfo::new(
+                sql_state::INVALID_SQL_STATEMENT_NAME,
+                "statement for portal does not exist",
+            );
+            return self.send_error(error, true).await;
         };
 
-        // Stub execution - classify query and return appropriate response
-        // NOTE: Uses same classification as handle_query() - real execution comes later
-        match Self::classify_query(&stmt.query) {
-            None => {
-                // Empty query
-                self.framed.send(BackendMessage::EmptyQueryResponse).await?;
-            }
-            Some(tag) => {
-                // All query types return CommandComplete (errors ignored in extended protocol)
-                self.framed
-                    .send(BackendMessage::CommandComplete {
-                        tag: tag.to_string(),
-                    })
-                    .await?;
-            }
-        }
+        // Stub execution - use stored AST to determine response
+        // NOTE: Real execution comes in later steps
+        let tag = Self::command_tag(&stmt.ast);
+        self.framed
+            .send(BackendMessage::CommandComplete { tag })
+            .await?;
 
         Ok(())
     }
@@ -396,13 +362,10 @@ impl Connection {
     /// Execute, Close) are skipped until Sync.
     async fn send_error(
         &mut self,
-        code: &str,
-        message: String,
+        error: ErrorInfo,
         into_error_state: bool,
     ) -> Result<(), ConnectionError> {
-        self.framed
-            .send(BackendMessage::error(code, message))
-            .await?;
+        self.framed.send(error.into()).await?;
         self.state.in_error = into_error_state;
         Ok(())
     }

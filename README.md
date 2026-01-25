@@ -61,7 +61,7 @@ Goal: Manage 8KB pages safely across threads with disk persistence.
 Goal: Manage variable-length records within the 8KB limit and parse SQL into AST.
 
 6. ✅ Slotted Page & Record Management: Implement the slotted page structure (header and slot array), binary serialization for records, and CRUD operations (Insert, Delete, Update) with free space reclamation.
-7. Lexer & Parser: Tokenize SQL strings. Implement recursive descent parser for CREATE TABLE, INSERT, SELECT, UPDATE, DELETE. Design AST structure.
+7. ✅ Lexer & Parser: Tokenize SQL strings. Implement recursive descent parser for CREATE TABLE, INSERT, SELECT, UPDATE, DELETE. Design AST structure.
 
 ### Month 4: MVCC Foundation
 

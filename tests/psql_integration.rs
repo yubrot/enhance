@@ -209,3 +209,40 @@ SELECT 1 \parse stmt1
     // so subsequent parse/bind/execute succeed
     result.assert_success();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_syntax_error_with_position() {
+    let server = PsqlTestServer::start().await;
+
+    // Test that syntax errors include position information
+    let result = server.run_psql(r#"SELECT FROM "users";"#);
+    // psql displays position with caret (^) pointing to error location
+    result.assert_output_contains(
+        r#"
+LINE 1: SELECT FROM "users";
+               ^"#,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_complex_select() {
+    let server = PsqlTestServer::start().await;
+
+    // Test that complex SELECT statements parse correctly
+    let result = server.run_psql(
+        "SELECT id, name, age FROM users WHERE active = TRUE AND age >= 18 ORDER BY name ASC LIMIT 10;",
+    );
+    // psql shows "(0 rows)" for empty result sets
+    result.assert_success();
+    result.assert_output_contains("(0 rows)");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_comments() {
+    let server = PsqlTestServer::start().await;
+
+    // Test that SQL comments are handled correctly
+    let result = server.run_psql("SELECT 1 /* this is a comment */ + 2; -- line comment");
+    result.assert_success();
+    result.assert_output_contains("(0 rows)");
+}

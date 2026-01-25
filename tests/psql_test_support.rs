@@ -29,7 +29,6 @@ impl PsqlOutput {
     }
 
     /// Asserts that the output contains the given substring.
-    #[allow(dead_code)]
     pub fn assert_output_contains(&self, expected: &str) {
         assert!(
             self.output.contains(expected),

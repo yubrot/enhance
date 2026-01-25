@@ -73,42 +73,6 @@ pub enum BackendMessage {
 }
 
 impl BackendMessage {
-    /// Creates an error response with the given SQL state code and message.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// use enhance::protocol::{BackendMessage, sql_state};
-    ///
-    /// let query = "INVALID SYNTAX";
-    /// let msg = BackendMessage::error(
-    ///     sql_state::SYNTAX_ERROR,
-    ///     format!("Unrecognized query type: {}", query)
-    /// );
-    /// ```
-    pub fn error(sql_state: &str, message: impl Into<String>) -> Self {
-        BackendMessage::ErrorResponse {
-            fields: vec![
-                ErrorField {
-                    code: ErrorFieldCode::Severity,
-                    value: "ERROR".to_string(),
-                },
-                ErrorField {
-                    code: ErrorFieldCode::SeverityNonLocalized,
-                    value: "ERROR".to_string(),
-                },
-                ErrorField {
-                    code: ErrorFieldCode::SqlState,
-                    value: sql_state.to_string(),
-                },
-                ErrorField {
-                    code: ErrorFieldCode::Message,
-                    value: message.into(),
-                },
-            ],
-        }
-    }
-
     /// Returns the message type byte.
     fn ty(&self) -> u8 {
         match self {
@@ -249,10 +213,100 @@ pub struct ErrorField {
 }
 
 impl ErrorField {
+    /// Creates a new error field.
+    pub fn new(code: ErrorFieldCode, value: impl Into<String>) -> Self {
+        Self {
+            code,
+            value: value.into(),
+        }
+    }
+
     /// Encodes this error field into the given BytesMut buffer.
     fn encode(&self, dst: &mut BytesMut) {
         dst.put_u8(self.code.as_u8());
         put_cstring(dst, &self.value);
+    }
+}
+
+/// Structured error information for PostgreSQL error responses.
+///
+/// PostgreSQL error responses have required fields (severity, SQL state, message)
+/// and optional fields (position, detail, hint, etc.). This struct provides a
+/// builder-style API for constructing well-formed error responses.
+///
+/// # Examples
+///
+/// ```rust
+/// use enhance::protocol::{ErrorInfo, sql_state};
+///
+/// // Simple error (severity defaults to "ERROR")
+/// let err = ErrorInfo::new(sql_state::UNDEFINED_TABLE, "table does not exist");
+///
+/// // Error with position (for syntax errors)
+/// let err = ErrorInfo::new(sql_state::SYNTAX_ERROR, "unexpected token")
+///     .with_position(15);
+///
+/// // Fatal error
+/// let err = ErrorInfo::new(sql_state::CONNECTION_EXCEPTION, "connection lost")
+///     .with_severity("FATAL");
+/// ```
+#[derive(Debug, Clone)]
+pub struct ErrorInfo {
+    /// Severity level (ERROR, FATAL, PANIC, WARNING, NOTICE, DEBUG, INFO, LOG)
+    pub severity: &'static str,
+    /// SQLSTATE code (e.g., "42P01" for undefined table)
+    pub code: &'static str,
+    /// Primary human-readable error message
+    pub message: String,
+    /// Error cursor position in the original query string (1-indexed)
+    pub position: Option<usize>,
+}
+
+impl ErrorInfo {
+    /// Creates a new error with the required fields.
+    ///
+    /// Severity defaults to "ERROR".
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            severity: "ERROR",
+            code,
+            message: message.into(),
+            position: None,
+        }
+    }
+
+    /// Sets the severity level.
+    ///
+    /// Common values: "ERROR", "FATAL", "PANIC", "WARNING", "NOTICE", "DEBUG", "INFO", "LOG"
+    pub fn with_severity(mut self, severity: &'static str) -> Self {
+        self.severity = severity;
+        self
+    }
+
+    /// Adds position information to this error.
+    ///
+    /// The position is 1-indexed, indicating the character position in the
+    /// original query string where the error occurred.
+    pub fn with_position(mut self, position: usize) -> Self {
+        self.position = Some(position);
+        self
+    }
+}
+
+impl From<ErrorInfo> for BackendMessage {
+    fn from(info: ErrorInfo) -> Self {
+        let mut fields = vec![
+            ErrorField::new(ErrorFieldCode::Severity, info.severity),
+            ErrorField::new(ErrorFieldCode::SeverityNonLocalized, info.severity),
+            ErrorField::new(ErrorFieldCode::SqlState, info.code),
+            ErrorField::new(ErrorFieldCode::Message, info.message),
+        ];
+
+        if let Some(pos) = info.position {
+            fields.push(ErrorField::new(ErrorFieldCode::Position, pos.to_string()));
+        }
+
+        BackendMessage::ErrorResponse { fields }
     }
 }
 
@@ -386,7 +440,8 @@ mod tests {
 
     #[test]
     fn test_write_error_response() {
-        let msg = BackendMessage::error(sql_state::UNDEFINED_TABLE, "table does not exist");
+        let error = ErrorInfo::new(sql_state::UNDEFINED_TABLE, "table does not exist");
+        let msg: BackendMessage = error.into();
         let buf = encode_message(msg);
 
         assert_eq!(buf[0], b'E');
@@ -402,6 +457,19 @@ mod tests {
         assert_eq!(buf[26], b'M'); // Message
         assert_eq!(&buf[27..48], b"table does not exist\x00");
         assert_eq!(buf[48], 0); // terminator
+    }
+
+    #[test]
+    fn test_write_error_response_with_position() {
+        let error = ErrorInfo::new(sql_state::SYNTAX_ERROR, "unexpected token").with_position(15);
+        let msg: BackendMessage = error.into();
+        let buf = encode_message(msg);
+
+        assert_eq!(buf[0], b'E');
+        // Verify position field is included
+        // Fields: S=ERROR(7), V=ERROR(7), C=42601(7), M=unexpected token(18), P=15(4)
+        // Total: 4 + 7 + 7 + 7 + 18 + 4 + 1 = 48
+        assert_eq!(read_i32(&buf, 1), 48);
     }
 
     #[test]

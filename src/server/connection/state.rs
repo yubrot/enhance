@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::protocol::FormatCode;
+use crate::sql::Statement;
 
 /// Per-connection state for Extended Query Protocol.
 ///
@@ -69,9 +70,9 @@ impl ConnectionState {
 /// A prepared statement stored on the connection.
 #[derive(Debug, Clone)]
 pub struct PreparedStatement {
-    /// The original SQL query
-    pub query: String,
-    /// Parameter type OIDs (may be inferred later)
+    /// Parsed AST.
+    pub ast: Statement,
+    /// Parameter type OIDs (may be inferred later).
     pub param_types: Vec<i32>,
 }
 
@@ -92,18 +93,31 @@ pub struct Portal {
 mod tests {
     use super::*;
 
+    fn dummy_stmt() -> PreparedStatement {
+        use crate::sql::{SelectItem, SelectStmt};
+        PreparedStatement {
+            ast: Statement::Select(Box::new(SelectStmt {
+                distinct: false,
+                columns: vec![SelectItem::Wildcard],
+                from: None,
+                where_clause: None,
+                group_by: vec![],
+                having: None,
+                order_by: vec![],
+                limit: None,
+                offset: None,
+                locking: None,
+            })),
+            param_types: vec![],
+        }
+    }
+
     #[test]
     fn test_statement_lifecycle() {
         let mut state = ConnectionState::new();
 
         // Create statement
-        state.put_statement(
-            "test".to_string(),
-            PreparedStatement {
-                query: "SELECT 1".to_string(),
-                param_types: vec![],
-            },
-        );
+        state.put_statement("test".to_string(), dummy_stmt());
 
         assert!(state.get_statement("test").is_some());
         assert!(state.get_statement("nonexistent").is_none());
@@ -118,13 +132,7 @@ mod tests {
         let mut state = ConnectionState::new();
 
         // Create named statement
-        state.put_statement(
-            "stmt".to_string(),
-            PreparedStatement {
-                query: "SELECT 1".to_string(),
-                param_types: vec![],
-            },
-        );
+        state.put_statement("stmt".to_string(), dummy_stmt());
 
         // Create portal from named statement
         state.put_portal(
@@ -140,13 +148,7 @@ mod tests {
         assert!(state.get_portal("portal1").is_some());
 
         // Replace named statement - should also close dependent portals
-        state.put_statement(
-            "stmt".to_string(),
-            PreparedStatement {
-                query: "SELECT 2".to_string(),
-                param_types: vec![],
-            },
-        );
+        state.put_statement("stmt".to_string(), dummy_stmt());
 
         assert!(state.get_portal("portal1").is_none());
     }
@@ -156,20 +158,8 @@ mod tests {
         let mut state = ConnectionState::new();
 
         // Create both named and unnamed statements
-        state.put_statement(
-            "".to_string(),
-            PreparedStatement {
-                query: "SELECT 1".to_string(),
-                param_types: vec![],
-            },
-        );
-        state.put_statement(
-            "named".to_string(),
-            PreparedStatement {
-                query: "SELECT 2".to_string(),
-                param_types: vec![],
-            },
-        );
+        state.put_statement("".to_string(), dummy_stmt());
+        state.put_statement("named".to_string(), dummy_stmt());
 
         // Create both named and unnamed portals
         state.put_portal(
