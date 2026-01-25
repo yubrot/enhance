@@ -92,6 +92,9 @@ pub enum TokenKind {
 
     /// End of file/input.
     Eof,
+
+    /// Lexer error (e.g., unterminated string, invalid character).
+    Error(String),
 }
 
 impl TokenKind {
@@ -125,6 +128,7 @@ impl TokenKind {
             TokenKind::Dot => "'.'".to_string(),
             TokenKind::Colon => "':'".to_string(),
             TokenKind::Eof => "end of input".to_string(),
+            TokenKind::Error(msg) => format!("error: {msg}"),
         }
     }
 }

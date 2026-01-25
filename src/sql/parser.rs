@@ -22,11 +22,9 @@ pub struct Parser<'a> {
 impl<'a> Parser<'a> {
     /// Creates a new parser for the given SQL input.
     pub fn new(input: &'a str) -> Self {
-        let mut lexer = Lexer::new(input);
-        let tokens = lexer.tokenize();
-
-        // NOTE: Lexer errors are accumulated and could be checked here.
-        // For simplicity, we proceed with whatever tokens we got.
+        // NOTE: Lexer errors are returned as TokenKind::Error tokens.
+        // The parser will report them as syntax errors when encountered.
+        let tokens = Lexer::new(input).collect();
 
         Self {
             tokens,
