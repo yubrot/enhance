@@ -218,6 +218,8 @@ pub struct CreateTableStmt {
     pub columns: Vec<ColumnDef>,
     /// Table-level constraints.
     pub constraints: Vec<TableConstraint>,
+    /// If true, don't error if table already exists.
+    pub if_not_exists: bool,
 }
 
 /// Column definition.

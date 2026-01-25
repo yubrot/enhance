@@ -200,6 +200,7 @@ impl<'a> Parser<'a> {
 
     /// Parses a CREATE TABLE statement.
     fn parse_create_table_stmt(&mut self) -> Result<Statement, SyntaxError> {
+        let if_not_exists = self.parse_if_not_exists()?;
         let name = self.expect_identifier()?;
 
         self.expect_token(TokenKind::LParen)?;
@@ -231,6 +232,7 @@ impl<'a> Parser<'a> {
             name,
             columns,
             constraints,
+            if_not_exists,
         })))
     }
 
@@ -819,13 +821,7 @@ impl<'a> Parser<'a> {
     /// Parses a DROP TABLE statement.
     fn parse_drop_table_stmt(&mut self) -> Result<Statement, SyntaxError> {
         // DROP TABLE [IF EXISTS] name
-        let if_exists = if self.consume_keyword(Keyword::If) {
-            self.expect_keyword(Keyword::Exists)?;
-            true
-        } else {
-            false
-        };
-
+        let if_exists = self.parse_if_exists()?;
         let name = self.expect_identifier()?;
 
         Ok(Statement::DropTable(DropTableStmt { name, if_exists }))
@@ -834,13 +830,7 @@ impl<'a> Parser<'a> {
     /// Parses a CREATE INDEX statement.
     fn parse_create_index_stmt(&mut self, unique: bool) -> Result<Statement, SyntaxError> {
         // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (columns)
-        let if_not_exists = if self.consume_keyword(Keyword::If) {
-            self.expect_keyword(Keyword::Not)?;
-            self.expect_keyword(Keyword::Exists)?;
-            true
-        } else {
-            false
-        };
+        let if_not_exists = self.parse_if_not_exists()?;
 
         let name = self.expect_identifier()?;
         self.expect_keyword(Keyword::On)?;
@@ -862,13 +852,7 @@ impl<'a> Parser<'a> {
     /// Parses a DROP INDEX statement.
     fn parse_drop_index_stmt(&mut self) -> Result<Statement, SyntaxError> {
         // DROP INDEX [IF EXISTS] name
-        let if_exists = if self.consume_keyword(Keyword::If) {
-            self.expect_keyword(Keyword::Exists)?;
-            true
-        } else {
-            false
-        };
-
+        let if_exists = self.parse_if_exists()?;
         let name = self.expect_identifier()?;
 
         Ok(Statement::DropIndex(DropIndexStmt { name, if_exists }))
@@ -968,6 +952,27 @@ impl<'a> Parser<'a> {
                 &self.current_token_name(),
                 span,
             ))
+        }
+    }
+
+    /// Parses optional IF NOT EXISTS clause.
+    fn parse_if_not_exists(&mut self) -> Result<bool, SyntaxError> {
+        if self.consume_keyword(Keyword::If) {
+            self.expect_keyword(Keyword::Not)?;
+            self.expect_keyword(Keyword::Exists)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Parses optional IF EXISTS clause.
+    fn parse_if_exists(&mut self) -> Result<bool, SyntaxError> {
+        if self.consume_keyword(Keyword::If) {
+            self.expect_keyword(Keyword::Exists)?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 
@@ -1108,6 +1113,17 @@ mod tests {
                 assert_eq!(ct.columns[0].data_type, DataType::Integer);
                 assert_eq!(ct.columns[1].name, "name");
                 assert_eq!(ct.columns[1].data_type, DataType::Text);
+                assert!(!ct.if_not_exists);
+            }
+            _ => panic!("expected CREATE TABLE"),
+        }
+
+        // IF NOT EXISTS
+        let stmt = parse("CREATE TABLE IF NOT EXISTS users (id INTEGER)").unwrap();
+        match stmt {
+            Statement::CreateTable(ct) => {
+                assert_eq!(ct.name, "users");
+                assert!(ct.if_not_exists);
             }
             _ => panic!("expected CREATE TABLE"),
         }
