@@ -249,6 +249,14 @@ pub struct ErrorField {
 }
 
 impl ErrorField {
+    /// Creates a new error field.
+    pub fn new(code: ErrorFieldCode, value: impl Into<String>) -> Self {
+        Self {
+            code,
+            value: value.into(),
+        }
+    }
+
     /// Encodes this error field into the given BytesMut buffer.
     fn encode(&self, dst: &mut BytesMut) {
         dst.put_u8(self.code.as_u8());

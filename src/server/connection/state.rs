@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::protocol::FormatCode;
+use crate::sql::Statement;
 
 /// Per-connection state for Extended Query Protocol.
 ///
@@ -71,6 +72,8 @@ impl ConnectionState {
 pub struct PreparedStatement {
     /// The original SQL query
     pub query: String,
+    /// Parsed AST (None if parsing failed but we stored the statement anyway)
+    pub ast: Option<Statement>,
     /// Parameter type OIDs (may be inferred later)
     pub param_types: Vec<i32>,
 }
@@ -101,6 +104,7 @@ mod tests {
             "test".to_string(),
             PreparedStatement {
                 query: "SELECT 1".to_string(),
+                ast: None,
                 param_types: vec![],
             },
         );
@@ -122,6 +126,7 @@ mod tests {
             "stmt".to_string(),
             PreparedStatement {
                 query: "SELECT 1".to_string(),
+                ast: None,
                 param_types: vec![],
             },
         );
@@ -144,6 +149,7 @@ mod tests {
             "stmt".to_string(),
             PreparedStatement {
                 query: "SELECT 2".to_string(),
+                ast: None,
                 param_types: vec![],
             },
         );
@@ -160,6 +166,7 @@ mod tests {
             "".to_string(),
             PreparedStatement {
                 query: "SELECT 1".to_string(),
+                ast: None,
                 param_types: vec![],
             },
         );
@@ -167,6 +174,7 @@ mod tests {
             "named".to_string(),
             PreparedStatement {
                 query: "SELECT 2".to_string(),
+                ast: None,
                 param_types: vec![],
             },
         );
