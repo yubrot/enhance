@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::protocol::{
     BackendMessage, BindMessage, CloseMessage, CloseTarget, DescribeMessage, DescribeTarget,
-    ErrorField, ErrorFieldCode, ExecuteMessage, FrontendMessage, ParseMessage, PostgresCodec,
-    TransactionStatus, sql_state,
+    ErrorInfo, ExecuteMessage, FrontendMessage, ParseMessage, PostgresCodec, TransactionStatus,
+    sql_state,
 };
 use crate::sql::{Parser, Statement};
 
@@ -42,21 +42,6 @@ impl Connection {
             pid,
             state: ConnectionState::new(),
         }
-    }
-
-    /// Parses a SQL query and returns the AST.
-    ///
-    /// Returns `Ok(None)` for empty queries, `Ok(Some(stmt))` for valid SQL,
-    /// or `Err` for syntax errors.
-    fn parse_query(query: &str) -> Result<Option<Statement>, crate::sql::SyntaxError> {
-        let query = query.trim();
-
-        if query.is_empty() {
-            return Ok(None);
-        }
-
-        let mut parser = Parser::new(query);
-        parser.parse().map(Some)
     }
 
     /// Returns the command completion tag for a statement.
@@ -107,7 +92,7 @@ impl Connection {
 
         match message {
             FrontendMessage::Query(query) => {
-                self.handle_query(query.trim()).await?;
+                self.handle_query(&query).await?;
             }
             FrontendMessage::Terminate => return Ok(true),
             FrontendMessage::Parse(_)
@@ -151,7 +136,7 @@ impl Connection {
     async fn handle_query(&mut self, query: &str) -> Result<(), ConnectionError> {
         println!("(pid={}) Query: {}", self.pid, query);
 
-        match Self::parse_query(query) {
+        match Parser::new(query).parse() {
             Ok(None) => {
                 // Empty query
                 self.framed.send(BackendMessage::EmptyQueryResponse).await?;
@@ -173,17 +158,9 @@ impl Connection {
             }
             Err(err) => {
                 // Parse error - send error response with position
-                self.framed
-                    .send(BackendMessage::ErrorResponse {
-                        fields: vec![
-                            ErrorField::new(ErrorFieldCode::Severity, "ERROR"),
-                            ErrorField::new(ErrorFieldCode::SeverityNonLocalized, "ERROR"),
-                            ErrorField::new(ErrorFieldCode::SqlState, sql_state::SYNTAX_ERROR),
-                            ErrorField::new(ErrorFieldCode::Message, &err.message),
-                            ErrorField::new(ErrorFieldCode::Position, err.position().to_string()),
-                        ],
-                    })
-                    .await?;
+                let error = ErrorInfo::new(sql_state::SYNTAX_ERROR, &err.message)
+                    .with_position(err.position());
+                self.framed.send(error.into()).await?;
             }
         }
 
@@ -206,20 +183,18 @@ impl Connection {
         );
 
         // Parse the SQL
-        let ast = match Self::parse_query(&msg.query) {
+        let ast = match Parser::new(&msg.query).parse() {
             Ok(Some(ast)) => ast,
             Ok(None) => {
                 // Empty query not allowed in Extended Query Protocol
-                return self
-                    .send_error(sql_state::SYNTAX_ERROR, "empty query".to_string(), true)
-                    .await;
+                let error = ErrorInfo::new(sql_state::SYNTAX_ERROR, "empty query");
+                return self.send_error(error, true).await;
             }
             Err(err) => {
                 // Parse error - send error response with position
-                let position = err.position();
-                return self
-                    .send_error_with_position(sql_state::SYNTAX_ERROR, err.message, position, true)
-                    .await;
+                let error = ErrorInfo::new(sql_state::SYNTAX_ERROR, &err.message)
+                    .with_position(err.position());
+                return self.send_error(error, true).await;
             }
         };
 
@@ -244,16 +219,14 @@ impl Connection {
 
         // Verify statement exists
         if self.state.get_statement(&msg.statement_name).is_none() {
-            return self
-                .send_error(
-                    sql_state::INVALID_SQL_STATEMENT_NAME,
-                    format!(
-                        "prepared statement \"{}\" does not exist",
-                        msg.statement_name
-                    ),
-                    true,
-                )
-                .await;
+            let error = ErrorInfo::new(
+                sql_state::INVALID_SQL_STATEMENT_NAME,
+                format!(
+                    "prepared statement \"{}\" does not exist",
+                    msg.statement_name
+                ),
+            );
+            return self.send_error(error, true).await;
         }
 
         // Create portal
@@ -279,13 +252,11 @@ impl Connection {
         match msg.target_type {
             DescribeTarget::Statement => {
                 let Some(stmt) = self.state.get_statement(&msg.name) else {
-                    return self
-                        .send_error(
-                            sql_state::INVALID_SQL_STATEMENT_NAME,
-                            format!("prepared statement \"{}\" does not exist", msg.name),
-                            true,
-                        )
-                        .await;
+                    let error = ErrorInfo::new(
+                        sql_state::INVALID_SQL_STATEMENT_NAME,
+                        format!("prepared statement \"{}\" does not exist", msg.name),
+                    );
+                    return self.send_error(error, true).await;
                 };
 
                 // Send ParameterDescription
@@ -301,13 +272,11 @@ impl Connection {
             }
             DescribeTarget::Portal => {
                 let Some(_portal) = self.state.get_portal(&msg.name) else {
-                    return self
-                        .send_error(
-                            sql_state::INVALID_CURSOR_NAME,
-                            format!("portal \"{}\" does not exist", msg.name),
-                            true,
-                        )
-                        .await;
+                    let error = ErrorInfo::new(
+                        sql_state::INVALID_CURSOR_NAME,
+                        format!("portal \"{}\" does not exist", msg.name),
+                    );
+                    return self.send_error(error, true).await;
                 };
 
                 // For stub: Send NoData (no result columns yet)
@@ -325,23 +294,19 @@ impl Connection {
         );
 
         let Some(portal) = self.state.get_portal(&msg.portal_name) else {
-            return self
-                .send_error(
-                    sql_state::INVALID_CURSOR_NAME,
-                    format!("portal \"{}\" does not exist", msg.portal_name),
-                    true,
-                )
-                .await;
+            let error = ErrorInfo::new(
+                sql_state::INVALID_CURSOR_NAME,
+                format!("portal \"{}\" does not exist", msg.portal_name),
+            );
+            return self.send_error(error, true).await;
         };
 
         let Some(stmt) = self.state.get_statement(&portal.statement_name) else {
-            return self
-                .send_error(
-                    sql_state::INVALID_SQL_STATEMENT_NAME,
-                    "statement for portal does not exist".to_string(),
-                    true,
-                )
-                .await;
+            let error = ErrorInfo::new(
+                sql_state::INVALID_SQL_STATEMENT_NAME,
+                "statement for portal does not exist",
+            );
+            return self.send_error(error, true).await;
         };
 
         // Stub execution - use stored AST to determine response
@@ -397,36 +362,10 @@ impl Connection {
     /// Execute, Close) are skipped until Sync.
     async fn send_error(
         &mut self,
-        code: &str,
-        message: String,
+        error: ErrorInfo,
         into_error_state: bool,
     ) -> Result<(), ConnectionError> {
-        self.framed
-            .send(BackendMessage::error(code, message))
-            .await?;
-        self.state.in_error = into_error_state;
-        Ok(())
-    }
-
-    /// Send an error response with position information.
-    async fn send_error_with_position(
-        &mut self,
-        code: &str,
-        message: String,
-        position: usize,
-        into_error_state: bool,
-    ) -> Result<(), ConnectionError> {
-        self.framed
-            .send(BackendMessage::ErrorResponse {
-                fields: vec![
-                    ErrorField::new(ErrorFieldCode::Severity, "ERROR"),
-                    ErrorField::new(ErrorFieldCode::SeverityNonLocalized, "ERROR"),
-                    ErrorField::new(ErrorFieldCode::SqlState, code),
-                    ErrorField::new(ErrorFieldCode::Message, &message),
-                    ErrorField::new(ErrorFieldCode::Position, position.to_string()),
-                ],
-            })
-            .await?;
+        self.framed.send(error.into()).await?;
         self.state.in_error = into_error_state;
         Ok(())
     }
