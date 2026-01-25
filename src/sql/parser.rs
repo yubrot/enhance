@@ -139,7 +139,7 @@ impl<'a> Parser<'a> {
         // SELECT
         if self.check_keyword(Keyword::Select) {
             let select = self.parse_select_stmt()?;
-            return Ok(Statement::Select(select));
+            return Ok(Statement::Select(Box::new(select)));
         }
 
         // INSERT
@@ -219,11 +219,11 @@ impl<'a> Parser<'a> {
 
         self.expect_token(TokenKind::RParen)?;
 
-        Ok(Statement::CreateTable(CreateTableStmt {
+        Ok(Statement::CreateTable(Box::new(CreateTableStmt {
             name,
             columns,
             constraints,
-        }))
+        })))
     }
 
     /// Parses a column definition.
@@ -754,11 +754,11 @@ impl<'a> Parser<'a> {
             }
         }
 
-        Ok(Statement::Insert(InsertStmt {
+        Ok(Statement::Insert(Box::new(InsertStmt {
             table,
             columns,
             values,
-        }))
+        })))
     }
 
     /// Parses an UPDATE statement.
@@ -784,11 +784,11 @@ impl<'a> Parser<'a> {
             None
         };
 
-        Ok(Statement::Update(UpdateStmt {
+        Ok(Statement::Update(Box::new(UpdateStmt {
             table,
             assignments,
             where_clause,
-        }))
+        })))
     }
 
     /// Parses a DELETE statement.
@@ -802,10 +802,10 @@ impl<'a> Parser<'a> {
             None
         };
 
-        Ok(Statement::Delete(DeleteStmt {
+        Ok(Statement::Delete(Box::new(DeleteStmt {
             table,
             where_clause,
-        }))
+        })))
     }
 
     /// Parses a DROP TABLE statement.
@@ -893,7 +893,7 @@ impl<'a> Parser<'a> {
 
     /// Returns true if at end of tokens.
     pub(crate) fn is_eof(&self) -> bool {
-        self.peek().map_or(true, |t| t.is_eof())
+        self.peek().is_none_or(|t| t.is_eof())
     }
 
     /// Peeks at the current token.

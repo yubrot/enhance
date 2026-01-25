@@ -7,15 +7,15 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     /// SELECT statement.
-    Select(SelectStmt),
+    Select(Box<SelectStmt>),
     /// INSERT statement.
-    Insert(InsertStmt),
+    Insert(Box<InsertStmt>),
     /// UPDATE statement.
-    Update(UpdateStmt),
+    Update(Box<UpdateStmt>),
     /// DELETE statement.
-    Delete(DeleteStmt),
+    Delete(Box<DeleteStmt>),
     /// CREATE TABLE statement.
-    CreateTable(CreateTableStmt),
+    CreateTable(Box<CreateTableStmt>),
     /// DROP TABLE statement.
     DropTable(DropTableStmt),
     /// CREATE INDEX statement.

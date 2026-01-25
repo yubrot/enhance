@@ -70,7 +70,8 @@ impl ConnectionState {
 /// A prepared statement stored on the connection.
 #[derive(Debug, Clone)]
 pub struct PreparedStatement {
-    /// The original SQL query
+    /// The original SQL query (used for EXPLAIN and debugging).
+    #[allow(dead_code)]
     pub query: String,
     /// Parsed AST (None if parsing failed but we stored the statement anyway)
     pub ast: Option<Statement>,

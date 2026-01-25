@@ -336,7 +336,7 @@ impl Keyword {
     }
 
     /// Attempts to parse a keyword from a string (case-insensitive).
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         // NOTE: A production implementation might use a perfect hash or phf crate.
         // This simple match is sufficient for learning purposes.
         match s.to_uppercase().as_str() {
@@ -436,10 +436,10 @@ mod tests {
 
     #[test]
     fn test_keyword_from_str() {
-        assert_eq!(Keyword::from_str("SELECT"), Some(Keyword::Select));
-        assert_eq!(Keyword::from_str("select"), Some(Keyword::Select));
-        assert_eq!(Keyword::from_str("SeLeCt"), Some(Keyword::Select));
-        assert_eq!(Keyword::from_str("unknown"), None);
+        assert_eq!(Keyword::parse("SELECT"), Some(Keyword::Select));
+        assert_eq!(Keyword::parse("select"), Some(Keyword::Select));
+        assert_eq!(Keyword::parse("SeLeCt"), Some(Keyword::Select));
+        assert_eq!(Keyword::parse("unknown"), None);
     }
 
     #[test]
@@ -453,7 +453,7 @@ mod tests {
             Keyword::Table,
         ];
         for kw in keywords {
-            assert_eq!(Keyword::from_str(kw.as_str()), Some(kw));
+            assert_eq!(Keyword::parse(kw.as_str()), Some(kw));
         }
     }
 

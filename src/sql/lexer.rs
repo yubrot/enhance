@@ -380,7 +380,7 @@ impl<'a> Lexer<'a> {
         let span = Span::new(start, self.pos);
 
         // Check if this is a keyword
-        if let Some(keyword) = Keyword::from_str(ident) {
+        if let Some(keyword) = Keyword::parse(ident) {
             Token::new(TokenKind::Keyword(keyword), span)
         } else {
             Token::new(TokenKind::Identifier(ident.to_string()), span)
