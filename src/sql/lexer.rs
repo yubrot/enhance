@@ -4,7 +4,7 @@
 //! It handles keywords, identifiers, literals, operators, and comments.
 
 use super::error::Span;
-use super::token::{Keyword, Token, TokenKind};
+use super::token::{Token, TokenKind};
 
 /// SQL lexer that tokenizes input strings.
 ///
@@ -369,8 +369,8 @@ impl<'a> Lexer<'a> {
         let span = Span::new(start, self.pos);
 
         // Check if this is a keyword
-        if let Some(keyword) = Keyword::parse(ident) {
-            Token::new(TokenKind::Keyword(keyword), span)
+        if let Some(kind) = TokenKind::from_keyword(ident) {
+            Token::new(kind, span)
         } else {
             Token::new(TokenKind::Identifier(ident.to_string()), span)
         }
@@ -472,9 +472,9 @@ mod tests {
         assert_eq!(
             lex("SELECT FROM WHERE"),
             vec![
-                TokenKind::Keyword(Keyword::Select),
-                TokenKind::Keyword(Keyword::From),
-                TokenKind::Keyword(Keyword::Where),
+                TokenKind::Select,
+                TokenKind::From,
+                TokenKind::Where,
                 TokenKind::Eof,
             ]
         );
@@ -485,9 +485,9 @@ mod tests {
         assert_eq!(
             lex("select SELECT SeLeCt"),
             vec![
-                TokenKind::Keyword(Keyword::Select),
-                TokenKind::Keyword(Keyword::Select),
-                TokenKind::Keyword(Keyword::Select),
+                TokenKind::Select,
+                TokenKind::Select,
+                TokenKind::Select,
                 TokenKind::Eof,
             ]
         );
@@ -613,11 +613,7 @@ mod tests {
     fn test_line_comments() {
         assert_eq!(
             lex("SELECT -- this is a comment\nFROM"),
-            vec![
-                TokenKind::Keyword(Keyword::Select),
-                TokenKind::Keyword(Keyword::From),
-                TokenKind::Eof,
-            ]
+            vec![TokenKind::Select, TokenKind::From, TokenKind::Eof,]
         );
     }
 
@@ -625,11 +621,7 @@ mod tests {
     fn test_block_comments() {
         assert_eq!(
             lex("SELECT /* comment */ FROM"),
-            vec![
-                TokenKind::Keyword(Keyword::Select),
-                TokenKind::Keyword(Keyword::From),
-                TokenKind::Eof,
-            ]
+            vec![TokenKind::Select, TokenKind::From, TokenKind::Eof,]
         );
     }
 
@@ -637,11 +629,7 @@ mod tests {
     fn test_nested_block_comments() {
         assert_eq!(
             lex("SELECT /* outer /* nested */ comment */ FROM"),
-            vec![
-                TokenKind::Keyword(Keyword::Select),
-                TokenKind::Keyword(Keyword::From),
-                TokenKind::Eof,
-            ]
+            vec![TokenKind::Select, TokenKind::From, TokenKind::Eof,]
         );
     }
 
@@ -651,20 +639,20 @@ mod tests {
         assert_eq!(
             tokens,
             vec![
-                TokenKind::Keyword(Keyword::Select),
+                TokenKind::Select,
                 TokenKind::Identifier("id".to_string()),
                 TokenKind::Comma,
                 TokenKind::Identifier("name".to_string()),
-                TokenKind::Keyword(Keyword::From),
+                TokenKind::From,
                 TokenKind::Identifier("users".to_string()),
-                TokenKind::Keyword(Keyword::Where),
+                TokenKind::Where,
                 TokenKind::Identifier("age".to_string()),
                 TokenKind::GtEq,
                 TokenKind::Integer(18),
-                TokenKind::Keyword(Keyword::And),
+                TokenKind::And,
                 TokenKind::Identifier("active".to_string()),
                 TokenKind::Eq,
-                TokenKind::Keyword(Keyword::True),
+                TokenKind::True,
                 TokenKind::Eof,
             ]
         );
@@ -688,7 +676,7 @@ mod tests {
         assert_eq!(
             tokens,
             vec![
-                TokenKind::Keyword(Keyword::Select),
+                TokenKind::Select,
                 TokenKind::Error("unterminated block comment".to_string()),
                 TokenKind::Eof,
             ]
@@ -713,9 +701,9 @@ mod tests {
         assert_eq!(
             tokens,
             vec![
-                TokenKind::Keyword(Keyword::Select),
+                TokenKind::Select,
                 TokenKind::Error("unexpected character '@'".to_string()),
-                TokenKind::Keyword(Keyword::From),
+                TokenKind::From,
                 TokenKind::Eof,
             ]
         );

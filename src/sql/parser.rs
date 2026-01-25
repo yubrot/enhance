@@ -7,7 +7,7 @@
 use super::ast::*;
 use super::error::{Span, SyntaxError};
 use super::lexer::Lexer;
-use super::token::{Keyword, Token, TokenKind};
+use super::token::{Token, TokenKind};
 
 /// Operator precedence levels (higher = binds tighter).
 ///
@@ -109,27 +109,27 @@ impl<'a> Parser<'a> {
 
     /// Parses a single statement.
     fn parse_statement(&mut self) -> Result<Statement, SyntaxError> {
-        match self.peek_keyword(0) {
-            Some(Keyword::Explain) => {
+        match self.peek(0) {
+            Some(TokenKind::Explain) => {
                 self.discard(1);
                 Ok(Statement::Explain(Box::new(self.parse_statement()?)))
             }
-            Some(Keyword::Begin) => self.parse_begin_stmt(),
-            Some(Keyword::Commit) => {
+            Some(TokenKind::Begin) => self.parse_begin_stmt(),
+            Some(TokenKind::Commit) => {
                 self.discard(1);
                 Ok(Statement::Commit)
             }
-            Some(Keyword::Rollback) => {
+            Some(TokenKind::Rollback) => {
                 self.discard(1);
                 Ok(Statement::Rollback)
             }
-            Some(Keyword::Set) => self.parse_set_stmt(),
-            Some(Keyword::Create) => self.parse_create_stmt(),
-            Some(Keyword::Drop) => self.parse_drop_stmt(),
-            Some(Keyword::Select) => Ok(Statement::Select(Box::new(self.parse_select_stmt()?))),
-            Some(Keyword::Insert) => self.parse_insert_stmt(),
-            Some(Keyword::Update) => self.parse_update_stmt(),
-            Some(Keyword::Delete) => self.parse_delete_stmt(),
+            Some(TokenKind::Set) => self.parse_set_stmt(),
+            Some(TokenKind::Create) => self.parse_create_stmt(),
+            Some(TokenKind::Drop) => self.parse_drop_stmt(),
+            Some(TokenKind::Select) => Ok(Statement::Select(Box::new(self.parse_select_stmt()?))),
+            Some(TokenKind::Insert) => self.parse_insert_stmt(),
+            Some(TokenKind::Update) => self.parse_update_stmt(),
+            Some(TokenKind::Delete) => self.parse_delete_stmt(),
             _ => Err(self.unexpected_token_error("statement")),
         }
     }
@@ -137,8 +137,8 @@ impl<'a> Parser<'a> {
     /// Parses a BEGIN statement.
     fn parse_begin_stmt(&mut self) -> Result<Statement, SyntaxError> {
         // BEGIN [TRANSACTION]
-        self.consume_keyword(Keyword::Begin)?;
-        if self.starts_with([Keyword::Transaction]) {
+        self.consume(TokenKind::Begin)?;
+        if self.starts_with([TokenKind::Transaction]) {
             self.discard(1);
         }
         Ok(Statement::Begin)
@@ -146,7 +146,7 @@ impl<'a> Parser<'a> {
 
     /// Parses a SET statement.
     fn parse_set_stmt(&mut self) -> Result<Statement, SyntaxError> {
-        self.consume_keyword(Keyword::Set)?;
+        self.consume(TokenKind::Set)?;
         let name = self.consume_identifier()?;
         self.consume(TokenKind::Eq)?;
         let value = self.parse_expr()?;
@@ -156,24 +156,24 @@ impl<'a> Parser<'a> {
 
     /// Parses a CREATE statement (TABLE or INDEX).
     fn parse_create_stmt(&mut self) -> Result<Statement, SyntaxError> {
-        if self.starts_with([Keyword::Create, Keyword::Table]) {
+        if self.starts_with([TokenKind::Create, TokenKind::Table]) {
             return self.parse_create_table();
         }
-        if self.starts_with([Keyword::Create, Keyword::Unique, Keyword::Index])
-            || self.starts_with([Keyword::Create, Keyword::Index])
+        if self.starts_with([TokenKind::Create, TokenKind::Unique, TokenKind::Index])
+            || self.starts_with([TokenKind::Create, TokenKind::Index])
         {
             return self.parse_create_index();
         }
 
         // Consume CREATE to give a better error message
-        self.consume_keyword(Keyword::Create)?;
+        self.consume(TokenKind::Create)?;
         Err(self.unexpected_token_error("TABLE or INDEX"))
     }
 
     /// Parses a CREATE TABLE statement.
     fn parse_create_table(&mut self) -> Result<Statement, SyntaxError> {
-        self.consume_keyword(Keyword::Create)?;
-        self.consume_keyword(Keyword::Table)?;
+        self.consume(TokenKind::Create)?;
+        self.consume(TokenKind::Table)?;
 
         let if_not_exists = self.parse_if_not_exists()?;
         let name = self.consume_identifier()?;
@@ -186,13 +186,13 @@ impl<'a> Parser<'a> {
         loop {
             // Check for table-level constraint
             if matches!(
-                self.peek_keyword(0),
+                self.peek(0),
                 Some(
-                    Keyword::Primary
-                        | Keyword::Unique
-                        | Keyword::Foreign
-                        | Keyword::Check
-                        | Keyword::Constraint
+                    TokenKind::Primary
+                        | TokenKind::Unique
+                        | TokenKind::Foreign
+                        | TokenKind::Check
+                        | TokenKind::Constraint
                 )
             ) {
                 constraints.push(self.parse_table_constraint()?);
@@ -232,45 +232,45 @@ impl<'a> Parser<'a> {
 
     /// Parses a data type.
     pub(crate) fn parse_data_type(&mut self) -> Result<DataType, SyntaxError> {
-        match self.peek_keyword(0) {
-            Some(Keyword::Boolean) => {
+        match self.peek(0) {
+            Some(TokenKind::Boolean) => {
                 self.discard(1);
                 Ok(DataType::Boolean)
             }
-            Some(Keyword::Smallint) => {
+            Some(TokenKind::Smallint) => {
                 self.discard(1);
                 Ok(DataType::Smallint)
             }
-            Some(Keyword::Integer | Keyword::Int) => {
+            Some(TokenKind::Integer_ | TokenKind::Int) => {
                 self.discard(1);
                 Ok(DataType::Integer)
             }
-            Some(Keyword::Bigint) => {
+            Some(TokenKind::Bigint) => {
                 self.discard(1);
                 Ok(DataType::Bigint)
             }
-            Some(Keyword::Real) => {
+            Some(TokenKind::Real) => {
                 self.discard(1);
                 Ok(DataType::Real)
             }
-            Some(Keyword::Text) => {
+            Some(TokenKind::Text) => {
                 self.discard(1);
                 Ok(DataType::Text)
             }
-            Some(Keyword::Varchar) => {
+            Some(TokenKind::Varchar) => {
                 self.discard(1);
                 let length = self.parse_parenthesized_integer()?;
                 Ok(DataType::Varchar(length))
             }
-            Some(Keyword::Bytea) => {
+            Some(TokenKind::Bytea) => {
                 self.discard(1);
                 Ok(DataType::Bytea)
             }
-            Some(Keyword::Serial) => {
+            Some(TokenKind::Serial) => {
                 self.discard(1);
                 Ok(DataType::Serial)
             }
-            Some(Keyword::Double) if self.peek_keyword(1) == Some(Keyword::Precision) => {
+            Some(TokenKind::Double) if self.peek(1) == Some(&TokenKind::Precision) => {
                 self.discard(2);
                 Ok(DataType::DoublePrecision)
             }
@@ -295,27 +295,27 @@ impl<'a> Parser<'a> {
         let mut constraints = Vec::new();
 
         loop {
-            if self.starts_with([Keyword::Not, Keyword::Null]) {
+            if self.starts_with([TokenKind::Not, TokenKind::Null]) {
                 self.discard(2);
                 constraints.push(ColumnConstraint::NotNull);
-            } else if self.starts_with([Keyword::Null]) {
+            } else if self.starts_with([TokenKind::Null]) {
                 self.discard(1);
                 constraints.push(ColumnConstraint::Null);
-            } else if self.starts_with([Keyword::Primary, Keyword::Key]) {
+            } else if self.starts_with([TokenKind::Primary, TokenKind::Key]) {
                 self.discard(2);
                 constraints.push(ColumnConstraint::PrimaryKey);
-            } else if self.starts_with([Keyword::Unique]) {
+            } else if self.starts_with([TokenKind::Unique]) {
                 self.discard(1);
                 constraints.push(ColumnConstraint::Unique);
-            } else if self.starts_with([Keyword::Default]) {
+            } else if self.starts_with([TokenKind::Default]) {
                 self.discard(1);
                 let value = self.parse_expr()?;
                 constraints.push(ColumnConstraint::Default(value));
-            } else if self.starts_with([Keyword::Check]) {
+            } else if self.starts_with([TokenKind::Check]) {
                 self.discard(1);
                 let expr = self.parse_parenthesized(Self::parse_expr)?;
                 constraints.push(ColumnConstraint::Check(expr));
-            } else if self.starts_with([Keyword::References]) {
+            } else if self.starts_with([TokenKind::References]) {
                 self.discard(1);
                 let table = self.consume_identifier()?;
                 let column = self.parse_parenthesized_identifier()?;
@@ -342,29 +342,29 @@ impl<'a> Parser<'a> {
 
     /// Parses a table-level constraint.
     fn parse_table_constraint(&mut self) -> Result<TableConstraint, SyntaxError> {
-        let name = if self.starts_with([Keyword::Constraint]) {
+        let name = if self.starts_with([TokenKind::Constraint]) {
             self.discard(1);
             Some(self.consume_identifier()?)
         } else {
             None
         };
 
-        let kind = if self.starts_with([Keyword::Primary, Keyword::Key]) {
+        let kind = if self.starts_with([TokenKind::Primary, TokenKind::Key]) {
             self.discard(2);
             let columns = self.parse_parenthesized(Self::parse_identifier_list)?;
             TableConstraintKind::PrimaryKey(columns)
-        } else if self.starts_with([Keyword::Unique]) {
+        } else if self.starts_with([TokenKind::Unique]) {
             self.discard(1);
             let columns = self.parse_parenthesized(Self::parse_identifier_list)?;
             TableConstraintKind::Unique(columns)
-        } else if self.starts_with([Keyword::Check]) {
+        } else if self.starts_with([TokenKind::Check]) {
             self.discard(1);
             let expr = self.parse_parenthesized(Self::parse_expr)?;
             TableConstraintKind::Check(expr)
-        } else if self.starts_with([Keyword::Foreign, Keyword::Key]) {
+        } else if self.starts_with([TokenKind::Foreign, TokenKind::Key]) {
             self.discard(2);
             let columns = self.parse_parenthesized(Self::parse_identifier_list)?;
-            self.consume_keyword(Keyword::References)?;
+            self.consume(TokenKind::References)?;
             let ref_table = self.consume_identifier()?;
             let ref_columns = self.parse_parenthesized(Self::parse_identifier_list)?;
             TableConstraintKind::ForeignKey {
@@ -382,18 +382,18 @@ impl<'a> Parser<'a> {
     /// Parses a CREATE INDEX statement.
     fn parse_create_index(&mut self) -> Result<Statement, SyntaxError> {
         // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (columns)
-        self.consume_keyword(Keyword::Create)?;
+        self.consume(TokenKind::Create)?;
 
-        let unique = self.starts_with([Keyword::Unique]);
+        let unique = self.starts_with([TokenKind::Unique]);
         if unique {
             self.discard(1);
         }
 
-        self.consume_keyword(Keyword::Index)?;
+        self.consume(TokenKind::Index)?;
 
         let if_not_exists = self.parse_if_not_exists()?;
         let name = self.consume_identifier()?;
-        self.consume_keyword(Keyword::On)?;
+        self.consume(TokenKind::On)?;
         let table = self.consume_identifier()?;
 
         let columns = self.parse_parenthesized(Self::parse_index_column_list)?;
@@ -419,25 +419,25 @@ impl<'a> Parser<'a> {
     /// Parses a DROP statement (TABLE or INDEX).
     fn parse_drop_stmt(&mut self) -> Result<Statement, SyntaxError> {
         // DROP TABLE
-        if self.starts_with([Keyword::Drop, Keyword::Table]) {
+        if self.starts_with([TokenKind::Drop, TokenKind::Table]) {
             return self.parse_drop_table();
         }
 
         // DROP INDEX
-        if self.starts_with([Keyword::Drop, Keyword::Index]) {
+        if self.starts_with([TokenKind::Drop, TokenKind::Index]) {
             return self.parse_drop_index();
         }
 
         // Consume DROP to give a better error message
-        self.consume_keyword(Keyword::Drop)?;
+        self.consume(TokenKind::Drop)?;
         Err(self.unexpected_token_error("TABLE or INDEX"))
     }
 
     /// Parses a DROP TABLE statement.
     fn parse_drop_table(&mut self) -> Result<Statement, SyntaxError> {
         // DROP TABLE [IF EXISTS] name
-        self.consume_keyword(Keyword::Drop)?;
-        self.consume_keyword(Keyword::Table)?;
+        self.consume(TokenKind::Drop)?;
+        self.consume(TokenKind::Table)?;
 
         let if_exists = self.parse_if_exists()?;
         let name = self.consume_identifier()?;
@@ -448,8 +448,8 @@ impl<'a> Parser<'a> {
     /// Parses a DROP INDEX statement.
     fn parse_drop_index(&mut self) -> Result<Statement, SyntaxError> {
         // DROP INDEX [IF EXISTS] name
-        self.consume_keyword(Keyword::Drop)?;
-        self.consume_keyword(Keyword::Index)?;
+        self.consume(TokenKind::Drop)?;
+        self.consume(TokenKind::Index)?;
 
         let if_exists = self.parse_if_exists()?;
         let name = self.consume_identifier()?;
@@ -459,14 +459,14 @@ impl<'a> Parser<'a> {
 
     /// Parses a SELECT statement.
     pub(crate) fn parse_select_stmt(&mut self) -> Result<SelectStmt, SyntaxError> {
-        self.consume_keyword(Keyword::Select)?;
+        self.consume(TokenKind::Select)?;
 
         // DISTINCT / ALL
-        let distinct = if self.starts_with([Keyword::Distinct]) {
+        let distinct = if self.starts_with([TokenKind::Distinct]) {
             self.discard(1);
             true
         } else {
-            if self.starts_with([Keyword::All]) {
+            if self.starts_with([TokenKind::All]) {
                 self.discard(1);
             }
             false
@@ -476,13 +476,13 @@ impl<'a> Parser<'a> {
         let columns = self.parse_select_list()?;
 
         // FROM clause
-        let from = self.parse_if_keyword(Keyword::From, Self::parse_from_clause)?;
+        let from = self.parse_if_token(TokenKind::From, Self::parse_from_clause)?;
 
         // WHERE clause
-        let where_clause = self.parse_if_keyword(Keyword::Where, Self::parse_expr)?;
+        let where_clause = self.parse_if_token(TokenKind::Where, Self::parse_expr)?;
 
         // GROUP BY clause
-        let group_by = if self.starts_with([Keyword::Group, Keyword::By]) {
+        let group_by = if self.starts_with([TokenKind::Group, TokenKind::By]) {
             self.discard(2);
             self.parse_expr_list()?
         } else {
@@ -490,10 +490,10 @@ impl<'a> Parser<'a> {
         };
 
         // HAVING clause
-        let having = self.parse_if_keyword(Keyword::Having, Self::parse_expr)?;
+        let having = self.parse_if_token(TokenKind::Having, Self::parse_expr)?;
 
         // ORDER BY clause
-        let order_by = if self.starts_with([Keyword::Order, Keyword::By]) {
+        let order_by = if self.starts_with([TokenKind::Order, TokenKind::By]) {
             self.discard(2);
             self.parse_order_by_list()?
         } else {
@@ -501,13 +501,13 @@ impl<'a> Parser<'a> {
         };
 
         // LIMIT clause
-        let limit = self.parse_if_keyword(Keyword::Limit, Self::parse_expr)?;
+        let limit = self.parse_if_token(TokenKind::Limit, Self::parse_expr)?;
 
         // OFFSET clause
-        let offset = self.parse_if_keyword(Keyword::Offset, Self::parse_expr)?;
+        let offset = self.parse_if_token(TokenKind::Offset, Self::parse_expr)?;
 
         // FOR UPDATE/SHARE
-        let locking = self.parse_if_keyword(Keyword::For, Self::parse_locking_clause)?;
+        let locking = self.parse_if_token(TokenKind::For, Self::parse_locking_clause)?;
 
         Ok(SelectStmt {
             distinct,
@@ -565,31 +565,31 @@ impl<'a> Parser<'a> {
 
         // Handle JOINs
         loop {
-            let join_type = if self.starts_with([Keyword::Cross, Keyword::Join]) {
+            let join_type = if self.starts_with([TokenKind::Cross, TokenKind::Join]) {
                 self.discard(2);
                 Some(JoinType::Cross)
-            } else if self.starts_with([Keyword::Inner, Keyword::Join]) {
+            } else if self.starts_with([TokenKind::Inner, TokenKind::Join]) {
                 self.discard(2);
                 Some(JoinType::Inner)
-            } else if self.starts_with([Keyword::Left, Keyword::Outer, Keyword::Join]) {
+            } else if self.starts_with([TokenKind::Left, TokenKind::Outer, TokenKind::Join]) {
                 self.discard(3);
                 Some(JoinType::Left)
-            } else if self.starts_with([Keyword::Left, Keyword::Join]) {
+            } else if self.starts_with([TokenKind::Left, TokenKind::Join]) {
                 self.discard(2);
                 Some(JoinType::Left)
-            } else if self.starts_with([Keyword::Right, Keyword::Outer, Keyword::Join]) {
+            } else if self.starts_with([TokenKind::Right, TokenKind::Outer, TokenKind::Join]) {
                 self.discard(3);
                 Some(JoinType::Right)
-            } else if self.starts_with([Keyword::Right, Keyword::Join]) {
+            } else if self.starts_with([TokenKind::Right, TokenKind::Join]) {
                 self.discard(2);
                 Some(JoinType::Right)
-            } else if self.starts_with([Keyword::Full, Keyword::Outer, Keyword::Join]) {
+            } else if self.starts_with([TokenKind::Full, TokenKind::Outer, TokenKind::Join]) {
                 self.discard(3);
                 Some(JoinType::Full)
-            } else if self.starts_with([Keyword::Full, Keyword::Join]) {
+            } else if self.starts_with([TokenKind::Full, TokenKind::Join]) {
                 self.discard(2);
                 Some(JoinType::Full)
-            } else if self.starts_with([Keyword::Join]) {
+            } else if self.starts_with([TokenKind::Join]) {
                 self.discard(1);
                 Some(JoinType::Inner)
             } else {
@@ -604,10 +604,10 @@ impl<'a> Parser<'a> {
 
             let condition = if join_type == JoinType::Cross {
                 None
-            } else if self.starts_with([Keyword::On]) {
+            } else if self.starts_with([TokenKind::On]) {
                 self.discard(1);
                 Some(JoinCondition::On(self.parse_expr()?))
-            } else if self.starts_with([Keyword::Using]) {
+            } else if self.starts_with([TokenKind::Using]) {
                 self.discard(1);
                 let columns = self.parse_parenthesized(Self::parse_identifier_list)?;
                 Some(JoinCondition::Using(columns))
@@ -635,7 +635,7 @@ impl<'a> Parser<'a> {
             self.consume(TokenKind::RParen)?;
 
             // Subquery alias is required
-            if self.starts_with([Keyword::As]) {
+            if self.starts_with([TokenKind::As]) {
                 self.discard(1);
             }
             let alias = self.consume_identifier()?;
@@ -669,12 +669,12 @@ impl<'a> Parser<'a> {
 
     /// Parses FOR UPDATE/SHARE clause.
     fn parse_locking_clause(&mut self) -> Result<LockingClause, SyntaxError> {
-        let mode = match self.peek_keyword(0) {
-            Some(Keyword::Update) => {
+        let mode = match self.peek(0) {
+            Some(TokenKind::Update) => {
                 self.discard(1);
                 LockMode::Update
             }
-            Some(Keyword::Share) => {
+            Some(TokenKind::Share) => {
                 self.discard(1);
                 LockMode::Share
             }
@@ -686,8 +686,8 @@ impl<'a> Parser<'a> {
 
     /// Parses an INSERT statement.
     fn parse_insert_stmt(&mut self) -> Result<Statement, SyntaxError> {
-        self.consume_keyword(Keyword::Insert)?;
-        self.consume_keyword(Keyword::Into)?;
+        self.consume(TokenKind::Insert)?;
+        self.consume(TokenKind::Into)?;
         let table = self.consume_identifier()?;
 
         // Optional column list
@@ -698,7 +698,7 @@ impl<'a> Parser<'a> {
         };
 
         // VALUES clause
-        self.consume_keyword(Keyword::Values)?;
+        self.consume(TokenKind::Values)?;
 
         let values =
             self.parse_comma_separated(|p| p.parse_parenthesized(Self::parse_expr_list))?;
@@ -712,9 +712,9 @@ impl<'a> Parser<'a> {
 
     /// Parses an UPDATE statement.
     fn parse_update_stmt(&mut self) -> Result<Statement, SyntaxError> {
-        self.consume_keyword(Keyword::Update)?;
+        self.consume(TokenKind::Update)?;
         let table = self.consume_identifier()?;
-        self.consume_keyword(Keyword::Set)?;
+        self.consume(TokenKind::Set)?;
 
         let assignments = self.parse_comma_separated(|p| {
             let column = p.consume_identifier()?;
@@ -723,7 +723,7 @@ impl<'a> Parser<'a> {
             Ok(Assignment { column, value })
         })?;
 
-        let where_clause = self.parse_if_keyword(Keyword::Where, Self::parse_expr)?;
+        let where_clause = self.parse_if_token(TokenKind::Where, Self::parse_expr)?;
 
         Ok(Statement::Update(Box::new(UpdateStmt {
             table,
@@ -734,11 +734,11 @@ impl<'a> Parser<'a> {
 
     /// Parses a DELETE statement.
     fn parse_delete_stmt(&mut self) -> Result<Statement, SyntaxError> {
-        self.consume_keyword(Keyword::Delete)?;
-        self.consume_keyword(Keyword::From)?;
+        self.consume(TokenKind::Delete)?;
+        self.consume(TokenKind::From)?;
         let table = self.consume_identifier()?;
 
-        let where_clause = self.parse_if_keyword(Keyword::Where, Self::parse_expr)?;
+        let where_clause = self.parse_if_token(TokenKind::Where, Self::parse_expr)?;
 
         Ok(Statement::Delete(Box::new(DeleteStmt {
             table,
@@ -782,7 +782,7 @@ impl<'a> Parser<'a> {
     /// Parses a unary expression (NOT, -, +) or primary expression.
     fn parse_unary_expr(&mut self) -> Result<Expr, SyntaxError> {
         let (op, precedence) = match self.peek(0) {
-            Some(TokenKind::Keyword(Keyword::Not)) => (UnaryOperator::Not, Precedence::Not),
+            Some(TokenKind::Not) => (UnaryOperator::Not, Precedence::Not),
             Some(TokenKind::Minus) => (UnaryOperator::Minus, Precedence::UnaryPlusMinus),
             Some(TokenKind::Plus) => (UnaryOperator::Plus, Precedence::UnaryPlusMinus),
             _ => return self.parse_postfix_expr(),
@@ -800,36 +800,36 @@ impl<'a> Parser<'a> {
         let mut expr = self.parse_primary_expr()?;
 
         loop {
-            if self.starts_with([Keyword::Is, Keyword::Not, Keyword::Null]) {
+            if self.starts_with([TokenKind::Is, TokenKind::Not, TokenKind::Null]) {
                 self.discard(3);
                 expr = Expr::IsNull {
                     expr: Box::new(expr),
                     negated: true,
                 };
-            } else if self.starts_with([Keyword::Is, Keyword::Null]) {
+            } else if self.starts_with([TokenKind::Is, TokenKind::Null]) {
                 self.discard(2);
                 expr = Expr::IsNull {
                     expr: Box::new(expr),
                     negated: false,
                 };
-            } else if self.starts_with([Keyword::Not, Keyword::In]) {
+            } else if self.starts_with([TokenKind::Not, TokenKind::In]) {
                 self.discard(2);
                 expr = self.parse_in_expr(expr, true)?;
-            } else if self.starts_with([Keyword::Not, Keyword::Between]) {
+            } else if self.starts_with([TokenKind::Not, TokenKind::Between]) {
                 self.discard(2);
                 expr = self.parse_between_expr(expr, true)?;
-            } else if self.starts_with([Keyword::Not, Keyword::Like])
-                || self.starts_with([Keyword::Not, Keyword::Ilike])
+            } else if self.starts_with([TokenKind::Not, TokenKind::Like])
+                || self.starts_with([TokenKind::Not, TokenKind::Ilike])
             {
                 self.discard(1); // NOT (LIKE/ILIKE consumed by parse_like_expr)
                 expr = self.parse_like_expr(expr, true)?;
-            } else if self.starts_with([Keyword::In]) {
+            } else if self.starts_with([TokenKind::In]) {
                 self.discard(1);
                 expr = self.parse_in_expr(expr, false)?;
-            } else if self.starts_with([Keyword::Between]) {
+            } else if self.starts_with([TokenKind::Between]) {
                 self.discard(1);
                 expr = self.parse_between_expr(expr, false)?;
-            } else if self.starts_with([Keyword::Like]) || self.starts_with([Keyword::Ilike]) {
+            } else if self.starts_with([TokenKind::Like]) || self.starts_with([TokenKind::Ilike]) {
                 expr = self.parse_like_expr(expr, false)?;
             } else if matches!(self.peek(0), Some(TokenKind::DoubleColon)) {
                 self.discard(1);
@@ -849,7 +849,7 @@ impl<'a> Parser<'a> {
     /// Parses IN expression (after IN keyword consumed).
     fn parse_in_expr(&mut self, expr: Expr, negated: bool) -> Result<Expr, SyntaxError> {
         self.consume(TokenKind::LParen)?;
-        if self.starts_with([Keyword::Select]) {
+        if self.starts_with([TokenKind::Select]) {
             let subquery = self.parse_select_stmt()?;
             self.consume(TokenKind::RParen)?;
             Ok(Expr::InSubquery {
@@ -871,7 +871,7 @@ impl<'a> Parser<'a> {
     /// Parses BETWEEN expression (after BETWEEN keyword consumed).
     fn parse_between_expr(&mut self, expr: Expr, negated: bool) -> Result<Expr, SyntaxError> {
         let low = self.parse_expr_with_precedence(Precedence::Comparison)?;
-        self.consume_keyword(Keyword::And)?;
+        self.consume(TokenKind::And)?;
         let high = self.parse_expr_with_precedence(Precedence::Comparison)?;
         Ok(Expr::Between {
             expr: Box::new(expr),
@@ -883,10 +883,10 @@ impl<'a> Parser<'a> {
 
     /// Parses LIKE/ILIKE expression (consumes keyword itself).
     fn parse_like_expr(&mut self, expr: Expr, negated: bool) -> Result<Expr, SyntaxError> {
-        let case_insensitive = self.starts_with([Keyword::Ilike]);
+        let case_insensitive = self.starts_with([TokenKind::Ilike]);
         self.discard(1); // consume LIKE or ILIKE
         let pattern = self.parse_expr_with_precedence(Precedence::Comparison)?;
-        let escape = if self.starts_with([Keyword::Escape]) {
+        let escape = if self.starts_with([TokenKind::Escape]) {
             self.discard(1);
             Some(Box::new(
                 self.parse_expr_with_precedence(Precedence::Comparison)?,
@@ -906,19 +906,19 @@ impl<'a> Parser<'a> {
     /// Parses a primary expression (literals, identifiers, function calls, etc.).
     fn parse_primary_expr(&mut self) -> Result<Expr, SyntaxError> {
         match self.peek(0) {
-            Some(TokenKind::Keyword(Keyword::Null)) => {
+            Some(TokenKind::Null) => {
                 self.discard(1);
                 Ok(Expr::Null)
             }
-            Some(TokenKind::Keyword(Keyword::True)) => {
+            Some(TokenKind::True) => {
                 self.discard(1);
                 Ok(Expr::Boolean(true))
             }
-            Some(TokenKind::Keyword(Keyword::False)) => {
+            Some(TokenKind::False) => {
                 self.discard(1);
                 Ok(Expr::Boolean(false))
             }
-            Some(TokenKind::Keyword(Keyword::Exists)) => {
+            Some(TokenKind::Exists) => {
                 self.discard(1);
                 let subquery = self.parse_parenthesized(Self::parse_select_stmt)?;
                 Ok(Expr::Exists {
@@ -926,15 +926,15 @@ impl<'a> Parser<'a> {
                     negated: false,
                 })
             }
-            Some(TokenKind::Keyword(Keyword::Case)) => {
+            Some(TokenKind::Case) => {
                 self.discard(1);
                 self.parse_case_expr()
             }
-            Some(TokenKind::Keyword(Keyword::Cast)) => {
+            Some(TokenKind::Cast) => {
                 self.discard(1);
                 let (expr, data_type) = self.parse_parenthesized(|p| {
                     let expr = p.parse_expr()?;
-                    p.consume_keyword(Keyword::As)?;
+                    p.consume(TokenKind::As)?;
                     let data_type = p.parse_data_type()?;
                     Ok((expr, data_type))
                 })?;
@@ -965,7 +965,7 @@ impl<'a> Parser<'a> {
             }
             Some(TokenKind::LParen) => {
                 self.discard(1);
-                if self.starts_with([Keyword::Select]) {
+                if self.starts_with([TokenKind::Select]) {
                     let query = self.parse_select_stmt()?;
                     self.consume(TokenKind::RParen)?;
                     Ok(Expr::Subquery(Box::new(query)))
@@ -1016,7 +1016,7 @@ impl<'a> Parser<'a> {
         self.consume(TokenKind::LParen)?;
 
         // Check for DISTINCT
-        let distinct = self.starts_with([Keyword::Distinct]);
+        let distinct = self.starts_with([TokenKind::Distinct]);
         if distinct {
             self.discard(1);
         }
@@ -1063,7 +1063,7 @@ impl<'a> Parser<'a> {
     /// and searched CASE (CASE WHEN condition THEN result).
     fn parse_case_expr(&mut self) -> Result<Expr, SyntaxError> {
         // Check for simple CASE (has operand)
-        let operand = if !self.starts_with([Keyword::When]) {
+        let operand = if !self.starts_with([TokenKind::When]) {
             Some(Box::new(self.parse_expr()?))
         } else {
             None
@@ -1071,10 +1071,10 @@ impl<'a> Parser<'a> {
 
         // Parse WHEN clauses
         let mut when_clauses = Vec::new();
-        while self.starts_with([Keyword::When]) {
+        while self.starts_with([TokenKind::When]) {
             self.discard(1);
             let condition = self.parse_expr()?;
-            self.consume_keyword(Keyword::Then)?;
+            self.consume(TokenKind::Then)?;
             let result = self.parse_expr()?;
             when_clauses.push(WhenClause { condition, result });
         }
@@ -1085,10 +1085,10 @@ impl<'a> Parser<'a> {
 
         // Parse optional ELSE
         let else_result = self
-            .parse_if_keyword(Keyword::Else, Self::parse_expr)?
+            .parse_if_token(TokenKind::Else, Self::parse_expr)?
             .map(Box::new);
 
-        self.consume_keyword(Keyword::End)?;
+        self.consume(TokenKind::End)?;
 
         Ok(Expr::Case {
             operand,
@@ -1100,8 +1100,8 @@ impl<'a> Parser<'a> {
     /// Peeks at the next token and returns the binary operator and its precedence.
     fn peek_binary_op(&self) -> Option<(BinaryOperator, Precedence)> {
         match self.peek(0)? {
-            TokenKind::Keyword(Keyword::Or) => Some((BinaryOperator::Or, Precedence::Or)),
-            TokenKind::Keyword(Keyword::And) => Some((BinaryOperator::And, Precedence::And)),
+            TokenKind::Or => Some((BinaryOperator::Or, Precedence::Or)),
+            TokenKind::And => Some((BinaryOperator::And, Precedence::And)),
             TokenKind::Eq => Some((BinaryOperator::Eq, Precedence::Comparison)),
             TokenKind::Neq => Some((BinaryOperator::Neq, Precedence::Comparison)),
             TokenKind::Lt => Some((BinaryOperator::Lt, Precedence::Comparison)),
@@ -1120,13 +1120,13 @@ impl<'a> Parser<'a> {
 
     // ==================== Parsing utilities ====================
 
-    /// Parses something only if the specified keyword is present.
-    fn parse_if_keyword<T>(
+    /// Parses something only if the specified token is present.
+    fn parse_if_token<T>(
         &mut self,
-        kw: Keyword,
+        kind: TokenKind,
         f: impl FnOnce(&mut Self) -> Result<T, SyntaxError>,
     ) -> Result<Option<T>, SyntaxError> {
-        if self.peek_keyword(0) == Some(kw) {
+        if self.peek(0) == Some(&kind) {
             self.discard(1);
             Ok(Some(f(self)?))
         } else {
@@ -1160,7 +1160,7 @@ impl<'a> Parser<'a> {
 
     /// Parses an optional alias (with or without AS keyword).
     fn parse_as(&mut self) -> Result<Option<String>, SyntaxError> {
-        if self.starts_with([Keyword::As]) {
+        if self.starts_with([TokenKind::As]) {
             self.discard(1);
             return Ok(Some(self.consume_identifier()?));
         }
@@ -1175,7 +1175,7 @@ impl<'a> Parser<'a> {
 
     /// Parses optional IF NOT EXISTS clause.
     fn parse_if_not_exists(&mut self) -> Result<bool, SyntaxError> {
-        if self.starts_with([Keyword::If, Keyword::Not, Keyword::Exists]) {
+        if self.starts_with([TokenKind::If, TokenKind::Not, TokenKind::Exists]) {
             self.discard(3);
             Ok(true)
         } else {
@@ -1185,7 +1185,7 @@ impl<'a> Parser<'a> {
 
     /// Parses optional IF EXISTS clause.
     fn parse_if_exists(&mut self) -> Result<bool, SyntaxError> {
-        if self.starts_with([Keyword::If, Keyword::Exists]) {
+        if self.starts_with([TokenKind::If, TokenKind::Exists]) {
             self.discard(2);
             Ok(true)
         } else {
@@ -1195,12 +1195,12 @@ impl<'a> Parser<'a> {
 
     /// Parses sort direction (ASC/DESC).
     fn parse_sort_direction(&mut self) -> SortDirection {
-        match self.peek_keyword(0) {
-            Some(Keyword::Asc) => {
+        match self.peek(0) {
+            Some(TokenKind::Asc) => {
                 self.discard(1);
                 SortDirection::Asc
             }
-            Some(Keyword::Desc) => {
+            Some(TokenKind::Desc) => {
                 self.discard(1);
                 SortDirection::Desc
             }
@@ -1210,13 +1210,13 @@ impl<'a> Parser<'a> {
 
     /// Parses NULL ordering (NULLS FIRST/LAST).
     fn parse_null_ordering(&mut self) -> Result<NullOrdering, SyntaxError> {
-        if self.starts_with([Keyword::Nulls, Keyword::First]) {
+        if self.starts_with([TokenKind::Nulls, TokenKind::First]) {
             self.discard(2);
             Ok(NullOrdering::First)
-        } else if self.starts_with([Keyword::Nulls, Keyword::Last]) {
+        } else if self.starts_with([TokenKind::Nulls, TokenKind::Last]) {
             self.discard(2);
             Ok(NullOrdering::Last)
-        } else if self.starts_with([Keyword::Nulls]) {
+        } else if self.starts_with([TokenKind::Nulls]) {
             self.discard(1);
             Err(self.unexpected_token_error("FIRST or LAST"))
         } else {
@@ -1243,20 +1243,12 @@ impl<'a> Parser<'a> {
         self.tokens.get(self.pos + nth).map(|t| &t.kind)
     }
 
-    /// Peeks at the keyword at the given offset from current position, if any.
-    fn peek_keyword(&self, nth: usize) -> Option<Keyword> {
-        match self.peek(nth) {
-            Some(TokenKind::Keyword(kw)) => Some(*kw),
-            _ => None,
-        }
-    }
-
-    /// Checks if the next tokens match the given keyword sequence.
-    fn starts_with<const N: usize>(&self, keywords: [Keyword; N]) -> bool {
-        keywords
+    /// Checks if the next tokens match the given token sequence.
+    fn starts_with<const N: usize>(&self, tokens: [TokenKind; N]) -> bool {
+        tokens
             .into_iter()
             .enumerate()
-            .all(|(i, kw)| self.peek_keyword(i) == Some(kw))
+            .all(|(i, kind)| self.peek(i) == Some(&kind))
     }
 
     // --- Consume operations ---
@@ -1273,16 +1265,6 @@ impl<'a> Parser<'a> {
             Ok(())
         } else {
             Err(self.unexpected_token_error(&kind.display_name()))
-        }
-    }
-
-    /// Expects a specific keyword, returning an error if not found.
-    fn consume_keyword(&mut self, kw: Keyword) -> Result<(), SyntaxError> {
-        if self.peek_keyword(0) == Some(kw) {
-            self.discard(1);
-            Ok(())
-        } else {
-            Err(self.unexpected_token_error(&format!("keyword '{}'", kw.as_str())))
         }
     }
 

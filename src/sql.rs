@@ -31,4 +31,4 @@ pub use ast::*;
 pub use error::{Span, SyntaxError};
 pub use lexer::Lexer;
 pub use parser::Parser;
-pub use token::{Keyword, Token, TokenKind};
+pub use token::{Token, TokenKind};
