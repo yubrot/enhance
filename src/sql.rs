@@ -11,7 +11,7 @@
 //!
 //! let sql = "SELECT id, name FROM users WHERE active = TRUE";
 //! let mut parser = Parser::new(sql);
-//! let statement = parser.parse().unwrap();
+//! let statement = parser.parse().unwrap().unwrap();
 //!
 //! match statement {
 //!     Statement::Select(select) => {

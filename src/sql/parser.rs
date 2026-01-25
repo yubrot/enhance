@@ -37,10 +37,18 @@ impl<'a> Parser<'a> {
 
     /// Parses the input and returns a statement.
     ///
+    /// Returns `Ok(None)` for empty queries (whitespace/comments only),
+    /// `Ok(Some(stmt))` for valid SQL statements.
+    ///
     /// # Errors
     ///
     /// Returns a [`SyntaxError`] if the input is not valid SQL.
-    pub fn parse(&mut self) -> Result<Statement, SyntaxError> {
+    pub fn parse(&mut self) -> Result<Option<Statement>, SyntaxError> {
+        // Empty query (only whitespace/comments)
+        if self.is_eof() {
+            return Ok(None);
+        }
+
         let stmt = self.parse_statement()?;
 
         // Optional trailing semicolon
@@ -56,7 +64,7 @@ impl<'a> Parser<'a> {
             ));
         }
 
-        Ok(stmt)
+        Ok(Some(stmt))
     }
 
     /// Parses a single statement.
@@ -1054,7 +1062,18 @@ mod tests {
     use super::*;
 
     fn parse(sql: &str) -> Result<Statement, SyntaxError> {
-        Parser::new(sql).parse()
+        Parser::new(sql)
+            .parse()
+            .and_then(|opt| opt.ok_or_else(|| SyntaxError::new("empty query", Span::at(0))))
+    }
+
+    #[test]
+    fn test_empty_query() {
+        assert!(Parser::new("").parse().unwrap().is_none());
+        assert!(Parser::new("   ").parse().unwrap().is_none());
+        assert!(Parser::new("  \n\t  ").parse().unwrap().is_none());
+        assert!(Parser::new("-- comment").parse().unwrap().is_none());
+        assert!(Parser::new("/* block */").parse().unwrap().is_none());
     }
 
     #[test]

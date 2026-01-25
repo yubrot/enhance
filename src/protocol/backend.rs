@@ -268,8 +268,8 @@ impl ErrorInfo {
     /// Severity defaults to "ERROR".
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
-            severity: &"ERROR",
-            code: code,
+            severity: "ERROR",
+            code,
             message: message.into(),
             position: None,
         }
