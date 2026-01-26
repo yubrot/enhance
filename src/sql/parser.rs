@@ -9,6 +9,40 @@ use super::error::{Span, SyntaxError};
 use super::lexer::Lexer;
 use super::token::{Token, TokenKind};
 
+/// Helper macro to count tokens at compile time.
+macro_rules! count_tokens {
+    () => { 0 };
+    ($head:ident) => { 1 };
+    ($head:ident, $($tail:ident),+) => { 1 + count_tokens!($($tail),+) };
+}
+
+/// Matches token sequences with optional consumption.
+///
+/// Use `[Token1, Token2]!` to match and consume tokens.
+/// Use `[Token1, Token2]` to match without consuming tokens.
+macro_rules! match_tokens {
+    ($self:expr, { [$($token:ident),+]! => $body:expr $(, $($rest:tt)*)? }) => {
+        if $self.starts_with([$(TokenKind::$token),+]) {
+            $self.discard(count_tokens!($($token),+));
+            $body
+        } else {
+            match_tokens!($self, { $($($rest)*)? })
+        }
+    };
+
+    ($self:expr, { [$($token:ident),+] => $body:expr $(, $($rest:tt)*)? }) => {
+        if $self.starts_with([$(TokenKind::$token),+]) {
+            $body
+        } else {
+            match_tokens!($self, { $($($rest)*)? })
+        }
+    };
+
+    ($self:expr, { _ => $default:expr $(,)? }) => {
+        $default
+    };
+}
+
 /// Operator precedence levels (higher = binds tighter).
 ///
 /// Precedence (low to high):
@@ -61,8 +95,6 @@ pub struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    // ==================== Public API ====================
-
     /// Creates a new parser for the given SQL input.
     pub fn new(input: &'a str) -> Self {
         // NOTE: Lexer errors are returned as TokenKind::Error tokens.
@@ -92,10 +124,7 @@ impl<'a> Parser<'a> {
 
         let stmt = self.parse_statement()?;
 
-        // Optional trailing semicolon
-        if matches!(self.peek(0), Some(TokenKind::Semicolon)) {
-            self.discard(1);
-        }
+        match_tokens!(self, { [Semicolon]! => {}, _ => {} });
 
         // Check for unexpected trailing tokens
         if !matches!(self.peek(0), None | Some(TokenKind::Eof)) {
@@ -109,38 +138,28 @@ impl<'a> Parser<'a> {
 
     /// Parses a single statement.
     fn parse_statement(&mut self) -> Result<Statement, SyntaxError> {
-        match self.peek(0) {
-            Some(TokenKind::Explain) => {
-                self.discard(1);
-                Ok(Statement::Explain(Box::new(self.parse_statement()?)))
-            }
-            Some(TokenKind::Begin) => self.parse_begin_stmt(),
-            Some(TokenKind::Commit) => {
-                self.discard(1);
-                Ok(Statement::Commit)
-            }
-            Some(TokenKind::Rollback) => {
-                self.discard(1);
-                Ok(Statement::Rollback)
-            }
-            Some(TokenKind::Set) => self.parse_set_stmt(),
-            Some(TokenKind::Create) => self.parse_create_stmt(),
-            Some(TokenKind::Drop) => self.parse_drop_stmt(),
-            Some(TokenKind::Select) => Ok(Statement::Select(Box::new(self.parse_select_stmt()?))),
-            Some(TokenKind::Insert) => self.parse_insert_stmt(),
-            Some(TokenKind::Update) => self.parse_update_stmt(),
-            Some(TokenKind::Delete) => self.parse_delete_stmt(),
+        match_tokens!(self, {
+            [Explain]! => Ok(Statement::Explain(Box::new(self.parse_statement()?))),
+            [Begin] => self.parse_begin_stmt(),
+            [Commit]! => Ok(Statement::Commit),
+            [Rollback]! => Ok(Statement::Rollback),
+            [Set] => self.parse_set_stmt(),
+            [Create] => self.parse_create_stmt(),
+            [Drop] => self.parse_drop_stmt(),
+            [Select] => Ok(Statement::Select(Box::new(self.parse_select_stmt()?))),
+            [Insert] => self.parse_insert_stmt(),
+            [Update] => self.parse_update_stmt(),
+            [Delete] => self.parse_delete_stmt(),
             _ => Err(self.unexpected_token_error("statement")),
-        }
+        })
     }
 
     /// Parses a BEGIN statement.
     fn parse_begin_stmt(&mut self) -> Result<Statement, SyntaxError> {
-        // BEGIN [TRANSACTION]
         self.consume(TokenKind::Begin)?;
-        if self.starts_with([TokenKind::Transaction]) {
-            self.discard(1);
-        }
+
+        match_tokens!(self, { [Transaction]! => {}, _ => {} });
+
         Ok(Statement::Begin)
     }
 
@@ -156,58 +175,44 @@ impl<'a> Parser<'a> {
 
     /// Parses a CREATE statement (TABLE or INDEX).
     fn parse_create_stmt(&mut self) -> Result<Statement, SyntaxError> {
-        if self.starts_with([TokenKind::Create, TokenKind::Table]) {
-            return self.parse_create_table();
-        }
-        if self.starts_with([TokenKind::Create, TokenKind::Unique, TokenKind::Index])
-            || self.starts_with([TokenKind::Create, TokenKind::Index])
-        {
-            return self.parse_create_index();
-        }
-
-        // Consume CREATE to give a better error message
-        self.consume(TokenKind::Create)?;
-        Err(self.unexpected_token_error("TABLE or INDEX"))
+        match_tokens!(self, {
+            [Create, Table] => self.parse_create_table(),
+            [Create, Unique, Index] => self.parse_create_index(),
+            [Create, Index] => self.parse_create_index(),
+            _ => {
+                // Consume CREATE to give a better error message
+                self.consume(TokenKind::Create)?;
+                Err(self.unexpected_token_error("TABLE or INDEX"))
+            }
+        })
     }
 
     /// Parses a CREATE TABLE statement.
     fn parse_create_table(&mut self) -> Result<Statement, SyntaxError> {
         self.consume(TokenKind::Create)?;
         self.consume(TokenKind::Table)?;
-
-        let if_not_exists = self.parse_if_not_exists()?;
+        let if_not_exists = match_tokens!(self, { [If, Not, Exists]! => true, _ => false });
         let name = self.consume_identifier()?;
 
         self.consume(TokenKind::LParen)?;
-
         let mut columns = Vec::new();
         let mut constraints = Vec::new();
 
         loop {
-            // Check for table-level constraint
-            if matches!(
-                self.peek(0),
-                Some(
-                    TokenKind::Primary
-                        | TokenKind::Unique
-                        | TokenKind::Foreign
-                        | TokenKind::Check
-                        | TokenKind::Constraint
-                )
-            ) {
-                constraints.push(self.parse_table_constraint()?);
-            } else {
-                columns.push(self.parse_column_def()?);
-            }
-
-            if matches!(self.peek(0), Some(TokenKind::Comma)) {
-                self.discard(1);
-            } else {
-                break;
-            }
+            match_tokens!(self, {
+                [Primary] => constraints.push(self.parse_table_constraint()?),
+                [Unique] => constraints.push(self.parse_table_constraint()?),
+                [Foreign] => constraints.push(self.parse_table_constraint()?),
+                [Check] => constraints.push(self.parse_table_constraint()?),
+                [Constraint] => constraints.push(self.parse_table_constraint()?),
+                _ => columns.push(self.parse_column_def()?),
+            });
+            match_tokens!(self, {
+                [Comma]! => continue,
+                [RParen]! => break,
+                _ => return Err(self.unexpected_token_error("',' or ')'")),
+            });
         }
-
-        self.consume(TokenKind::RParen)?;
 
         Ok(Statement::CreateTable(Box::new(CreateTableStmt {
             name,
@@ -215,6 +220,40 @@ impl<'a> Parser<'a> {
             constraints,
             if_not_exists,
         })))
+    }
+
+    /// Parses a table-level constraint.
+    fn parse_table_constraint(&mut self) -> Result<TableConstraint, SyntaxError> {
+        let name = match_tokens!(self, {
+            [Constraint]! => Some(self.consume_identifier()?),
+            _ => None
+        });
+
+        let kind = match_tokens!(self, {
+            [Primary, Key]! => {
+                let columns = self.parse_parenthesized(|p| p.parse_comma_separated(Self::consume_identifier))?;
+                TableConstraintKind::PrimaryKey(columns)
+            },
+            [Unique]! => {
+                let columns = self.parse_parenthesized(|p| p.parse_comma_separated(Self::consume_identifier))?;
+                TableConstraintKind::Unique(columns)
+            },
+            [Check]! => TableConstraintKind::Check(self.parse_parenthesized(Self::parse_expr)?),
+            [Foreign, Key]! => {
+                let columns = self.parse_parenthesized(|p| p.parse_comma_separated(Self::consume_identifier))?;
+                self.consume(TokenKind::References)?;
+                let ref_table = self.consume_identifier()?;
+                let ref_columns = self.parse_parenthesized(|p| p.parse_comma_separated(Self::consume_identifier))?;
+                TableConstraintKind::ForeignKey {
+                    columns,
+                    ref_table,
+                    ref_columns,
+                }
+            },
+            _ => return Err(self.unexpected_token_error("constraint type"))
+        });
+
+        Ok(TableConstraint { name, kind })
     }
 
     /// Parses a column definition.
@@ -230,153 +269,45 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Parses a data type.
-    pub(crate) fn parse_data_type(&mut self) -> Result<DataType, SyntaxError> {
-        match self.peek(0) {
-            Some(TokenKind::Boolean) => {
-                self.discard(1);
-                Ok(DataType::Boolean)
-            }
-            Some(TokenKind::Smallint) => {
-                self.discard(1);
-                Ok(DataType::Smallint)
-            }
-            Some(TokenKind::Integer_ | TokenKind::Int) => {
-                self.discard(1);
-                Ok(DataType::Integer)
-            }
-            Some(TokenKind::Bigint) => {
-                self.discard(1);
-                Ok(DataType::Bigint)
-            }
-            Some(TokenKind::Real) => {
-                self.discard(1);
-                Ok(DataType::Real)
-            }
-            Some(TokenKind::Text) => {
-                self.discard(1);
-                Ok(DataType::Text)
-            }
-            Some(TokenKind::Varchar) => {
-                self.discard(1);
-                let length = self.parse_parenthesized_integer()?;
-                Ok(DataType::Varchar(length))
-            }
-            Some(TokenKind::Bytea) => {
-                self.discard(1);
-                Ok(DataType::Bytea)
-            }
-            Some(TokenKind::Serial) => {
-                self.discard(1);
-                Ok(DataType::Serial)
-            }
-            Some(TokenKind::Double) if self.peek(1) == Some(&TokenKind::Precision) => {
-                self.discard(2);
-                Ok(DataType::DoublePrecision)
-            }
-            _ => Err(self.unexpected_token_error("data type")),
-        }
-    }
-
-    /// Parses an optional parenthesized integer.
-    fn parse_parenthesized_integer(&mut self) -> Result<Option<u32>, SyntaxError> {
-        if matches!(self.peek(0), Some(TokenKind::LParen)) {
-            self.discard(1);
-            let n = self.consume_integer()?;
-            self.consume(TokenKind::RParen)?;
-            Ok(Some(n as u32))
-        } else {
-            Ok(None)
-        }
-    }
-
     /// Parses column constraints.
     fn parse_column_constraints(&mut self) -> Result<Vec<ColumnConstraint>, SyntaxError> {
         let mut constraints = Vec::new();
-
         loop {
-            if self.starts_with([TokenKind::Not, TokenKind::Null]) {
-                self.discard(2);
-                constraints.push(ColumnConstraint::NotNull);
-            } else if self.starts_with([TokenKind::Null]) {
-                self.discard(1);
-                constraints.push(ColumnConstraint::Null);
-            } else if self.starts_with([TokenKind::Primary, TokenKind::Key]) {
-                self.discard(2);
-                constraints.push(ColumnConstraint::PrimaryKey);
-            } else if self.starts_with([TokenKind::Unique]) {
-                self.discard(1);
-                constraints.push(ColumnConstraint::Unique);
-            } else if self.starts_with([TokenKind::Default]) {
-                self.discard(1);
-                let value = self.parse_expr()?;
-                constraints.push(ColumnConstraint::Default(value));
-            } else if self.starts_with([TokenKind::Check]) {
-                self.discard(1);
-                let expr = self.parse_parenthesized(Self::parse_expr)?;
-                constraints.push(ColumnConstraint::Check(expr));
-            } else if self.starts_with([TokenKind::References]) {
-                self.discard(1);
-                let table = self.consume_identifier()?;
-                let column = self.parse_parenthesized_identifier()?;
-                constraints.push(ColumnConstraint::References { table, column });
-            } else {
-                break;
-            }
+            let constraint = match_tokens!(self, {
+                [Not, Null]! => ColumnConstraint::NotNull,
+                [Primary, Key]! => ColumnConstraint::PrimaryKey,
+                [Null]! => ColumnConstraint::Null,
+                [Unique]! => ColumnConstraint::Unique,
+                [Default]! => ColumnConstraint::Default(self.parse_expr()?),
+                [Check]! => ColumnConstraint::Check(self.parse_parenthesized(Self::parse_expr)?),
+                [References]! => {
+                    let table = self.consume_identifier()?;
+                    let column = self.parse_if_parenthesized(Self::consume_identifier)?;
+                    ColumnConstraint::References { table, column }
+                },
+                _ => break
+            });
+            constraints.push(constraint);
         }
-
         Ok(constraints)
     }
 
-    /// Parses an optional parenthesized identifier.
-    fn parse_parenthesized_identifier(&mut self) -> Result<Option<String>, SyntaxError> {
-        if matches!(self.peek(0), Some(TokenKind::LParen)) {
-            self.discard(1);
-            let id = self.consume_identifier()?;
-            self.consume(TokenKind::RParen)?;
-            Ok(Some(id))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Parses a table-level constraint.
-    fn parse_table_constraint(&mut self) -> Result<TableConstraint, SyntaxError> {
-        let name = if self.starts_with([TokenKind::Constraint]) {
-            self.discard(1);
-            Some(self.consume_identifier()?)
-        } else {
-            None
-        };
-
-        let kind = if self.starts_with([TokenKind::Primary, TokenKind::Key]) {
-            self.discard(2);
-            let columns = self.parse_parenthesized(Self::parse_identifier_list)?;
-            TableConstraintKind::PrimaryKey(columns)
-        } else if self.starts_with([TokenKind::Unique]) {
-            self.discard(1);
-            let columns = self.parse_parenthesized(Self::parse_identifier_list)?;
-            TableConstraintKind::Unique(columns)
-        } else if self.starts_with([TokenKind::Check]) {
-            self.discard(1);
-            let expr = self.parse_parenthesized(Self::parse_expr)?;
-            TableConstraintKind::Check(expr)
-        } else if self.starts_with([TokenKind::Foreign, TokenKind::Key]) {
-            self.discard(2);
-            let columns = self.parse_parenthesized(Self::parse_identifier_list)?;
-            self.consume(TokenKind::References)?;
-            let ref_table = self.consume_identifier()?;
-            let ref_columns = self.parse_parenthesized(Self::parse_identifier_list)?;
-            TableConstraintKind::ForeignKey {
-                columns,
-                ref_table,
-                ref_columns,
-            }
-        } else {
-            return Err(self.unexpected_token_error("constraint type"));
-        };
-
-        Ok(TableConstraint { name, kind })
+    /// Parses a data type.
+    pub(crate) fn parse_data_type(&mut self) -> Result<DataType, SyntaxError> {
+        match_tokens!(self, {
+            [Boolean]! => Ok(DataType::Boolean),
+            [Smallint]! => Ok(DataType::Smallint),
+            [Integer_]! => Ok(DataType::Integer),
+            [Int]! => Ok(DataType::Integer),
+            [Bigint]! => Ok(DataType::Bigint),
+            [Double, Precision]! => Ok(DataType::DoublePrecision),
+            [Real]! => Ok(DataType::Real),
+            [Text]! => Ok(DataType::Text),
+            [Bytea]! => Ok(DataType::Bytea),
+            [Serial]! => Ok(DataType::Serial),
+            [Varchar]! => Ok(DataType::Varchar(self.parse_if_parenthesized(Self::consume_integer)?.map(|i| i as u32))),
+            _ => Err(self.unexpected_token_error("data type"))
+        })
     }
 
     /// Parses a CREATE INDEX statement.
@@ -384,18 +315,14 @@ impl<'a> Parser<'a> {
         // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (columns)
         self.consume(TokenKind::Create)?;
 
-        let unique = self.starts_with([TokenKind::Unique]);
-        if unique {
-            self.discard(1);
-        }
+        let unique = match_tokens!(self, { [Unique]! => true, _ => false });
 
         self.consume(TokenKind::Index)?;
 
-        let if_not_exists = self.parse_if_not_exists()?;
+        let if_not_exists = match_tokens!(self, { [If, Not, Exists]! => true, _ => false });
         let name = self.consume_identifier()?;
         self.consume(TokenKind::On)?;
         let table = self.consume_identifier()?;
-
         let columns = self.parse_parenthesized(Self::parse_index_column_list)?;
 
         Ok(Statement::CreateIndex(CreateIndexStmt {
@@ -418,19 +345,15 @@ impl<'a> Parser<'a> {
 
     /// Parses a DROP statement (TABLE or INDEX).
     fn parse_drop_stmt(&mut self) -> Result<Statement, SyntaxError> {
-        // DROP TABLE
-        if self.starts_with([TokenKind::Drop, TokenKind::Table]) {
-            return self.parse_drop_table();
-        }
-
-        // DROP INDEX
-        if self.starts_with([TokenKind::Drop, TokenKind::Index]) {
-            return self.parse_drop_index();
-        }
-
-        // Consume DROP to give a better error message
-        self.consume(TokenKind::Drop)?;
-        Err(self.unexpected_token_error("TABLE or INDEX"))
+        match_tokens!(self, {
+            [Drop, Table] => self.parse_drop_table(),
+            [Drop, Index] => self.parse_drop_index(),
+            _ => {
+                // Consume DROP to give a better error message
+                self.consume(TokenKind::Drop)?;
+                Err(self.unexpected_token_error("TABLE or INDEX"))
+            }
+        })
     }
 
     /// Parses a DROP TABLE statement.
@@ -439,7 +362,7 @@ impl<'a> Parser<'a> {
         self.consume(TokenKind::Drop)?;
         self.consume(TokenKind::Table)?;
 
-        let if_exists = self.parse_if_exists()?;
+        let if_exists = match_tokens!(self, { [If, Exists]! => true, _ => false });
         let name = self.consume_identifier()?;
 
         Ok(Statement::DropTable(DropTableStmt { name, if_exists }))
@@ -451,7 +374,7 @@ impl<'a> Parser<'a> {
         self.consume(TokenKind::Drop)?;
         self.consume(TokenKind::Index)?;
 
-        let if_exists = self.parse_if_exists()?;
+        let if_exists = match_tokens!(self, { [If, Exists]! => true, _ => false });
         let name = self.consume_identifier()?;
 
         Ok(Statement::DropIndex(DropIndexStmt { name, if_exists }))
@@ -462,52 +385,36 @@ impl<'a> Parser<'a> {
         self.consume(TokenKind::Select)?;
 
         // DISTINCT / ALL
-        let distinct = if self.starts_with([TokenKind::Distinct]) {
-            self.discard(1);
-            true
-        } else {
-            if self.starts_with([TokenKind::All]) {
-                self.discard(1);
-            }
-            false
-        };
+        let distinct = match_tokens!(self, { [Distinct]! => true, [All]! => false, _ => false });
 
         // Select list
-        let columns = self.parse_select_list()?;
+        let columns = self.parse_comma_separated(Self::parse_select_item)?;
 
         // FROM clause
-        let from = self.parse_if_token(TokenKind::From, Self::parse_from_clause)?;
+        let from = match_tokens!(self, { [From]! => Some(self.parse_from_clause()?), _ => None });
 
         // WHERE clause
-        let where_clause = self.parse_if_token(TokenKind::Where, Self::parse_expr)?;
+        let where_clause = match_tokens!(self, { [Where]! => Some(self.parse_expr()?), _ => None });
 
         // GROUP BY clause
-        let group_by = if self.starts_with([TokenKind::Group, TokenKind::By]) {
-            self.discard(2);
-            self.parse_expr_list()?
-        } else {
-            vec![]
-        };
+        let group_by = match_tokens!(self, { [Group, By]! => self.parse_comma_separated(Self::parse_expr)?, _ => Vec::new() });
 
         // HAVING clause
-        let having = self.parse_if_token(TokenKind::Having, Self::parse_expr)?;
+        let having = match_tokens!(self, { [Having]! => Some(self.parse_expr()?), _ => None });
 
         // ORDER BY clause
-        let order_by = if self.starts_with([TokenKind::Order, TokenKind::By]) {
-            self.discard(2);
-            self.parse_order_by_list()?
-        } else {
-            vec![]
-        };
+        let order_by =
+            match_tokens!(self, { [Order, By]! => self.parse_order_by_list()?, _ => vec![] });
 
         // LIMIT clause
-        let limit = self.parse_if_token(TokenKind::Limit, Self::parse_expr)?;
+        let limit = match_tokens!(self, { [Limit]! => Some(self.parse_expr()?), _ => None });
 
         // OFFSET clause
-        let offset = self.parse_if_token(TokenKind::Offset, Self::parse_expr)?;
+        let offset = match_tokens!(self, { [Offset]! => Some(self.parse_expr()?), _ => None });
 
         // FOR UPDATE/SHARE
-        let locking = self.parse_if_token(TokenKind::For, Self::parse_locking_clause)?;
+        let locking =
+            match_tokens!(self, { [For]! => Some(self.parse_locking_clause()?), _ => None });
 
         Ok(SelectStmt {
             distinct,
@@ -523,18 +430,13 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Parses the select list (columns/expressions).
-    fn parse_select_list(&mut self) -> Result<Vec<SelectItem>, SyntaxError> {
-        self.parse_comma_separated(Self::parse_select_item)
-    }
-
     /// Parses a single select item.
     fn parse_select_item(&mut self) -> Result<SelectItem, SyntaxError> {
         // Check for *
-        if matches!(self.peek(0), Some(TokenKind::Asterisk)) {
-            self.discard(1);
-            return Ok(SelectItem::Wildcard);
-        }
+        match_tokens!(self, {
+            [Asterisk]! => return Ok(SelectItem::Wildcard),
+            _ => {},
+        });
 
         // Check for table.* (qualified wildcard)
         if let Some(TokenKind::Identifier(name) | TokenKind::QuotedIdentifier(name)) = self.peek(0)
@@ -565,54 +467,31 @@ impl<'a> Parser<'a> {
 
         // Handle JOINs
         loop {
-            let join_type = if self.starts_with([TokenKind::Cross, TokenKind::Join]) {
-                self.discard(2);
-                Some(JoinType::Cross)
-            } else if self.starts_with([TokenKind::Inner, TokenKind::Join]) {
-                self.discard(2);
-                Some(JoinType::Inner)
-            } else if self.starts_with([TokenKind::Left, TokenKind::Outer, TokenKind::Join]) {
-                self.discard(3);
-                Some(JoinType::Left)
-            } else if self.starts_with([TokenKind::Left, TokenKind::Join]) {
-                self.discard(2);
-                Some(JoinType::Left)
-            } else if self.starts_with([TokenKind::Right, TokenKind::Outer, TokenKind::Join]) {
-                self.discard(3);
-                Some(JoinType::Right)
-            } else if self.starts_with([TokenKind::Right, TokenKind::Join]) {
-                self.discard(2);
-                Some(JoinType::Right)
-            } else if self.starts_with([TokenKind::Full, TokenKind::Outer, TokenKind::Join]) {
-                self.discard(3);
-                Some(JoinType::Full)
-            } else if self.starts_with([TokenKind::Full, TokenKind::Join]) {
-                self.discard(2);
-                Some(JoinType::Full)
-            } else if self.starts_with([TokenKind::Join]) {
-                self.discard(1);
-                Some(JoinType::Inner)
-            } else {
-                None
-            };
-
-            let Some(join_type) = join_type else {
-                break;
-            };
+            let join_type = match_tokens!(self, {
+                [Cross, Join]! => JoinType::Cross,
+                [Inner, Join]! => JoinType::Inner,
+                [Left, Outer, Join]! => JoinType::Left,
+                [Left, Join]! => JoinType::Left,
+                [Right, Outer, Join]! => JoinType::Right,
+                [Right, Join]! => JoinType::Right,
+                [Full, Outer, Join]! => JoinType::Full,
+                [Full, Join]! => JoinType::Full,
+                [Join]! => JoinType::Inner,
+                _ => break,
+            });
 
             let right = self.parse_primary_table_ref()?;
 
-            let condition = if join_type == JoinType::Cross {
-                None
-            } else if self.starts_with([TokenKind::On]) {
-                self.discard(1);
-                Some(JoinCondition::On(self.parse_expr()?))
-            } else if self.starts_with([TokenKind::Using]) {
-                self.discard(1);
-                let columns = self.parse_parenthesized(Self::parse_identifier_list)?;
-                Some(JoinCondition::Using(columns))
-            } else {
-                None
+            let condition = match join_type {
+                JoinType::Cross => None,
+                _ => match_tokens!(self, {
+                    [On]! => Some(JoinCondition::On(self.parse_expr()?)),
+                    [Using]! => {
+                        let columns = self.parse_parenthesized(|p| p.parse_comma_separated(Self::consume_identifier))?;
+                        Some(JoinCondition::Using(columns))
+                    },
+                    _ => None,
+                }),
             };
 
             table_ref = TableRef::Join {
@@ -628,29 +507,28 @@ impl<'a> Parser<'a> {
 
     /// Parses a primary table reference (table name or subquery).
     fn parse_primary_table_ref(&mut self) -> Result<TableRef, SyntaxError> {
-        // Subquery
-        if matches!(self.peek(0), Some(TokenKind::LParen)) {
-            self.discard(1);
-            let query = self.parse_select_stmt()?;
-            self.consume(TokenKind::RParen)?;
+        match_tokens!(self, {
+            [LParen]! => {
+                let query = self.parse_select_stmt()?;
+                self.consume(TokenKind::RParen)?;
 
-            // Subquery alias is required
-            if self.starts_with([TokenKind::As]) {
-                self.discard(1);
+                // Subquery alias is required
+                match_tokens!(self, { [As]! => {}, _ => {} });
+                let alias = self.consume_identifier()?;
+
+                Ok(TableRef::Subquery {
+                    query: Box::new(query),
+                    alias,
+                })
+            },
+            _ => {
+                // Table name
+                let name = self.consume_identifier()?;
+                let alias = self.parse_as()?;
+
+                Ok(TableRef::Table { name, alias })
             }
-            let alias = self.consume_identifier()?;
-
-            return Ok(TableRef::Subquery {
-                query: Box::new(query),
-                alias,
-            });
-        }
-
-        // Table name
-        let name = self.consume_identifier()?;
-        let alias = self.parse_as()?;
-
-        Ok(TableRef::Table { name, alias })
+        })
     }
 
     /// Parses ORDER BY item list.
@@ -669,17 +547,11 @@ impl<'a> Parser<'a> {
 
     /// Parses FOR UPDATE/SHARE clause.
     fn parse_locking_clause(&mut self) -> Result<LockingClause, SyntaxError> {
-        let mode = match self.peek(0) {
-            Some(TokenKind::Update) => {
-                self.discard(1);
-                LockMode::Update
-            }
-            Some(TokenKind::Share) => {
-                self.discard(1);
-                LockMode::Share
-            }
-            _ => return Err(self.unexpected_token_error("UPDATE or SHARE")),
-        };
+        let mode = match_tokens!(self, {
+            [Update]! => LockMode::Update,
+            [Share]! => LockMode::Share,
+            _ => return Err(self.unexpected_token_error("UPDATE or SHARE"))
+        });
 
         Ok(LockingClause { mode })
     }
@@ -691,17 +563,16 @@ impl<'a> Parser<'a> {
         let table = self.consume_identifier()?;
 
         // Optional column list
-        let columns = if matches!(self.peek(0), Some(TokenKind::LParen)) {
-            self.parse_parenthesized(Self::parse_identifier_list)?
-        } else {
-            vec![]
-        };
+        let columns = self
+            .parse_if_parenthesized(|p| p.parse_comma_separated(Self::consume_identifier))?
+            .unwrap_or(Vec::new());
 
         // VALUES clause
         self.consume(TokenKind::Values)?;
 
-        let values =
-            self.parse_comma_separated(|p| p.parse_parenthesized(Self::parse_expr_list))?;
+        let values = self.parse_comma_separated(|p| {
+            p.parse_parenthesized(|p| p.parse_comma_separated(Self::parse_expr))
+        })?;
 
         Ok(Statement::Insert(Box::new(InsertStmt {
             table,
@@ -723,7 +594,7 @@ impl<'a> Parser<'a> {
             Ok(Assignment { column, value })
         })?;
 
-        let where_clause = self.parse_if_token(TokenKind::Where, Self::parse_expr)?;
+        let where_clause = match_tokens!(self, { [Where]! => Some(self.parse_expr()?), _ => None });
 
         Ok(Statement::Update(Box::new(UpdateStmt {
             table,
@@ -738,7 +609,7 @@ impl<'a> Parser<'a> {
         self.consume(TokenKind::From)?;
         let table = self.consume_identifier()?;
 
-        let where_clause = self.parse_if_token(TokenKind::Where, Self::parse_expr)?;
+        let where_clause = match_tokens!(self, { [Where]! => Some(self.parse_expr()?), _ => None });
 
         Ok(Statement::Delete(Box::new(DeleteStmt {
             table,
@@ -781,18 +652,20 @@ impl<'a> Parser<'a> {
 
     /// Parses a unary expression (NOT, -, +) or primary expression.
     fn parse_unary_expr(&mut self) -> Result<Expr, SyntaxError> {
-        let (op, precedence) = match self.peek(0) {
-            Some(TokenKind::Not) => (UnaryOperator::Not, Precedence::Not),
-            Some(TokenKind::Minus) => (UnaryOperator::Minus, Precedence::UnaryPlusMinus),
-            Some(TokenKind::Plus) => (UnaryOperator::Plus, Precedence::UnaryPlusMinus),
-            _ => return self.parse_postfix_expr(),
-        };
-        self.discard(1);
-        let operand = self.parse_expr_with_precedence(precedence)?;
-        Ok(Expr::UnaryOp {
-            op,
-            operand: Box::new(operand),
-        })
+        if let Some((op, precedence)) = match_tokens!(self, {
+            [Not]! => Some((UnaryOperator::Not, Precedence::Not)),
+            [Minus]! => Some((UnaryOperator::Minus, Precedence::UnaryPlusMinus)),
+            [Plus]! => Some((UnaryOperator::Plus, Precedence::UnaryPlusMinus)),
+            _ => None
+        }) {
+            let operand = self.parse_expr_with_precedence(precedence)?;
+            Ok(Expr::UnaryOp {
+                op,
+                operand: Box::new(operand),
+            })
+        } else {
+            self.parse_postfix_expr()
+        }
     }
 
     /// Parses postfix expressions (IS NULL, IN, BETWEEN, LIKE, ::, etc.).
@@ -800,47 +673,32 @@ impl<'a> Parser<'a> {
         let mut expr = self.parse_primary_expr()?;
 
         loop {
-            if self.starts_with([TokenKind::Is, TokenKind::Not, TokenKind::Null]) {
-                self.discard(3);
-                expr = Expr::IsNull {
+            expr = match_tokens!(self, {
+                [Is, Not, Null]! => Expr::IsNull {
                     expr: Box::new(expr),
                     negated: true,
-                };
-            } else if self.starts_with([TokenKind::Is, TokenKind::Null]) {
-                self.discard(2);
-                expr = Expr::IsNull {
+                },
+                [Is, Null]! => Expr::IsNull {
                     expr: Box::new(expr),
                     negated: false,
-                };
-            } else if self.starts_with([TokenKind::Not, TokenKind::In]) {
-                self.discard(2);
-                expr = self.parse_in_expr(expr, true)?;
-            } else if self.starts_with([TokenKind::Not, TokenKind::Between]) {
-                self.discard(2);
-                expr = self.parse_between_expr(expr, true)?;
-            } else if self.starts_with([TokenKind::Not, TokenKind::Like])
-                || self.starts_with([TokenKind::Not, TokenKind::Ilike])
-            {
-                self.discard(1); // NOT (LIKE/ILIKE consumed by parse_like_expr)
-                expr = self.parse_like_expr(expr, true)?;
-            } else if self.starts_with([TokenKind::In]) {
-                self.discard(1);
-                expr = self.parse_in_expr(expr, false)?;
-            } else if self.starts_with([TokenKind::Between]) {
-                self.discard(1);
-                expr = self.parse_between_expr(expr, false)?;
-            } else if self.starts_with([TokenKind::Like]) || self.starts_with([TokenKind::Ilike]) {
-                expr = self.parse_like_expr(expr, false)?;
-            } else if matches!(self.peek(0), Some(TokenKind::DoubleColon)) {
-                self.discard(1);
-                let data_type = self.parse_data_type()?;
-                expr = Expr::Cast {
-                    expr: Box::new(expr),
-                    data_type,
-                };
-            } else {
-                break;
-            }
+                },
+                [Not, In]! => self.parse_in_expr(expr, true)?,
+                [Not, Between]! => self.parse_between_expr(expr, true)?,
+                [Not, Like]! => self.parse_like_expr(expr, false, true)?,
+                [Not, Ilike]! => self.parse_like_expr(expr, true, true)?,
+                [In]! => self.parse_in_expr(expr, false)?,
+                [Between]! => self.parse_between_expr(expr, false)?,
+                [Like]! => self.parse_like_expr(expr, false, false)?,
+                [Ilike]! => self.parse_like_expr(expr, true, false)?,
+                [DoubleColon]! => {
+                    let data_type = self.parse_data_type()?;
+                    Expr::Cast {
+                        expr: Box::new(expr),
+                        data_type,
+                    }
+                },
+                _ => break,
+            });
         }
 
         Ok(expr)
@@ -849,23 +707,26 @@ impl<'a> Parser<'a> {
     /// Parses IN expression (after IN keyword consumed).
     fn parse_in_expr(&mut self, expr: Expr, negated: bool) -> Result<Expr, SyntaxError> {
         self.consume(TokenKind::LParen)?;
-        if self.starts_with([TokenKind::Select]) {
-            let subquery = self.parse_select_stmt()?;
-            self.consume(TokenKind::RParen)?;
-            Ok(Expr::InSubquery {
-                expr: Box::new(expr),
-                subquery: Box::new(subquery),
-                negated,
-            })
-        } else {
-            let list = self.parse_expr_list()?;
-            self.consume(TokenKind::RParen)?;
-            Ok(Expr::InList {
-                expr: Box::new(expr),
-                list,
-                negated,
-            })
-        }
+        match_tokens!(self, {
+            [Select] => {
+                let subquery = self.parse_select_stmt()?;
+                self.consume(TokenKind::RParen)?;
+                Ok(Expr::InSubquery {
+                    expr: Box::new(expr),
+                    subquery: Box::new(subquery),
+                    negated,
+                })
+            },
+            _ => {
+                let list = self.parse_comma_separated(Self::parse_expr)?;
+                self.consume(TokenKind::RParen)?;
+                Ok(Expr::InList {
+                    expr: Box::new(expr),
+                    list,
+                    negated,
+                })
+            }
+        })
     }
 
     /// Parses BETWEEN expression (after BETWEEN keyword consumed).
@@ -881,19 +742,18 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Parses LIKE/ILIKE expression (consumes keyword itself).
-    fn parse_like_expr(&mut self, expr: Expr, negated: bool) -> Result<Expr, SyntaxError> {
-        let case_insensitive = self.starts_with([TokenKind::Ilike]);
-        self.discard(1); // consume LIKE or ILIKE
+    /// Parses LIKE/ILIKE expression (after LIKE/ILIKE keyword consumed).
+    fn parse_like_expr(
+        &mut self,
+        expr: Expr,
+        case_insensitive: bool,
+        negated: bool,
+    ) -> Result<Expr, SyntaxError> {
         let pattern = self.parse_expr_with_precedence(Precedence::Comparison)?;
-        let escape = if self.starts_with([TokenKind::Escape]) {
-            self.discard(1);
-            Some(Box::new(
-                self.parse_expr_with_precedence(Precedence::Comparison)?,
-            ))
-        } else {
-            None
-        };
+        let escape = match_tokens!(self, {
+            [Escape]! => Some(Box::new(self.parse_expr_with_precedence(Precedence::Comparison)?)),
+            _ => None
+        });
         Ok(Expr::Like {
             expr: Box::new(expr),
             pattern: Box::new(pattern),
@@ -905,44 +765,54 @@ impl<'a> Parser<'a> {
 
     /// Parses a primary expression (literals, identifiers, function calls, etc.).
     fn parse_primary_expr(&mut self) -> Result<Expr, SyntaxError> {
-        match self.peek(0) {
-            Some(TokenKind::Null) => {
-                self.discard(1);
-                Ok(Expr::Null)
-            }
-            Some(TokenKind::True) => {
-                self.discard(1);
-                Ok(Expr::Boolean(true))
-            }
-            Some(TokenKind::False) => {
-                self.discard(1);
-                Ok(Expr::Boolean(false))
-            }
-            Some(TokenKind::Exists) => {
-                self.discard(1);
+        match_tokens!(self, {
+            [Null]! => return Ok(Expr::Null),
+            [True]! => return Ok(Expr::Boolean(true)),
+            [False]! => return Ok(Expr::Boolean(false)),
+            [Exists]! => {
                 let subquery = self.parse_parenthesized(Self::parse_select_stmt)?;
-                Ok(Expr::Exists {
+                return Ok(Expr::Exists {
                     subquery: Box::new(subquery),
                     negated: false,
                 })
-            }
-            Some(TokenKind::Case) => {
-                self.discard(1);
-                self.parse_case_expr()
-            }
-            Some(TokenKind::Cast) => {
-                self.discard(1);
+            },
+            [Case]! => return self.parse_case_expr(),
+            [Cast]! => {
                 let (expr, data_type) = self.parse_parenthesized(|p| {
                     let expr = p.parse_expr()?;
                     p.consume(TokenKind::As)?;
                     let data_type = p.parse_data_type()?;
                     Ok((expr, data_type))
                 })?;
-                Ok(Expr::Cast {
+                return Ok(Expr::Cast {
                     expr: Box::new(expr),
                     data_type,
                 })
-            }
+            },
+            [LParen]! => {
+                let expr = match_tokens!(self, {
+                    [Select] => {
+                        let query = self.parse_select_stmt()?;
+                        self.consume(TokenKind::RParen)?;
+                        Expr::Subquery(Box::new(query))
+                    },
+                    _ => {
+                        let expr = self.parse_expr()?;
+                        self.consume(TokenKind::RParen)?;
+                        expr
+                    }
+                });
+                return Ok(expr)
+            },
+            [Asterisk]! => return Ok(Expr::ColumnRef {
+                table: None,
+                column: "*".to_string(),
+            }),
+            _ => {}
+        });
+
+        // Handle tokens with values (Integer, Float, String, Parameter, Identifier)
+        match self.peek(0) {
             Some(TokenKind::Integer(n)) => {
                 let n = *n;
                 self.discard(1);
@@ -963,48 +833,25 @@ impl<'a> Parser<'a> {
                 self.discard(1);
                 Ok(Expr::Parameter(n))
             }
-            Some(TokenKind::LParen) => {
-                self.discard(1);
-                if self.starts_with([TokenKind::Select]) {
-                    let query = self.parse_select_stmt()?;
-                    self.consume(TokenKind::RParen)?;
-                    Ok(Expr::Subquery(Box::new(query)))
-                } else {
-                    let expr = self.parse_expr()?;
-                    self.consume(TokenKind::RParen)?;
-                    Ok(expr)
-                }
-            }
             Some(TokenKind::Identifier(name) | TokenKind::QuotedIdentifier(name)) => {
                 let name = name.clone();
                 self.discard(1);
 
-                // Function call
-                if matches!(self.peek(0), Some(TokenKind::LParen)) {
-                    return self.parse_function_call(name);
-                }
-
-                // Qualified column reference (table.column)
-                if matches!(self.peek(0), Some(TokenKind::Dot)) {
-                    self.discard(1);
-                    let column = self.consume_identifier()?;
-                    return Ok(Expr::ColumnRef {
-                        table: Some(name),
-                        column,
-                    });
-                }
-
-                Ok(Expr::ColumnRef {
-                    table: None,
-                    column: name,
-                })
-            }
-            // Asterisk (for COUNT(*))
-            Some(TokenKind::Asterisk) => {
-                self.discard(1);
-                Ok(Expr::ColumnRef {
-                    table: None,
-                    column: "*".to_string(),
+                match_tokens!(self, {
+                    // Function call
+                    [LParen] => self.parse_function_call(name),
+                    // Qualified column reference (table.column)
+                    [Dot]! => {
+                        let column = self.consume_identifier()?;
+                        Ok(Expr::ColumnRef {
+                            table: Some(name),
+                            column,
+                        })
+                    },
+                    _ => Ok(Expr::ColumnRef {
+                        table: None,
+                        column: name,
+                    }),
                 })
             }
             _ => Err(self.unexpected_token_error("expression")),
@@ -1016,37 +863,15 @@ impl<'a> Parser<'a> {
         self.consume(TokenKind::LParen)?;
 
         // Check for DISTINCT
-        let distinct = self.starts_with([TokenKind::Distinct]);
-        if distinct {
-            self.discard(1);
-        }
+        let distinct = match_tokens!(self, { [Distinct]! => true, _ => false });
 
-        // Check for empty argument list or wildcard
-        if matches!(self.peek(0), Some(TokenKind::RParen)) {
-            self.discard(1);
-            return Ok(Expr::Function {
-                name,
-                args: vec![],
-                distinct,
-            });
-        }
-
-        // Check for COUNT(*)
-        if matches!(self.peek(0), Some(TokenKind::Asterisk)) {
-            self.discard(1);
-            self.consume(TokenKind::RParen)?;
-            return Ok(Expr::Function {
-                name,
-                args: vec![Expr::ColumnRef {
-                    table: None,
-                    column: "*".to_string(),
-                }],
-                distinct,
-            });
-        }
-
-        // Parse argument list
-        let args = self.parse_comma_separated(Self::parse_expr)?;
+        let args = match_tokens!(self, {
+            // Check for empty argument list or wildcard
+            [RParen]! => Vec::new(),
+            // Check for COUNT(*)
+            [Asterisk]! => vec![Expr::ColumnRef { table: None, column: "*".to_string() }],
+            _ => self.parse_comma_separated(Self::parse_expr)?,
+        });
 
         self.consume(TokenKind::RParen)?;
 
@@ -1063,16 +888,14 @@ impl<'a> Parser<'a> {
     /// and searched CASE (CASE WHEN condition THEN result).
     fn parse_case_expr(&mut self) -> Result<Expr, SyntaxError> {
         // Check for simple CASE (has operand)
-        let operand = if !self.starts_with([TokenKind::When]) {
-            Some(Box::new(self.parse_expr()?))
-        } else {
-            None
-        };
+        let operand = match_tokens!(self, {
+            [When] => None,
+            _ => Some(Box::new(self.parse_expr()?)),
+        });
 
         // Parse WHEN clauses
         let mut when_clauses = Vec::new();
-        while self.starts_with([TokenKind::When]) {
-            self.discard(1);
+        while match_tokens!(self, { [When]! => true, _ => false }) {
             let condition = self.parse_expr()?;
             self.consume(TokenKind::Then)?;
             let result = self.parse_expr()?;
@@ -1084,9 +907,10 @@ impl<'a> Parser<'a> {
         }
 
         // Parse optional ELSE
-        let else_result = self
-            .parse_if_token(TokenKind::Else, Self::parse_expr)?
-            .map(Box::new);
+        let else_result = match_tokens!(self, {
+            [Else]! => Some(Box::new(self.parse_expr()?)),
+            _ => None
+        });
 
         self.consume(TokenKind::End)?;
 
@@ -1099,40 +923,26 @@ impl<'a> Parser<'a> {
 
     /// Peeks at the next token and returns the binary operator and its precedence.
     fn peek_binary_op(&self) -> Option<(BinaryOperator, Precedence)> {
-        match self.peek(0)? {
-            TokenKind::Or => Some((BinaryOperator::Or, Precedence::Or)),
-            TokenKind::And => Some((BinaryOperator::And, Precedence::And)),
-            TokenKind::Eq => Some((BinaryOperator::Eq, Precedence::Comparison)),
-            TokenKind::Neq => Some((BinaryOperator::Neq, Precedence::Comparison)),
-            TokenKind::Lt => Some((BinaryOperator::Lt, Precedence::Comparison)),
-            TokenKind::LtEq => Some((BinaryOperator::LtEq, Precedence::Comparison)),
-            TokenKind::Gt => Some((BinaryOperator::Gt, Precedence::Comparison)),
-            TokenKind::GtEq => Some((BinaryOperator::GtEq, Precedence::Comparison)),
-            TokenKind::Concat => Some((BinaryOperator::Concat, Precedence::Concat)),
-            TokenKind::Plus => Some((BinaryOperator::Add, Precedence::AddSub)),
-            TokenKind::Minus => Some((BinaryOperator::Sub, Precedence::AddSub)),
-            TokenKind::Asterisk => Some((BinaryOperator::Mul, Precedence::MulDiv)),
-            TokenKind::Slash => Some((BinaryOperator::Div, Precedence::MulDiv)),
-            TokenKind::Percent => Some((BinaryOperator::Mod, Precedence::MulDiv)),
-            _ => None,
-        }
+        Some(match_tokens!(self, {
+            [Or] => (BinaryOperator::Or, Precedence::Or),
+            [And] => (BinaryOperator::And, Precedence::And),
+            [Eq] => (BinaryOperator::Eq, Precedence::Comparison),
+            [Neq] => (BinaryOperator::Neq, Precedence::Comparison),
+            [Lt] => (BinaryOperator::Lt, Precedence::Comparison),
+            [LtEq] => (BinaryOperator::LtEq, Precedence::Comparison),
+            [Gt] => (BinaryOperator::Gt, Precedence::Comparison),
+            [GtEq] => (BinaryOperator::GtEq, Precedence::Comparison),
+            [Concat] => (BinaryOperator::Concat, Precedence::Concat),
+            [Plus] => (BinaryOperator::Add, Precedence::AddSub),
+            [Minus] => (BinaryOperator::Sub, Precedence::AddSub),
+            [Asterisk] => (BinaryOperator::Mul, Precedence::MulDiv),
+            [Slash] => (BinaryOperator::Div, Precedence::MulDiv),
+            [Percent] => (BinaryOperator::Mod, Precedence::MulDiv),
+            _ => return None
+        }))
     }
 
     // ==================== Parsing utilities ====================
-
-    /// Parses something only if the specified token is present.
-    fn parse_if_token<T>(
-        &mut self,
-        kind: TokenKind,
-        f: impl FnOnce(&mut Self) -> Result<T, SyntaxError>,
-    ) -> Result<Option<T>, SyntaxError> {
-        if self.peek(0) == Some(&kind) {
-            self.discard(1);
-            Ok(Some(f(self)?))
-        } else {
-            Ok(None)
-        }
-    }
 
     /// Parses content within parentheses.
     fn parse_parenthesized<T>(
@@ -1145,14 +955,27 @@ impl<'a> Parser<'a> {
         Ok(result)
     }
 
+    fn parse_if_parenthesized<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, SyntaxError>,
+    ) -> Result<Option<T>, SyntaxError> {
+        match_tokens!(self, {
+            [LParen]! => {
+                let result = f(self)?;
+                self.consume(TokenKind::RParen)?;
+                Ok(Some(result))
+            },
+            _ => Ok(None),
+        })
+    }
+
     /// Parses a comma-separated list of items.
     fn parse_comma_separated<T>(
         &mut self,
         mut f: impl FnMut(&mut Self) -> Result<T, SyntaxError>,
     ) -> Result<Vec<T>, SyntaxError> {
         let mut items = vec![f(self)?];
-        while matches!(self.peek(0), Some(TokenKind::Comma)) {
-            self.discard(1);
+        while match_tokens!(self, { [Comma]! => true, _ => false }) {
             items.push(f(self)?);
         }
         Ok(items)
@@ -1160,83 +983,39 @@ impl<'a> Parser<'a> {
 
     /// Parses an optional alias (with or without AS keyword).
     fn parse_as(&mut self) -> Result<Option<String>, SyntaxError> {
-        if self.starts_with([TokenKind::As]) {
-            self.discard(1);
-            return Ok(Some(self.consume_identifier()?));
-        }
-        // Alias without AS: identifier that's not a reserved keyword
-        if let Some(TokenKind::Identifier(name)) = self.peek(0) {
-            let alias = name.clone();
-            self.discard(1);
-            return Ok(Some(alias));
-        }
-        Ok(None)
-    }
-
-    /// Parses optional IF NOT EXISTS clause.
-    fn parse_if_not_exists(&mut self) -> Result<bool, SyntaxError> {
-        if self.starts_with([TokenKind::If, TokenKind::Not, TokenKind::Exists]) {
-            self.discard(3);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    /// Parses optional IF EXISTS clause.
-    fn parse_if_exists(&mut self) -> Result<bool, SyntaxError> {
-        if self.starts_with([TokenKind::If, TokenKind::Exists]) {
-            self.discard(2);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        match_tokens!(self, {
+            [As]! => Ok(Some(self.consume_identifier()?)),
+            _ => {
+                if matches!(self.peek(0), Some(TokenKind::Identifier(_))) {
+                    // Alias without AS: identifier that's not a reserved keyword
+                    Ok(Some(self.consume_identifier()?))
+                } else {
+                    Ok(None)
+                }
+            }
+        })
     }
 
     /// Parses sort direction (ASC/DESC).
     fn parse_sort_direction(&mut self) -> SortDirection {
-        match self.peek(0) {
-            Some(TokenKind::Asc) => {
-                self.discard(1);
-                SortDirection::Asc
-            }
-            Some(TokenKind::Desc) => {
-                self.discard(1);
-                SortDirection::Desc
-            }
-            _ => SortDirection::default(),
-        }
+        match_tokens!(self, {
+            [Asc]! => SortDirection::Asc,
+            [Desc]! => SortDirection::Desc,
+            _ => SortDirection::default()
+        })
     }
 
     /// Parses NULL ordering (NULLS FIRST/LAST).
     fn parse_null_ordering(&mut self) -> Result<NullOrdering, SyntaxError> {
-        if self.starts_with([TokenKind::Nulls, TokenKind::First]) {
-            self.discard(2);
-            Ok(NullOrdering::First)
-        } else if self.starts_with([TokenKind::Nulls, TokenKind::Last]) {
-            self.discard(2);
-            Ok(NullOrdering::Last)
-        } else if self.starts_with([TokenKind::Nulls]) {
-            self.discard(1);
-            Err(self.unexpected_token_error("FIRST or LAST"))
-        } else {
-            Ok(NullOrdering::default())
-        }
-    }
-
-    /// Parses a comma-separated list of identifiers.
-    fn parse_identifier_list(&mut self) -> Result<Vec<String>, SyntaxError> {
-        self.parse_comma_separated(Self::consume_identifier)
-    }
-
-    /// Parses a comma-separated list of expressions.
-    fn parse_expr_list(&mut self) -> Result<Vec<Expr>, SyntaxError> {
-        self.parse_comma_separated(Self::parse_expr)
+        match_tokens!(self, {
+            [Nulls, First]! => Ok(NullOrdering::First),
+            [Nulls, Last]! => Ok(NullOrdering::Last),
+            [Nulls]! => Err(self.unexpected_token_error("FIRST or LAST")),
+            _ => Ok(NullOrdering::default())
+        })
     }
 
     // ==================== Token utilities ====================
-
-    // --- Peek operations ---
 
     /// Peeks at the kind of a token at the given offset from current position.
     fn peek(&self, nth: usize) -> Option<&TokenKind> {
@@ -1250,8 +1029,6 @@ impl<'a> Parser<'a> {
             .enumerate()
             .all(|(i, kind)| self.peek(i) == Some(&kind))
     }
-
-    // --- Consume operations ---
 
     /// Advances by the given number of tokens.
     fn discard(&mut self, count: usize) {
@@ -1291,8 +1068,6 @@ impl<'a> Parser<'a> {
             _ => Err(self.unexpected_token_error("integer")),
         }
     }
-
-    // --- Error helpers ---
 
     /// Creates an unexpected token error with the current position.
     fn unexpected_token_error(&self, expected: &str) -> SyntaxError {
