@@ -25,7 +25,7 @@ pub const PAGE_VERSION: u8 = 1;
 pub enum PageType {
     /// Uninitialized or free page.
     Free = 0,
-    /// Heap page with slotted records.
+    /// Heap page with slotted tuples.
     Heap = 1,
 }
 
@@ -76,7 +76,7 @@ pub struct PageHeader {
     pub slot_count: u16,
     /// Index of first free (deleted) slot, or `u16::MAX` if none (for heap pages).
     pub first_free_slot: u16,
-    /// Offset where free space ends (start of record area, for heap pages).
+    /// Offset where free space ends (start of tuple/data area, for heap pages).
     pub free_end: u16,
 }
 

@@ -1,6 +1,6 @@
 //! Heap page implementation using slotted page structure.
 //!
-//! A heap page manages variable-length records within a fixed 8KB page.
+//! A heap page manages variable-length tuples within a fixed 8KB page.
 //! The page layout consists of:
 //!
 //! ```text
@@ -14,12 +14,12 @@
 //! | Free Space       |
 //! |                  |
 //! +------------------+ offset header.free_end
-//! | Records          |
+//! | Tuples/Data      |
 //! |     ...[2][1][0] | (grows up)
 //! +------------------+ offset 8192
 //! ```
 //!
-//! Records are stored from the bottom of the page upward, while the slot array
+//! Tuple data is stored from the bottom of the page upward, while the slot array
 //! grows downward from the header. This allows both to grow toward each other,
 //! maximizing space utilization.
 
@@ -28,13 +28,13 @@ use super::record::Record;
 use crate::storage::{PAGE_HEADER_SIZE, PAGE_SIZE, PageHeader};
 use crate::tx::{CommandId, TupleHeader, TxId, TUPLE_HEADER_SIZE};
 
-// Should be able to insert a max-sized record
-pub const MAX_RECORD_SIZE: usize = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE;
+// Maximum size for slot data (raw bytes stored in a slot)
+pub const MAX_SLOT_DATA_SIZE: usize = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE;
 
-/// Maximum size for tuple payload (record + tuple header).
+/// Maximum size for record (data values only, without tuple header).
 ///
-/// Account for tuple header in max payload size.
-pub const MAX_TUPLE_PAYLOAD_SIZE: usize = MAX_RECORD_SIZE - TUPLE_HEADER_SIZE;
+/// This is the actual space available for user data after accounting for the tuple header.
+pub const MAX_RECORD_SIZE: usize = MAX_SLOT_DATA_SIZE - TUPLE_HEADER_SIZE;
 
 /// Size of each slot entry in bytes.
 pub const SLOT_SIZE: usize = 4;
@@ -112,9 +112,9 @@ impl SlotEntry {
     }
 }
 
-/// A heap page for storing variable-length records.
+/// A heap page for storing variable-length tuples.
 ///
-/// This struct provides methods for manipulating records within a page.
+/// This struct provides methods for manipulating tuples and slot data within a page.
 /// Internally uses a slotted page layout where records grow upward from
 /// the bottom and the slot array grows downward from the header.
 ///
@@ -135,7 +135,7 @@ impl SlotEntry {
 /// page.init();
 ///
 /// let slot_id = page.insert(b"hello world").unwrap();
-/// assert_eq!(page.record(slot_id), Some(b"hello world".as_slice()));
+/// assert_eq!(page.slot_data(slot_id), Some(b"hello world".as_slice()));
 /// ```
 pub struct HeapPage<T> {
     data: T,
@@ -192,10 +192,10 @@ impl<T: AsRef<[u8]>> HeapPage<T> {
         SlotEntry::read(&self.data()[offset..offset + SLOT_SIZE])
     }
 
-    /// Reads a record by slot ID.
+    /// Reads slot data (raw bytes) by slot ID.
     ///
     /// Returns `None` if the slot is out of bounds or deleted.
-    pub fn record(&self, slot_id: SlotId) -> Option<&[u8]> {
+    pub fn slot_data(&self, slot_id: SlotId) -> Option<&[u8]> {
         let header = self.header();
         if slot_id >= header.slot_count {
             return None;
@@ -211,10 +211,12 @@ impl<T: AsRef<[u8]>> HeapPage<T> {
         Some(&self.data()[start..end])
     }
 
-    /// Returns an iterator over all valid (non-deleted) records.
-    pub fn records(&self) -> impl Iterator<Item = (SlotId, &[u8])> {
+    /// Returns an iterator over all valid (non-deleted) slot entries.
+    ///
+    /// Each entry is a tuple of (slot_id, raw_data).
+    pub fn slot_entries(&self) -> impl Iterator<Item = (SlotId, &[u8])> {
         let header = self.header();
-        (0..header.slot_count).filter_map(move |slot_id| Some((slot_id, self.record(slot_id)?)))
+        (0..header.slot_count).filter_map(move |slot_id| Some((slot_id, self.slot_data(slot_id)?)))
     }
 
     /// Returns the fragmentation ratio (0.0 = no fragmentation, 1.0 = all garbage).
@@ -453,7 +455,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> HeapPage<T> {
             .serialize(&mut buf[TUPLE_HEADER_SIZE..])
             .map_err(|e| HeapError::Serialization(e.to_string()))?;
 
-        // Insert as a single record
+        // Insert as raw slot data
         self.insert(&buf)
     }
 
@@ -499,7 +501,7 @@ impl<T: AsRef<[u8]>> HeapPage<T> {
     ///
     /// Returns `None` if the slot is out of bounds or deleted.
     pub fn get_tuple(&self, slot_id: SlotId, schema: &[i32]) -> Option<(TupleHeader, Record)> {
-        let raw = self.record(slot_id)?;
+        let raw = self.slot_data(slot_id)?;
         if raw.len() < TUPLE_HEADER_SIZE {
             return None;
         }
@@ -560,8 +562,8 @@ mod tests {
         let slot_id = page.insert(record).unwrap();
 
         assert_eq!(slot_id, 0);
-        assert_eq!(page.record(slot_id), Some(record.as_slice()));
-        assert_eq!(page.records().count(), 1);
+        assert_eq!(page.slot_data(slot_id), Some(record.as_slice()));
+        assert_eq!(page.slot_entries().count(), 1);
     }
 
     #[test]
@@ -573,17 +575,17 @@ mod tests {
 
         assert_eq!(slot_ids, vec![0, 1, 2]);
         for (slot_id, expected) in slot_ids.iter().zip(records.iter()) {
-            assert_eq!(page.record(*slot_id), Some(*expected));
+            assert_eq!(page.slot_data(*slot_id), Some(*expected));
         }
-        assert_eq!(page.records().count(), 3);
+        assert_eq!(page.slot_entries().count(), 3);
     }
 
     #[test]
     fn test_read_invalid_slot() {
         let page = create_page();
 
-        assert!(page.record(0).is_none());
-        assert!(page.record(100).is_none());
+        assert!(page.slot_data(0).is_none());
+        assert!(page.slot_data(100).is_none());
     }
 
     #[test]
@@ -595,14 +597,14 @@ mod tests {
 
         page.delete(slot0).unwrap();
 
-        assert!(page.record(slot0).is_none());
-        assert_eq!(page.record(slot1), Some(b"record1".as_slice()));
-        assert_eq!(page.records().count(), 1);
+        assert!(page.slot_data(slot0).is_none());
+        assert_eq!(page.slot_data(slot1), Some(b"record1".as_slice()));
+        assert_eq!(page.slot_entries().count(), 1);
 
         // New insert should reuse the deleted slot
         let slot2 = page.insert(b"record2").unwrap();
         assert_eq!(slot2, slot0);
-        assert_eq!(page.record(slot2), Some(b"record2".as_slice()));
+        assert_eq!(page.slot_data(slot2), Some(b"record2".as_slice()));
     }
 
     #[test]
@@ -624,7 +626,7 @@ mod tests {
         assert_eq!(page.insert(b"z").unwrap(), 3);
 
         // Untouched slot remains intact
-        assert_eq!(page.record(slot1), Some(b"b".as_slice()));
+        assert_eq!(page.slot_data(slot1), Some(b"b".as_slice()));
     }
 
     #[test]
@@ -647,7 +649,7 @@ mod tests {
         let slot = page.insert(b"hello world").unwrap();
         page.update(slot, b"hi").unwrap();
 
-        assert_eq!(page.record(slot), Some(b"hi".as_slice()));
+        assert_eq!(page.slot_data(slot), Some(b"hi".as_slice()));
     }
 
     #[test]
@@ -657,7 +659,7 @@ mod tests {
         let slot = page.insert(b"hi").unwrap();
         page.update(slot, b"hello world").unwrap();
 
-        assert_eq!(page.record(slot), Some(b"hello world".as_slice()));
+        assert_eq!(page.slot_data(slot), Some(b"hello world".as_slice()));
     }
 
     #[test]
@@ -715,9 +717,9 @@ mod tests {
         assert!(page.header().free_space(SLOT_SIZE) > free_before);
 
         // Records still readable
-        assert!(page.record(slot0).is_some());
-        assert!(page.record(slot1).is_none()); // Still deleted
-        assert!(page.record(slot2).is_some());
+        assert!(page.slot_data(slot0).is_some());
+        assert!(page.slot_data(slot1).is_none()); // Still deleted
+        assert!(page.slot_data(slot2).is_some());
 
         // Can insert using recovered space (reuses deleted slot)
         let slot3 = page.insert(&large_record).unwrap();
@@ -725,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn test_records() {
+    fn test_slot_entries() {
         let mut page = create_page();
 
         page.insert(b"first").unwrap();
@@ -734,19 +736,19 @@ mod tests {
 
         page.delete(slot1).unwrap();
 
-        let records: Vec<_> = page.records().collect();
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0], (0, b"first".as_slice()));
-        assert_eq!(records[1], (2, b"third".as_slice()));
+        let entries: Vec<_> = page.slot_entries().collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], (0, b"first".as_slice()));
+        assert_eq!(entries[1], (2, b"third".as_slice()));
     }
 
     #[test]
-    fn test_max_record_size() {
+    fn test_max_slot_data_size() {
         let mut page = create_page();
 
-        let max_record = vec![0u8; MAX_RECORD_SIZE];
-        let slot = page.insert(&max_record).unwrap();
-        assert_eq!(page.record(slot).map(|r| r.len()), Some(MAX_RECORD_SIZE));
+        let max_data = vec![0u8; MAX_SLOT_DATA_SIZE];
+        let slot = page.insert(&max_data).unwrap();
+        assert_eq!(page.slot_data(slot).map(|r| r.len()), Some(MAX_SLOT_DATA_SIZE));
 
         // But not another one
         assert!(matches!(
@@ -776,7 +778,7 @@ mod tests {
         let mut page = create_page();
 
         let slot = page.insert(b"").unwrap();
-        assert_eq!(page.record(slot), Some(b"".as_slice()));
+        assert_eq!(page.slot_data(slot), Some(b"".as_slice()));
     }
 
     // ========================================================================

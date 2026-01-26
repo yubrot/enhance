@@ -5,9 +5,9 @@ use std::fmt;
 /// Errors from heap operations.
 #[derive(Debug)]
 pub enum HeapError {
-    /// Page is full, cannot insert record.
+    /// Page is full, cannot insert data.
     PageFull {
-        /// Bytes required for the record and slot.
+        /// Bytes required for the data and slot.
         required: usize,
         /// Bytes available in free space.
         available: usize,
