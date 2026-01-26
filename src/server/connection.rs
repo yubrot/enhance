@@ -2,19 +2,20 @@ mod error;
 mod state;
 
 pub use error::ConnectionError;
-use state::{ConnectionState, Portal, PreparedStatement};
+use state::{ConnectionState, Portal, PreparedStatement, TxState};
 
 use futures_util::{SinkExt, StreamExt};
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
 use crate::protocol::{
     BackendMessage, BindMessage, CloseMessage, CloseTarget, DescribeMessage, DescribeTarget,
-    ErrorInfo, ExecuteMessage, FrontendMessage, ParseMessage, PostgresCodec, TransactionStatus,
-    sql_state,
+    ErrorInfo, ExecuteMessage, FrontendMessage, ParseMessage, PostgresCodec, sql_state,
 };
 use crate::sql::{Parser, Statement};
+use crate::tx::TransactionManager;
 
 /// A single client connection.
 ///
@@ -33,14 +34,20 @@ pub struct Connection {
     framed: Framed<TcpStream, PostgresCodec>,
     pid: i32,
     state: ConnectionState,
+    tx_manager: Arc<TransactionManager>,
 }
 
 impl Connection {
-    pub fn new(framed: Framed<TcpStream, PostgresCodec>, pid: i32) -> Self {
+    pub fn new(
+        framed: Framed<TcpStream, PostgresCodec>,
+        pid: i32,
+        tx_manager: Arc<TransactionManager>,
+    ) -> Self {
         Self {
             framed,
             pid,
             state: ConnectionState::new(),
+            tx_manager,
         }
     }
 
@@ -142,6 +149,35 @@ impl Connection {
                 self.framed.send(BackendMessage::EmptyQueryResponse).await?;
             }
             Ok(Some(stmt)) => {
+                // Handle transaction control commands
+                match &stmt {
+                    Statement::Begin => {
+                        if self.state.tx_state() == TxState::Idle {
+                            let txid = self.tx_manager.begin();
+                            self.state.begin_transaction(txid);
+                        }
+                        // If already in transaction, BEGIN is a no-op (PostgreSQL behavior)
+                    }
+                    Statement::Commit => {
+                        if let Some(txid) = self.state.current_txid() {
+                            self.tx_manager.commit(txid)?;
+                        }
+                        self.state.end_transaction();
+                    }
+                    Statement::Rollback => {
+                        if let Some(txid) = self.state.current_txid() {
+                            let _ = self.tx_manager.abort(txid);
+                        }
+                        self.state.end_transaction();
+                    }
+                    _ => {
+                        // For other statements, increment cid if in transaction
+                        if self.state.tx_state() == TxState::InTransaction {
+                            self.state.increment_cid();
+                        }
+                    }
+                }
+
                 // Successfully parsed
                 let tag = Self::command_tag(&stmt);
 
@@ -164,10 +200,10 @@ impl Connection {
             }
         }
 
-        // Always send ReadyForQuery after response
+        // Always send ReadyForQuery after response with actual transaction status
         self.framed
             .send(BackendMessage::ReadyForQuery {
-                status: TransactionStatus::Idle,
+                status: self.state.tx_state().to_protocol_status(),
             })
             .await?;
 
@@ -348,7 +384,7 @@ impl Connection {
 
         self.framed
             .send(BackendMessage::ReadyForQuery {
-                status: TransactionStatus::Idle,
+                status: self.state.tx_state().to_protocol_status(),
             })
             .await?;
 

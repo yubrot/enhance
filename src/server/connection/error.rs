@@ -1,10 +1,12 @@
 use crate::protocol::ProtocolError;
+use crate::tx::TxError;
 
 /// Connection error types.
 #[derive(Debug)]
 pub enum ConnectionError {
     Io(std::io::Error),
     Protocol(ProtocolError),
+    Transaction(TxError),
 }
 
 impl std::fmt::Display for ConnectionError {
@@ -12,6 +14,7 @@ impl std::fmt::Display for ConnectionError {
         match self {
             ConnectionError::Io(e) => write!(f, "I/O error: {}", e),
             ConnectionError::Protocol(e) => write!(f, "Protocol error: {}", e),
+            ConnectionError::Transaction(e) => write!(f, "Transaction error: {}", e),
         }
     }
 }
@@ -27,5 +30,11 @@ impl From<std::io::Error> for ConnectionError {
 impl From<ProtocolError> for ConnectionError {
     fn from(e: ProtocolError) -> Self {
         ConnectionError::Protocol(e)
+    }
+}
+
+impl From<TxError> for ConnectionError {
+    fn from(e: TxError) -> Self {
+        ConnectionError::Transaction(e)
     }
 }

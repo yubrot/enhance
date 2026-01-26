@@ -24,10 +24,17 @@
 //! maximizing space utilization.
 
 use super::error::HeapError;
+use super::record::Record;
 use crate::storage::{PAGE_HEADER_SIZE, PAGE_SIZE, PageHeader};
+use crate::tx::{CommandId, TupleHeader, TxId, TUPLE_HEADER_SIZE};
 
 // Should be able to insert a max-sized record
 pub const MAX_RECORD_SIZE: usize = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE;
+
+/// Maximum size for tuple payload (record + tuple header).
+///
+/// Account for tuple header in max payload size.
+pub const MAX_TUPLE_PAYLOAD_SIZE: usize = MAX_RECORD_SIZE - TUPLE_HEADER_SIZE;
 
 /// Size of each slot entry in bytes.
 pub const SLOT_SIZE: usize = 4;
@@ -414,6 +421,108 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> HeapPage<T> {
         }
         self.set_header(&header);
     }
+
+    // ========================================================================
+    // MVCC-Aware Methods
+    // ========================================================================
+
+    /// Inserts a record with MVCC tuple header.
+    ///
+    /// This serializes the tuple header and record together into a single
+    /// slot, making MVCC versioning transparent at the page level.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HeapError::PageFull` if there is not enough space.
+    pub fn insert_tuple(
+        &mut self,
+        record: &Record,
+        xmin: TxId,
+        cid: CommandId,
+    ) -> Result<SlotId, HeapError> {
+        // Serialize tuple header + record
+        let header = TupleHeader::new_insert(xmin, cid);
+        let record_size = record.serialized_size();
+        let total_size = TUPLE_HEADER_SIZE + record_size;
+
+        let mut buf = vec![0u8; total_size];
+        header
+            .serialize(&mut buf[..TUPLE_HEADER_SIZE])
+            .map_err(|e| HeapError::Serialization(e.to_string()))?;
+        record
+            .serialize(&mut buf[TUPLE_HEADER_SIZE..])
+            .map_err(|e| HeapError::Serialization(e.to_string()))?;
+
+        // Insert as a single record
+        self.insert(&buf)
+    }
+
+    /// Updates just the tuple header in an existing slot.
+    ///
+    /// This is used to modify transaction visibility information (e.g., setting
+    /// xmax for DELETE) without changing the record data.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HeapError::SlotNotFound` if the slot doesn't exist or is deleted.
+    pub fn update_tuple_header(
+        &mut self,
+        slot_id: SlotId,
+        header: TupleHeader,
+    ) -> Result<(), HeapError> {
+        let page_header = self.header();
+        if slot_id >= page_header.slot_count {
+            return Err(HeapError::SlotNotFound(slot_id));
+        }
+
+        let slot = self.slot(slot_id);
+        if slot.is_empty() {
+            return Err(HeapError::SlotNotFound(slot_id));
+        }
+
+        // Serialize new header and overwrite first TUPLE_HEADER_SIZE bytes
+        let mut header_buf = [0u8; TUPLE_HEADER_SIZE];
+        header
+            .serialize(&mut header_buf)
+            .map_err(|e| HeapError::Serialization(e.to_string()))?;
+
+        let start = slot.offset as usize;
+        self.data_mut()[start..start + TUPLE_HEADER_SIZE].copy_from_slice(&header_buf);
+
+        Ok(())
+    }
+}
+
+// Read-only MVCC methods (available for any T: AsRef<[u8]>)
+impl<T: AsRef<[u8]>> HeapPage<T> {
+    /// Reads a tuple (header + record) by slot ID.
+    ///
+    /// Returns `None` if the slot is out of bounds or deleted.
+    pub fn get_tuple(&self, slot_id: SlotId, schema: &[i32]) -> Option<(TupleHeader, Record)> {
+        let raw = self.record(slot_id)?;
+        if raw.len() < TUPLE_HEADER_SIZE {
+            return None;
+        }
+
+        let header = TupleHeader::deserialize(&raw[..TUPLE_HEADER_SIZE]).ok()?;
+        let record = Record::deserialize(&raw[TUPLE_HEADER_SIZE..], schema).ok()?;
+
+        Some((header, record))
+    }
+
+    /// Returns an iterator over all tuples with headers.
+    ///
+    /// Yields `(SlotId, TupleHeader, Record)` for each valid (non-deleted) slot.
+    pub fn tuples<'a>(
+        &'a self,
+        schema: &'a [i32],
+    ) -> impl Iterator<Item = (SlotId, TupleHeader, Record)> + 'a {
+        let header = self.header();
+        (0..header.slot_count).filter_map(move |slot_id| {
+            let (tuple_header, record) = self.get_tuple(slot_id, schema)?;
+            Some((slot_id, tuple_header, record))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -668,5 +777,150 @@ mod tests {
 
         let slot = page.insert(b"").unwrap();
         assert_eq!(page.record(slot), Some(b"".as_slice()));
+    }
+
+    // ========================================================================
+    // MVCC Tests
+    // ========================================================================
+
+    #[test]
+    fn test_insert_tuple() {
+        use crate::heap::{Record, Value};
+        use crate::protocol::type_oid;
+        use crate::tx::{CommandId, TxId};
+
+        let mut page = create_page();
+        let record = Record::new(vec![Value::Int32(42), Value::Text("hello".to_string())]);
+
+        let slot = page
+            .insert_tuple(&record, TxId::new(1), CommandId::FIRST)
+            .unwrap();
+        assert_eq!(slot, 0);
+
+        // Verify we can read it back
+        let schema = [type_oid::INT4, type_oid::TEXT];
+        let (header, read_record) = page.get_tuple(slot, &schema).unwrap();
+
+        assert_eq!(header.xmin, TxId::new(1));
+        assert_eq!(header.xmax, TxId::INVALID);
+        assert_eq!(header.cid, CommandId::FIRST);
+        assert_eq!(read_record, record);
+    }
+
+    #[test]
+    fn test_get_tuple_none_for_deleted_slot() {
+        use crate::protocol::type_oid;
+
+        let page = create_page();
+        let schema = [type_oid::INT4];
+
+        // Slot doesn't exist
+        assert!(page.get_tuple(0, &schema).is_none());
+    }
+
+    #[test]
+    fn test_update_tuple_header() {
+        use crate::heap::{Record, Value};
+        use crate::protocol::type_oid;
+        use crate::tx::{CommandId, Infomask, TupleHeader, TxId};
+
+        let mut page = create_page();
+        let record = Record::new(vec![Value::Int32(100)]);
+
+        let slot = page
+            .insert_tuple(&record, TxId::new(1), CommandId::FIRST)
+            .unwrap();
+
+        // Update the tuple header (e.g., marking as deleted)
+        let new_header = TupleHeader {
+            xmin: TxId::new(1),
+            xmax: TxId::new(2), // Mark as deleted by transaction 2
+            cid: CommandId::FIRST,
+            infomask: Infomask::empty().with_xmin_committed(),
+        };
+        page.update_tuple_header(slot, new_header).unwrap();
+
+        // Read back and verify
+        let schema = [type_oid::INT4];
+        let (header, read_record) = page.get_tuple(slot, &schema).unwrap();
+
+        assert_eq!(header.xmin, TxId::new(1));
+        assert_eq!(header.xmax, TxId::new(2));
+        assert!(header.infomask.xmin_committed());
+        assert_eq!(read_record, record);
+    }
+
+    #[test]
+    fn test_tuples_iterator() {
+        use crate::heap::{Record, Value};
+        use crate::protocol::type_oid;
+        use crate::tx::{CommandId, TxId};
+
+        let mut page = create_page();
+
+        // Insert multiple tuples
+        let record1 = Record::new(vec![Value::Int32(1)]);
+        let record2 = Record::new(vec![Value::Int32(2)]);
+        let record3 = Record::new(vec![Value::Int32(3)]);
+
+        page.insert_tuple(&record1, TxId::new(1), CommandId::FIRST)
+            .unwrap();
+        page.insert_tuple(&record2, TxId::new(2), CommandId::FIRST)
+            .unwrap();
+        page.insert_tuple(&record3, TxId::new(3), CommandId::FIRST)
+            .unwrap();
+
+        // Iterate and collect
+        let schema = [type_oid::INT4];
+        let tuples: Vec<_> = page.tuples(&schema).collect();
+
+        assert_eq!(tuples.len(), 3);
+        assert_eq!(tuples[0].0, 0); // slot_id
+        assert_eq!(tuples[0].1.xmin, TxId::new(1)); // header
+        assert_eq!(tuples[0].2, record1); // record
+
+        assert_eq!(tuples[1].0, 1);
+        assert_eq!(tuples[1].1.xmin, TxId::new(2));
+        assert_eq!(tuples[1].2, record2);
+
+        assert_eq!(tuples[2].0, 2);
+        assert_eq!(tuples[2].1.xmin, TxId::new(3));
+        assert_eq!(tuples[2].2, record3);
+    }
+
+    #[test]
+    fn test_insert_tuple_with_null_values() {
+        use crate::heap::{Record, Value};
+        use crate::protocol::type_oid;
+        use crate::tx::{CommandId, TxId};
+
+        let mut page = create_page();
+        let record = Record::new(vec![
+            Value::Int32(42),
+            Value::Null,
+            Value::Text("test".to_string()),
+        ]);
+
+        let slot = page
+            .insert_tuple(&record, TxId::new(1), CommandId::FIRST)
+            .unwrap();
+
+        // Read back
+        let schema = [type_oid::INT4, type_oid::INT4, type_oid::TEXT];
+        let (_, read_record) = page.get_tuple(slot, &schema).unwrap();
+        assert_eq!(read_record, record);
+    }
+
+    #[test]
+    fn test_update_tuple_header_invalid_slot() {
+        use crate::tx::{CommandId, TupleHeader, TxId};
+
+        let mut page = create_page();
+        let header = TupleHeader::new_insert(TxId::new(1), CommandId::FIRST);
+
+        assert!(matches!(
+            page.update_tuple_header(0, header),
+            Err(HeapError::SlotNotFound(0))
+        ));
     }
 }

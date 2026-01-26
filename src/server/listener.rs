@@ -6,12 +6,14 @@ use tokio::net::TcpListener;
 use crate::server::connection::Connection;
 use crate::server::handshake::{Handshake, HandshakeResult};
 use crate::server::registry::Registry;
+use crate::tx::TransactionManager;
 
 /// TCP server implementing PostgreSQL wire protocol.
 pub struct Server {
     listener: TcpListener,
     next_pid: Arc<AtomicI32>,
     registry: Arc<Registry>,
+    tx_manager: Arc<TransactionManager>,
 }
 
 impl Server {
@@ -21,6 +23,7 @@ impl Server {
             listener,
             next_pid: Arc::new(AtomicI32::new(1)),
             registry: Arc::new(Registry::new()),
+            tx_manager: Arc::new(TransactionManager::new()),
         }
     }
 
@@ -64,6 +67,7 @@ impl Server {
             let (socket, peer_addr) = self.listener.accept().await?;
             let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
             let registry = self.registry.clone();
+            let tx_manager = self.tx_manager.clone();
 
             println!("(pid={}) Accepted connection from {}", pid, peer_addr);
 
@@ -72,7 +76,7 @@ impl Server {
                 let (mut connection, secret_key) = match handshake.run().await {
                     Ok(HandshakeResult::Success { framed, secret_key }) => {
                         println!("(pid={}) Connection ready", pid);
-                        (Connection::new(framed, pid), secret_key)
+                        (Connection::new(framed, pid, tx_manager), secret_key)
                     }
                     Ok(HandshakeResult::CancelRequested {
                         pid: target_pid,
