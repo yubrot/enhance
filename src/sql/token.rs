@@ -31,24 +31,21 @@ impl Token {
 pub enum TokenKind {
     // Literals
     /// Integer literal (e.g., 42, -123).
-    Integer(i64),
+    IntegerLit(i64),
     /// Floating-point literal (e.g., 3.14, -1.5e10).
-    Float(f64),
+    FloatLit(f64),
     /// String literal (e.g., 'hello').
-    String(String),
+    StringLit(String),
 
-    // Identifiers
-    /// Unquoted identifier (e.g., foo, my_table).
+    /// Identifier (e.g., foo, my_table, "my table").
     Identifier(String),
-    /// Quoted identifier (e.g., "my table").
-    QuotedIdentifier(String),
     /// Positional parameter (e.g., $1, $2).
     Parameter(u32),
 
     // Data type keywords
     Boolean,
     Smallint,
-    Integer_,
+    Integer,
     Int,
     Bigint,
     Real,
@@ -205,15 +202,14 @@ impl TokenKind {
     /// Returns the display name for error messages.
     pub fn display_name(&self) -> String {
         match self {
-            TokenKind::Integer(n) => format!("integer '{n}'"),
-            TokenKind::Float(n) => format!("float '{n}'"),
-            TokenKind::String(s) => format!("string '{s}'"),
+            TokenKind::IntegerLit(n) => format!("integer '{n}'"),
+            TokenKind::FloatLit(n) => format!("float '{n}'"),
+            TokenKind::StringLit(s) => format!("string '{s}'"),
             TokenKind::Identifier(s) => format!("identifier '{s}'"),
-            TokenKind::QuotedIdentifier(s) => format!("identifier '\"{s}\"'"),
             TokenKind::Parameter(n) => format!("parameter '${n}'"),
             TokenKind::Boolean => "BOOLEAN".to_string(),
             TokenKind::Smallint => "SMALLINT".to_string(),
-            TokenKind::Integer_ => "INTEGER".to_string(),
+            TokenKind::Integer => "INTEGER".to_string(),
             TokenKind::Int => "INT".to_string(),
             TokenKind::Bigint => "BIGINT".to_string(),
             TokenKind::Real => "REAL".to_string(),
@@ -329,7 +325,7 @@ impl TokenKind {
         Some(match s.to_uppercase().as_str() {
             "BOOLEAN" => TokenKind::Boolean,
             "SMALLINT" => TokenKind::Smallint,
-            "INTEGER" => TokenKind::Integer_,
+            "INTEGER" => TokenKind::Integer,
             "INT" => TokenKind::Int,
             "BIGINT" => TokenKind::Bigint,
             "REAL" => TokenKind::Real,
@@ -451,7 +447,7 @@ mod tests {
             TokenKind::Identifier("foo".to_string()).display_name(),
             "identifier 'foo'"
         );
-        assert_eq!(TokenKind::Integer(42).display_name(), "integer '42'");
+        assert_eq!(TokenKind::IntegerLit(42).display_name(), "integer '42'");
         assert_eq!(TokenKind::Eof.display_name(), "end of input");
     }
 }

@@ -7,40 +7,41 @@
 use super::ast::*;
 use super::error::{Span, SyntaxError};
 use super::lexer::Lexer;
+use super::token::TokenKind::*;
 use super::token::{Token, TokenKind};
 
-/// Helper macro to count tokens at compile time.
-macro_rules! count_tokens {
-    () => { 0 };
-    ($head:ident) => { 1 };
-    ($head:ident, $($tail:ident),+) => { 1 + count_tokens!($($tail),+) };
-}
-
-/// Matches token sequences with optional consumption.
+/// Matches token sequences with optional consumption using match patterns.
 ///
 /// Use `[Token1, Token2]!` to match and consume tokens.
 /// Use `[Token1, Token2]` to match without consuming tokens.
 macro_rules! match_tokens {
-    ($self:expr, { [$($token:ident),+]! => $body:expr $(, $($rest:tt)*)? }) => {
-        if $self.starts_with([$(TokenKind::$token),+]) {
-            $self.discard(count_tokens!($($token),+));
+    // Entry point: with consumption
+    ($self:expr, { [$($pat:pat),+]! => $body:expr $(, $($rest:tt)*)? }) => {
+        if let [$(Some($pat)),+] = $self.peek::<{match_tokens!(@count $($pat),+)}>() {
+            $self.discard(match_tokens!(@count $($pat),+));
             $body
         } else {
             match_tokens!($self, { $($($rest)*)? })
         }
     };
 
-    ($self:expr, { [$($token:ident),+] => $body:expr $(, $($rest:tt)*)? }) => {
-        if $self.starts_with([$(TokenKind::$token),+]) {
+    // Entry point: without consumption
+    ($self:expr, { [$($pat:pat),+] => $body:expr $(, $($rest:tt)*)? }) => {
+        if let [$(Some($pat)),+] = $self.peek::<{match_tokens!(@count $($pat),+)}>() {
             $body
         } else {
             match_tokens!($self, { $($($rest)*)? })
         }
     };
 
+    // Default case
     ($self:expr, { _ => $default:expr $(,)? }) => {
         $default
     };
+
+    // Helper: count patterns
+    (@count) => { 0 };
+    (@count $head:pat $(, $tail:pat)*) => { 1 + match_tokens!(@count $($tail),*) };
 }
 
 /// Operator precedence levels (higher = binds tighter).
@@ -97,7 +98,7 @@ pub struct Parser<'a> {
 impl<'a> Parser<'a> {
     /// Creates a new parser for the given SQL input.
     pub fn new(input: &'a str) -> Self {
-        // NOTE: Lexer errors are returned as TokenKind::Error tokens.
+        // NOTE: Lexer errors are returned as Error tokens.
         // The parser will report them as syntax errors when encountered.
         let tokens = Lexer::new(input).collect();
 
@@ -118,7 +119,7 @@ impl<'a> Parser<'a> {
     /// Returns a [`SyntaxError`] if the input is not valid SQL.
     pub fn parse(&mut self) -> Result<Option<Statement>, SyntaxError> {
         // Empty query (only whitespace/comments)
-        if matches!(self.peek(0), None | Some(TokenKind::Eof)) {
+        if matches!(self.peek(), [None | Some(Eof)]) {
             return Ok(None);
         }
 
@@ -127,7 +128,7 @@ impl<'a> Parser<'a> {
         match_tokens!(self, { [Semicolon]! => {}, _ => {} });
 
         // Check for unexpected trailing tokens
-        if !matches!(self.peek(0), None | Some(TokenKind::Eof)) {
+        if !matches!(self.peek(), [None | Some(Eof)]) {
             return Err(self.unexpected_token_error("end of input"));
         }
 
@@ -156,7 +157,7 @@ impl<'a> Parser<'a> {
 
     /// Parses a BEGIN statement.
     fn parse_begin_stmt(&mut self) -> Result<Statement, SyntaxError> {
-        self.consume(TokenKind::Begin)?;
+        self.consume([Begin])?;
 
         match_tokens!(self, { [Transaction]! => {}, _ => {} });
 
@@ -165,9 +166,9 @@ impl<'a> Parser<'a> {
 
     /// Parses a SET statement.
     fn parse_set_stmt(&mut self) -> Result<Statement, SyntaxError> {
-        self.consume(TokenKind::Set)?;
+        self.consume([Set])?;
         let name = self.consume_identifier()?;
-        self.consume(TokenKind::Eq)?;
+        self.consume([Eq])?;
         let value = self.parse_expr()?;
 
         Ok(Statement::Set(SetStmt { name, value }))
@@ -181,7 +182,7 @@ impl<'a> Parser<'a> {
             [Create, Index] => self.parse_create_index(),
             _ => {
                 // Consume CREATE to give a better error message
-                self.consume(TokenKind::Create)?;
+                self.consume([Create])?;
                 Err(self.unexpected_token_error("TABLE or INDEX"))
             }
         })
@@ -189,22 +190,17 @@ impl<'a> Parser<'a> {
 
     /// Parses a CREATE TABLE statement.
     fn parse_create_table(&mut self) -> Result<Statement, SyntaxError> {
-        self.consume(TokenKind::Create)?;
-        self.consume(TokenKind::Table)?;
+        self.consume([Create, Table])?;
         let if_not_exists = match_tokens!(self, { [If, Not, Exists]! => true, _ => false });
         let name = self.consume_identifier()?;
 
-        self.consume(TokenKind::LParen)?;
+        self.consume([LParen])?;
         let mut columns = Vec::new();
         let mut constraints = Vec::new();
 
         loop {
             match_tokens!(self, {
-                [Primary] => constraints.push(self.parse_table_constraint()?),
-                [Unique] => constraints.push(self.parse_table_constraint()?),
-                [Foreign] => constraints.push(self.parse_table_constraint()?),
-                [Check] => constraints.push(self.parse_table_constraint()?),
-                [Constraint] => constraints.push(self.parse_table_constraint()?),
+                [Primary | Unique | Foreign | Check | Constraint] => constraints.push(self.parse_table_constraint()?),
                 _ => columns.push(self.parse_column_def()?),
             });
             match_tokens!(self, {
@@ -241,7 +237,7 @@ impl<'a> Parser<'a> {
             [Check]! => TableConstraintKind::Check(self.parse_parenthesized(Self::parse_expr)?),
             [Foreign, Key]! => {
                 let columns = self.parse_parenthesized(|p| p.parse_comma_separated(Self::consume_identifier))?;
-                self.consume(TokenKind::References)?;
+                self.consume([References])?;
                 let ref_table = self.consume_identifier()?;
                 let ref_columns = self.parse_parenthesized(|p| p.parse_comma_separated(Self::consume_identifier))?;
                 TableConstraintKind::ForeignKey {
@@ -297,7 +293,7 @@ impl<'a> Parser<'a> {
         match_tokens!(self, {
             [Boolean]! => Ok(DataType::Boolean),
             [Smallint]! => Ok(DataType::Smallint),
-            [Integer_]! => Ok(DataType::Integer),
+            [Integer]! => Ok(DataType::Integer),
             [Int]! => Ok(DataType::Integer),
             [Bigint]! => Ok(DataType::Bigint),
             [Double, Precision]! => Ok(DataType::DoublePrecision),
@@ -313,15 +309,16 @@ impl<'a> Parser<'a> {
     /// Parses a CREATE INDEX statement.
     fn parse_create_index(&mut self) -> Result<Statement, SyntaxError> {
         // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (columns)
-        self.consume(TokenKind::Create)?;
+        self.consume([Create])?;
 
         let unique = match_tokens!(self, { [Unique]! => true, _ => false });
 
-        self.consume(TokenKind::Index)?;
+        self.consume([Index])?;
 
         let if_not_exists = match_tokens!(self, { [If, Not, Exists]! => true, _ => false });
+
         let name = self.consume_identifier()?;
-        self.consume(TokenKind::On)?;
+        self.consume([On])?;
         let table = self.consume_identifier()?;
         let columns = self.parse_parenthesized(Self::parse_index_column_list)?;
 
@@ -350,7 +347,7 @@ impl<'a> Parser<'a> {
             [Drop, Index] => self.parse_drop_index(),
             _ => {
                 // Consume DROP to give a better error message
-                self.consume(TokenKind::Drop)?;
+                self.consume([Drop])?;
                 Err(self.unexpected_token_error("TABLE or INDEX"))
             }
         })
@@ -359,8 +356,7 @@ impl<'a> Parser<'a> {
     /// Parses a DROP TABLE statement.
     fn parse_drop_table(&mut self) -> Result<Statement, SyntaxError> {
         // DROP TABLE [IF EXISTS] name
-        self.consume(TokenKind::Drop)?;
-        self.consume(TokenKind::Table)?;
+        self.consume([Drop, Table])?;
 
         let if_exists = match_tokens!(self, { [If, Exists]! => true, _ => false });
         let name = self.consume_identifier()?;
@@ -371,8 +367,7 @@ impl<'a> Parser<'a> {
     /// Parses a DROP INDEX statement.
     fn parse_drop_index(&mut self) -> Result<Statement, SyntaxError> {
         // DROP INDEX [IF EXISTS] name
-        self.consume(TokenKind::Drop)?;
-        self.consume(TokenKind::Index)?;
+        self.consume([Drop, Index])?;
 
         let if_exists = match_tokens!(self, { [If, Exists]! => true, _ => false });
         let name = self.consume_identifier()?;
@@ -382,7 +377,7 @@ impl<'a> Parser<'a> {
 
     /// Parses a SELECT statement.
     pub(crate) fn parse_select_stmt(&mut self) -> Result<SelectStmt, SyntaxError> {
-        self.consume(TokenKind::Select)?;
+        self.consume([Select])?;
 
         // DISTINCT / ALL
         let distinct = match_tokens!(self, { [Distinct]! => true, [All]! => false, _ => false });
@@ -439,11 +434,8 @@ impl<'a> Parser<'a> {
         });
 
         // Check for table.* (qualified wildcard)
-        if let Some(TokenKind::Identifier(name) | TokenKind::QuotedIdentifier(name)) = self.peek(0)
-            && self.peek(1) == Some(&TokenKind::Dot)
-            && self.peek(2) == Some(&TokenKind::Asterisk)
-        {
-            let name = name.clone();
+        if let [Some(Identifier(name)), Some(Dot), Some(Asterisk)] = self.peek() {
+            let name = std::mem::take(name);
             self.discard(3);
             return Ok(SelectItem::QualifiedWildcard(name));
         }
@@ -510,7 +502,7 @@ impl<'a> Parser<'a> {
         match_tokens!(self, {
             [LParen]! => {
                 let query = self.parse_select_stmt()?;
-                self.consume(TokenKind::RParen)?;
+                self.consume([RParen])?;
 
                 // Subquery alias is required
                 match_tokens!(self, { [As]! => {}, _ => {} });
@@ -558,8 +550,7 @@ impl<'a> Parser<'a> {
 
     /// Parses an INSERT statement.
     fn parse_insert_stmt(&mut self) -> Result<Statement, SyntaxError> {
-        self.consume(TokenKind::Insert)?;
-        self.consume(TokenKind::Into)?;
+        self.consume([Insert, Into])?;
         let table = self.consume_identifier()?;
 
         // Optional column list
@@ -568,7 +559,7 @@ impl<'a> Parser<'a> {
             .unwrap_or(Vec::new());
 
         // VALUES clause
-        self.consume(TokenKind::Values)?;
+        self.consume([Values])?;
 
         let values = self.parse_comma_separated(|p| {
             p.parse_parenthesized(|p| p.parse_comma_separated(Self::parse_expr))
@@ -583,13 +574,13 @@ impl<'a> Parser<'a> {
 
     /// Parses an UPDATE statement.
     fn parse_update_stmt(&mut self) -> Result<Statement, SyntaxError> {
-        self.consume(TokenKind::Update)?;
+        self.consume([Update])?;
         let table = self.consume_identifier()?;
-        self.consume(TokenKind::Set)?;
+        self.consume([Set])?;
 
         let assignments = self.parse_comma_separated(|p| {
             let column = p.consume_identifier()?;
-            p.consume(TokenKind::Eq)?;
+            p.consume([Eq])?;
             let value = p.parse_expr()?;
             Ok(Assignment { column, value })
         })?;
@@ -605,8 +596,7 @@ impl<'a> Parser<'a> {
 
     /// Parses a DELETE statement.
     fn parse_delete_stmt(&mut self) -> Result<Statement, SyntaxError> {
-        self.consume(TokenKind::Delete)?;
-        self.consume(TokenKind::From)?;
+        self.consume([Delete, From])?;
         let table = self.consume_identifier()?;
 
         let where_clause = match_tokens!(self, { [Where]! => Some(self.parse_expr()?), _ => None });
@@ -682,14 +672,14 @@ impl<'a> Parser<'a> {
                     expr: Box::new(expr),
                     negated: false,
                 },
-                [Not, In]! => self.parse_in_expr(expr, true)?,
-                [Not, Between]! => self.parse_between_expr(expr, true)?,
-                [Not, Like]! => self.parse_like_expr(expr, false, true)?,
-                [Not, Ilike]! => self.parse_like_expr(expr, true, true)?,
                 [In]! => self.parse_in_expr(expr, false)?,
                 [Between]! => self.parse_between_expr(expr, false)?,
                 [Like]! => self.parse_like_expr(expr, false, false)?,
                 [Ilike]! => self.parse_like_expr(expr, true, false)?,
+                [Not, In]! => self.parse_in_expr(expr, true)?,
+                [Not, Between]! => self.parse_between_expr(expr, true)?,
+                [Not, Like]! => self.parse_like_expr(expr, false, true)?,
+                [Not, Ilike]! => self.parse_like_expr(expr, true, true)?,
                 [DoubleColon]! => {
                     let data_type = self.parse_data_type()?;
                     Expr::Cast {
@@ -706,11 +696,11 @@ impl<'a> Parser<'a> {
 
     /// Parses IN expression (after IN keyword consumed).
     fn parse_in_expr(&mut self, expr: Expr, negated: bool) -> Result<Expr, SyntaxError> {
-        self.consume(TokenKind::LParen)?;
+        self.consume([LParen])?;
         match_tokens!(self, {
             [Select] => {
                 let subquery = self.parse_select_stmt()?;
-                self.consume(TokenKind::RParen)?;
+                self.consume([RParen])?;
                 Ok(Expr::InSubquery {
                     expr: Box::new(expr),
                     subquery: Box::new(subquery),
@@ -719,7 +709,7 @@ impl<'a> Parser<'a> {
             },
             _ => {
                 let list = self.parse_comma_separated(Self::parse_expr)?;
-                self.consume(TokenKind::RParen)?;
+                self.consume([RParen])?;
                 Ok(Expr::InList {
                     expr: Box::new(expr),
                     list,
@@ -732,7 +722,7 @@ impl<'a> Parser<'a> {
     /// Parses BETWEEN expression (after BETWEEN keyword consumed).
     fn parse_between_expr(&mut self, expr: Expr, negated: bool) -> Result<Expr, SyntaxError> {
         let low = self.parse_expr_with_precedence(Precedence::Comparison)?;
-        self.consume(TokenKind::And)?;
+        self.consume([And])?;
         let high = self.parse_expr_with_precedence(Precedence::Comparison)?;
         Ok(Expr::Between {
             expr: Box::new(expr),
@@ -766,75 +756,71 @@ impl<'a> Parser<'a> {
     /// Parses a primary expression (literals, identifiers, function calls, etc.).
     fn parse_primary_expr(&mut self) -> Result<Expr, SyntaxError> {
         match_tokens!(self, {
-            [Null]! => return Ok(Expr::Null),
-            [True]! => return Ok(Expr::Boolean(true)),
-            [False]! => return Ok(Expr::Boolean(false)),
+            [Null]! => Ok(Expr::Null),
+            [True]! => Ok(Expr::Boolean(true)),
+            [False]! => Ok(Expr::Boolean(false)),
             [Exists]! => {
                 let subquery = self.parse_parenthesized(Self::parse_select_stmt)?;
-                return Ok(Expr::Exists {
+                Ok(Expr::Exists {
                     subquery: Box::new(subquery),
                     negated: false,
                 })
             },
-            [Case]! => return self.parse_case_expr(),
+            [Case]! => self.parse_case_expr(),
             [Cast]! => {
                 let (expr, data_type) = self.parse_parenthesized(|p| {
                     let expr = p.parse_expr()?;
-                    p.consume(TokenKind::As)?;
+                    p.consume([As])?;
                     let data_type = p.parse_data_type()?;
                     Ok((expr, data_type))
                 })?;
-                return Ok(Expr::Cast {
+                Ok(Expr::Cast {
                     expr: Box::new(expr),
                     data_type,
                 })
             },
             [LParen]! => {
-                let expr = match_tokens!(self, {
+                Ok(match_tokens!(self, {
                     [Select] => {
                         let query = self.parse_select_stmt()?;
-                        self.consume(TokenKind::RParen)?;
+                        self.consume([RParen])?;
                         Expr::Subquery(Box::new(query))
                     },
                     _ => {
                         let expr = self.parse_expr()?;
-                        self.consume(TokenKind::RParen)?;
+                        self.consume([RParen])?;
                         expr
                     }
-                });
-                return Ok(expr)
+                }))
             },
-            [Asterisk]! => return Ok(Expr::ColumnRef {
-                table: None,
-                column: "*".to_string(),
-            }),
-            _ => {}
-        });
-
-        // Handle tokens with values (Integer, Float, String, Parameter, Identifier)
-        match self.peek(0) {
-            Some(TokenKind::Integer(n)) => {
-                let n = *n;
+            [Asterisk]! => {
+                Ok(Expr::ColumnRef {
+                    table: None,
+                    column: "*".to_string(),
+                })
+            },
+            [IntegerLit(n)] => {
+                let n = std::mem::take(n);
                 self.discard(1);
                 Ok(Expr::Integer(n))
-            }
-            Some(TokenKind::Float(n)) => {
-                let n = *n;
+            },
+            [FloatLit(n)] => {
+                let n = std::mem::take(n);
                 self.discard(1);
                 Ok(Expr::Float(n))
-            }
-            Some(TokenKind::String(s)) => {
-                let s = s.clone();
+            },
+            [StringLit(s)] => {
+                let s = std::mem::take(s);
                 self.discard(1);
                 Ok(Expr::String(s))
-            }
-            Some(TokenKind::Parameter(n)) => {
-                let n = *n;
+            },
+            [Parameter(n)] => {
+                let n = std::mem::take(n);
                 self.discard(1);
                 Ok(Expr::Parameter(n))
-            }
-            Some(TokenKind::Identifier(name) | TokenKind::QuotedIdentifier(name)) => {
-                let name = name.clone();
+            },
+            [Identifier(name)] => {
+                let name = std::mem::take(name);
                 self.discard(1);
 
                 match_tokens!(self, {
@@ -853,14 +839,14 @@ impl<'a> Parser<'a> {
                         column: name,
                     }),
                 })
-            }
+            },
             _ => Err(self.unexpected_token_error("expression")),
-        }
+        })
     }
 
     /// Parses a function call with arguments.
     fn parse_function_call(&mut self, name: String) -> Result<Expr, SyntaxError> {
-        self.consume(TokenKind::LParen)?;
+        self.consume([LParen])?;
 
         // Check for DISTINCT
         let distinct = match_tokens!(self, { [Distinct]! => true, _ => false });
@@ -873,7 +859,7 @@ impl<'a> Parser<'a> {
             _ => self.parse_comma_separated(Self::parse_expr)?,
         });
 
-        self.consume(TokenKind::RParen)?;
+        self.consume([RParen])?;
 
         Ok(Expr::Function {
             name,
@@ -897,7 +883,7 @@ impl<'a> Parser<'a> {
         let mut when_clauses = Vec::new();
         while match_tokens!(self, { [When]! => true, _ => false }) {
             let condition = self.parse_expr()?;
-            self.consume(TokenKind::Then)?;
+            self.consume([Then])?;
             let result = self.parse_expr()?;
             when_clauses.push(WhenClause { condition, result });
         }
@@ -912,7 +898,7 @@ impl<'a> Parser<'a> {
             _ => None
         });
 
-        self.consume(TokenKind::End)?;
+        self.consume([End])?;
 
         Ok(Expr::Case {
             operand,
@@ -922,7 +908,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Peeks at the next token and returns the binary operator and its precedence.
-    fn peek_binary_op(&self) -> Option<(BinaryOperator, Precedence)> {
+    fn peek_binary_op(&mut self) -> Option<(BinaryOperator, Precedence)> {
         Some(match_tokens!(self, {
             [Or] => (BinaryOperator::Or, Precedence::Or),
             [And] => (BinaryOperator::And, Precedence::And),
@@ -949,9 +935,9 @@ impl<'a> Parser<'a> {
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<T, SyntaxError>,
     ) -> Result<T, SyntaxError> {
-        self.consume(TokenKind::LParen)?;
+        self.consume([LParen])?;
         let result = f(self)?;
-        self.consume(TokenKind::RParen)?;
+        self.consume([RParen])?;
         Ok(result)
     }
 
@@ -962,7 +948,7 @@ impl<'a> Parser<'a> {
         match_tokens!(self, {
             [LParen]! => {
                 let result = f(self)?;
-                self.consume(TokenKind::RParen)?;
+                self.consume([RParen])?;
                 Ok(Some(result))
             },
             _ => Ok(None),
@@ -985,14 +971,9 @@ impl<'a> Parser<'a> {
     fn parse_as(&mut self) -> Result<Option<String>, SyntaxError> {
         match_tokens!(self, {
             [As]! => Ok(Some(self.consume_identifier()?)),
-            _ => {
-                if matches!(self.peek(0), Some(TokenKind::Identifier(_))) {
-                    // Alias without AS: identifier that's not a reserved keyword
-                    Ok(Some(self.consume_identifier()?))
-                } else {
-                    Ok(None)
-                }
-            }
+            // Alias without AS: identifier that's not a reserved keyword
+            [Identifier(_)] => Ok(Some(self.consume_identifier()?)),
+            _ => Ok(None),
         })
     }
 
@@ -1017,17 +998,25 @@ impl<'a> Parser<'a> {
 
     // ==================== Token utilities ====================
 
-    /// Peeks at the kind of a token at the given offset from current position.
-    fn peek(&self, nth: usize) -> Option<&TokenKind> {
-        self.tokens.get(self.pos + nth).map(|t| &t.kind)
+    /// Returns a fixed-size array of mutable references to upcoming tokens.
+    fn peek<const N: usize>(&mut self) -> [Option<&mut TokenKind>; N] {
+        let mut result = [const { None }; N];
+        for (i, t) in self.tokens.iter_mut().skip(self.pos).take(N).enumerate() {
+            result[i] = Some(&mut t.kind);
+        }
+        result
     }
 
-    /// Checks if the next tokens match the given token sequence.
-    fn starts_with<const N: usize>(&self, tokens: [TokenKind; N]) -> bool {
-        tokens
-            .into_iter()
-            .enumerate()
-            .all(|(i, kind)| self.peek(i) == Some(&kind))
+    /// Expects a specific token, returning an error if not found.
+    fn consume<const N: usize>(&mut self, tokens: [TokenKind; N]) -> Result<(), SyntaxError> {
+        for token in tokens {
+            if matches!(self.peek(), [Some(t)] if t == &token) {
+                self.discard(1);
+            } else {
+                return Err(self.unexpected_token_error(&token.display_name()));
+            }
+        }
+        Ok(())
     }
 
     /// Advances by the given number of tokens.
@@ -1035,38 +1024,28 @@ impl<'a> Parser<'a> {
         self.pos = (self.pos + count).min(self.tokens.len());
     }
 
-    /// Expects a specific token, returning an error if not found.
-    fn consume(&mut self, kind: TokenKind) -> Result<(), SyntaxError> {
-        if self.peek(0) == Some(&kind) {
-            self.discard(1);
-            Ok(())
-        } else {
-            Err(self.unexpected_token_error(&kind.display_name()))
-        }
-    }
-
     /// Expects an identifier, returning its name.
     fn consume_identifier(&mut self) -> Result<String, SyntaxError> {
-        match self.peek(0) {
-            Some(TokenKind::Identifier(name) | TokenKind::QuotedIdentifier(name)) => {
-                let name = name.clone();
+        match_tokens!(self, {
+            [Identifier(name)] => {
+                let name = std::mem::take(name);
                 self.discard(1);
                 Ok(name)
-            }
+            },
             _ => Err(self.unexpected_token_error("identifier")),
-        }
+        })
     }
 
     /// Expects an integer literal.
     fn consume_integer(&mut self) -> Result<i64, SyntaxError> {
-        match self.peek(0) {
-            Some(TokenKind::Integer(n)) => {
-                let n = *n;
+        match_tokens!(self, {
+            [IntegerLit(n)] => {
+                let n = std::mem::take(n);
                 self.discard(1);
                 Ok(n)
-            }
+            },
             _ => Err(self.unexpected_token_error("integer")),
-        }
+        })
     }
 
     /// Creates an unexpected token error with the current position.
@@ -1076,7 +1055,9 @@ impl<'a> Parser<'a> {
             .get(self.pos)
             .map_or(Span::at(self.input.len()), |t| t.span);
         let current_token_name = self
-            .peek(0)
+            .tokens
+            .get(self.pos)
+            .map(|t| &t.kind)
             .map_or("end of input".to_string(), |k| k.display_name());
         SyntaxError::unexpected_token(expected, &current_token_name, current_span)
     }

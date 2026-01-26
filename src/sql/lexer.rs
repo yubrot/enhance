@@ -206,7 +206,7 @@ impl<'a> Lexer<'a> {
                 span,
             )
         } else {
-            Token::new(TokenKind::String(value), span)
+            Token::new(TokenKind::StringLit(value), span)
         }
     }
 
@@ -248,7 +248,7 @@ impl<'a> Lexer<'a> {
                 span,
             )
         } else {
-            Token::new(TokenKind::QuotedIdentifier(value), span)
+            Token::new(TokenKind::Identifier(value), span)
         }
     }
 
@@ -343,12 +343,12 @@ impl<'a> Lexer<'a> {
 
         if is_float {
             match num_str.parse::<f64>() {
-                Ok(n) => Token::new(TokenKind::Float(n), span),
+                Ok(n) => Token::new(TokenKind::FloatLit(n), span),
                 Err(_) => Token::new(TokenKind::Error("invalid number literal".to_string()), span),
             }
         } else {
             match num_str.parse::<i64>() {
-                Ok(n) => Token::new(TokenKind::Integer(n), span),
+                Ok(n) => Token::new(TokenKind::IntegerLit(n), span),
                 Err(_) => Token::new(TokenKind::Error("invalid number literal".to_string()), span),
             }
         }
@@ -511,8 +511,8 @@ mod tests {
         assert_eq!(
             lex(r#""my table" "has""quotes""#),
             vec![
-                TokenKind::QuotedIdentifier("my table".to_string()),
-                TokenKind::QuotedIdentifier("has\"quotes".to_string()),
+                TokenKind::Identifier("my table".to_string()),
+                TokenKind::Identifier("has\"quotes".to_string()),
                 TokenKind::Eof,
             ]
         );
@@ -523,9 +523,9 @@ mod tests {
         assert_eq!(
             lex("0 42 12345"),
             vec![
-                TokenKind::Integer(0),
-                TokenKind::Integer(42),
-                TokenKind::Integer(12345),
+                TokenKind::IntegerLit(0),
+                TokenKind::IntegerLit(42),
+                TokenKind::IntegerLit(12345),
                 TokenKind::Eof,
             ]
         );
@@ -536,10 +536,10 @@ mod tests {
         assert_eq!(
             lex("3.14 0.5 1e10 2.5e-3"),
             vec![
-                TokenKind::Float(3.14),
-                TokenKind::Float(0.5),
-                TokenKind::Float(1e10),
-                TokenKind::Float(2.5e-3),
+                TokenKind::FloatLit(3.14),
+                TokenKind::FloatLit(0.5),
+                TokenKind::FloatLit(1e10),
+                TokenKind::FloatLit(2.5e-3),
                 TokenKind::Eof,
             ]
         );
@@ -550,9 +550,9 @@ mod tests {
         assert_eq!(
             lex("'hello' 'it''s' ''"),
             vec![
-                TokenKind::String("hello".to_string()),
-                TokenKind::String("it's".to_string()),
-                TokenKind::String("".to_string()),
+                TokenKind::StringLit("hello".to_string()),
+                TokenKind::StringLit("it's".to_string()),
+                TokenKind::StringLit("".to_string()),
                 TokenKind::Eof,
             ]
         );
@@ -648,7 +648,7 @@ mod tests {
                 TokenKind::Where,
                 TokenKind::Identifier("age".to_string()),
                 TokenKind::GtEq,
-                TokenKind::Integer(18),
+                TokenKind::IntegerLit(18),
                 TokenKind::And,
                 TokenKind::Identifier("active".to_string()),
                 TokenKind::Eq,
