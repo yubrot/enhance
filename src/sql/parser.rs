@@ -1412,7 +1412,7 @@ mod tests {
         assert_eq!(parse_expr("TRUE").unwrap(), Expr::Boolean(true));
         assert_eq!(parse_expr("FALSE").unwrap(), Expr::Boolean(false));
         assert_eq!(parse_expr("42").unwrap(), Expr::Integer(42));
-        assert_eq!(parse_expr("3.14").unwrap(), Expr::Float(3.14));
+        assert_eq!(parse_expr("3.5").unwrap(), Expr::Float(3.5));
         assert_eq!(
             parse_expr("'hello'").unwrap(),
             Expr::String("hello".to_string())

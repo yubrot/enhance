@@ -13,6 +13,8 @@ pub enum TxState {
     /// In an active transaction block.
     InTransaction,
     /// Transaction failed, awaiting ROLLBACK.
+    /// NOTE: Will be used in future statement error handling (Step 8+).
+    #[allow(dead_code)]
     Failed,
 }
 
@@ -124,6 +126,8 @@ impl ConnectionState {
     }
 
     /// Get the current command ID.
+    /// NOTE: Will be used for statement-level snapshots (Step 8+).
+    #[allow(dead_code)]
     pub fn current_cid(&self) -> CommandId {
         self.current_cid
     }
@@ -143,6 +147,8 @@ impl ConnectionState {
     }
 
     /// Set the transaction state to Failed.
+    /// NOTE: Will be used when a statement fails within a transaction (Step 8+).
+    #[allow(dead_code)]
     pub fn set_failed(&mut self) {
         if self.tx_state == TxState::InTransaction {
             self.tx_state = TxState::Failed;

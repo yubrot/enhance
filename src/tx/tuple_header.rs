@@ -42,7 +42,25 @@ impl TupleHeader {
         }
     }
 
-    /// Serialize the tuple header to bytes.
+    /// Reads a tuple header from bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `data.len() < TUPLE_HEADER_SIZE`.
+    pub fn read(data: &[u8]) -> Self {
+        Self {
+            xmin: TxId::new(u64::from_le_bytes([
+                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+            ])),
+            xmax: TxId::new(u64::from_le_bytes([
+                data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
+            ])),
+            cid: CommandId::new(u32::from_le_bytes([data[16], data[17], data[18], data[19]])),
+            infomask: Infomask::from_raw(u16::from_le_bytes([data[20], data[21]])),
+        }
+    }
+
+    /// Writes the tuple header to bytes.
     ///
     /// Layout (22 bytes):
     /// - xmin: 8 bytes (little-endian u64)
@@ -50,75 +68,16 @@ impl TupleHeader {
     /// - cid: 4 bytes (little-endian u32)
     /// - infomask: 2 bytes (little-endian u16)
     ///
-    /// Returns the number of bytes written (always 22).
-    pub fn serialize(&self, buf: &mut [u8]) -> Result<usize, SerializationError> {
-        if buf.len() < TUPLE_HEADER_SIZE {
-            return Err(SerializationError::BufferTooSmall {
-                required: TUPLE_HEADER_SIZE,
-                available: buf.len(),
-            });
-        }
-
-        buf[0..8].copy_from_slice(&self.xmin.as_u64().to_le_bytes());
-        buf[8..16].copy_from_slice(&self.xmax.as_u64().to_le_bytes());
-        buf[16..20].copy_from_slice(&self.cid.as_u32().to_le_bytes());
-        buf[20..22].copy_from_slice(&self.infomask.as_u16().to_le_bytes());
-
-        Ok(TUPLE_HEADER_SIZE)
-    }
-
-    /// Deserialize a tuple header from bytes.
-    pub fn deserialize(buf: &[u8]) -> Result<Self, SerializationError> {
-        if buf.len() < TUPLE_HEADER_SIZE {
-            return Err(SerializationError::BufferTooSmall {
-                required: TUPLE_HEADER_SIZE,
-                available: buf.len(),
-            });
-        }
-
-        let xmin = TxId::new(u64::from_le_bytes(buf[0..8].try_into().unwrap()));
-        let xmax = TxId::new(u64::from_le_bytes(buf[8..16].try_into().unwrap()));
-        let cid = CommandId::new(u32::from_le_bytes(buf[16..20].try_into().unwrap()));
-        let infomask_raw = u16::from_le_bytes(buf[20..22].try_into().unwrap());
-        let infomask = Infomask::from_raw(infomask_raw);
-
-        Ok(Self {
-            xmin,
-            xmax,
-            cid,
-            infomask,
-        })
+    /// # Panics
+    ///
+    /// Panics if `data.len() < TUPLE_HEADER_SIZE`.
+    pub fn write(&self, data: &mut [u8]) {
+        data[0..8].copy_from_slice(&self.xmin.as_u64().to_le_bytes());
+        data[8..16].copy_from_slice(&self.xmax.as_u64().to_le_bytes());
+        data[16..20].copy_from_slice(&self.cid.as_u32().to_le_bytes());
+        data[20..22].copy_from_slice(&self.infomask.as_u16().to_le_bytes());
     }
 }
-
-/// Errors that can occur during tuple header serialization/deserialization.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SerializationError {
-    /// Buffer is too small for the operation.
-    BufferTooSmall {
-        /// Required buffer size.
-        required: usize,
-        /// Available buffer size.
-        available: usize,
-    },
-}
-
-impl std::fmt::Display for SerializationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SerializationError::BufferTooSmall {
-                required,
-                available,
-            } => write!(
-                f,
-                "Buffer too small: required {} bytes, available {} bytes",
-                required, available
-            ),
-        }
-    }
-}
-
-impl std::error::Error for SerializationError {}
 
 #[cfg(test)]
 mod tests {
@@ -139,7 +98,7 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_deserialize() {
+    fn test_read_write() {
         let original = TupleHeader {
             xmin: TxId::new(42),
             xmax: TxId::new(100),
@@ -150,37 +109,29 @@ mod tests {
         };
 
         let mut buf = [0u8; TUPLE_HEADER_SIZE];
-        let written = original.serialize(&mut buf).unwrap();
-        assert_eq!(written, TUPLE_HEADER_SIZE);
+        original.write(&mut buf);
 
-        let deserialized = TupleHeader::deserialize(&buf).unwrap();
-        assert_eq!(deserialized, original);
+        let read_back = TupleHeader::read(&buf);
+        assert_eq!(read_back, original);
     }
 
     #[test]
-    fn test_serialize_buffer_too_small() {
+    #[should_panic]
+    fn test_write_buffer_too_small() {
         let header = TupleHeader::new_insert(TxId::new(1), CommandId::FIRST);
         let mut buf = [0u8; 10]; // Too small
-
-        let result = header.serialize(&mut buf);
-        assert!(matches!(
-            result,
-            Err(SerializationError::BufferTooSmall { .. })
-        ));
+        header.write(&mut buf); // Should panic
     }
 
     #[test]
-    fn test_deserialize_buffer_too_small() {
+    #[should_panic]
+    fn test_read_buffer_too_small() {
         let buf = [0u8; 10]; // Too small
-        let result = TupleHeader::deserialize(&buf);
-        assert!(matches!(
-            result,
-            Err(SerializationError::BufferTooSmall { .. })
-        ));
+        TupleHeader::read(&buf); // Should panic
     }
 
     #[test]
-    fn test_serialization_layout() {
+    fn test_write_layout() {
         // Verify exact byte layout
         let header = TupleHeader {
             xmin: TxId::new(0x0102030405060708),
@@ -190,7 +141,7 @@ mod tests {
         };
 
         let mut buf = [0u8; TUPLE_HEADER_SIZE];
-        header.serialize(&mut buf).unwrap();
+        header.write(&mut buf);
 
         // xmin (little-endian)
         assert_eq!(&buf[0..8], &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);

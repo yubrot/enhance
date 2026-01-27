@@ -15,7 +15,7 @@ pub enum HeapError {
     /// Slot not found or already deleted.
     SlotNotFound(u16),
     /// Serialization error.
-    Serialization(String),
+    Serialization(SerializationError),
 }
 
 impl fmt::Display for HeapError {
@@ -34,14 +34,20 @@ impl fmt::Display for HeapError {
             HeapError::SlotNotFound(slot_id) => {
                 write!(f, "slot {} not found or deleted", slot_id)
             }
-            HeapError::Serialization(msg) => {
-                write!(f, "serialization error: {}", msg)
+            HeapError::Serialization(err) => {
+                write!(f, "serialization error: {}", err)
             }
         }
     }
 }
 
 impl std::error::Error for HeapError {}
+
+impl From<SerializationError> for HeapError {
+    fn from(err: SerializationError) -> Self {
+        HeapError::Serialization(err)
+    }
+}
 
 /// Errors from record serialization/deserialization.
 #[derive(Debug)]

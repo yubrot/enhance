@@ -282,7 +282,7 @@ mod tests {
             Value::Int16(i16::MAX),
             Value::Int32(i32::MAX),
             Value::Int64(i64::MAX),
-            Value::Float32(3.14),
+            Value::Float32(std::f32::consts::PI),
             Value::Float64(std::f64::consts::PI),
             Value::Text("hello".to_string()),
             Value::Bytea(vec![1, 2, 3]),

@@ -283,7 +283,7 @@ mod tests {
         let manager = TransactionManager::new();
 
         let tx1 = manager.begin(); // TxId 1
-        let tx2 = manager.begin(); // TxId 2
+        let _tx2 = manager.begin(); // TxId 2
 
         let snapshot = manager.snapshot(TxId::new(999), CommandId::FIRST);
 

@@ -20,8 +20,6 @@ mod record;
 mod value;
 
 pub use error::{HeapError, SerializationError};
-pub use page::{
-    HeapPage, MAX_RECORD_SIZE, MAX_SLOT_DATA_SIZE, SLOT_SIZE, SlotEntry, SlotId,
-};
+pub use page::{HeapPage, MAX_RECORD_SIZE, SlotId};
 pub use record::Record;
 pub use value::Value;
