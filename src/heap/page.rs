@@ -26,7 +26,7 @@
 use super::error::HeapError;
 use super::record::Record;
 use crate::storage::{PAGE_HEADER_SIZE, PAGE_SIZE, PageHeader};
-use crate::tx::{CommandId, TupleHeader, TxId, TUPLE_HEADER_SIZE};
+use crate::tx::{CommandId, TUPLE_HEADER_SIZE, TupleHeader, TxId};
 
 /// Maximum size for record (data values only, without tuple header).
 ///
@@ -488,7 +488,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> HeapPage<T> {
         cid: CommandId,
     ) -> Result<SlotId, HeapError> {
         // Serialize tuple header + record
-        let header = TupleHeader::new_insert(xmin, cid);
+        let header = TupleHeader::new(xmin, cid);
         let record_size = record.serialized_size();
         let total_size = TUPLE_HEADER_SIZE + record_size;
 
@@ -508,11 +508,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> HeapPage<T> {
     /// # Errors
     ///
     /// Returns `HeapError::SlotNotFound` if the slot doesn't exist or is deleted.
-    pub fn update_header(
-        &mut self,
-        slot_id: SlotId,
-        header: TupleHeader,
-    ) -> Result<(), HeapError> {
+    pub fn update_header(&mut self, slot_id: SlotId, header: TupleHeader) -> Result<(), HeapError> {
         // Get mutable access to the slot data
         let slot_data = self
             .page
@@ -872,7 +868,7 @@ mod tests {
         use crate::tx::{CommandId, TupleHeader, TxId};
 
         let mut page = create_heap_page();
-        let header = TupleHeader::new_insert(TxId::new(1), CommandId::FIRST);
+        let header = TupleHeader::new(TxId::new(1), CommandId::FIRST);
 
         assert!(matches!(
             page.update_header(0, header),

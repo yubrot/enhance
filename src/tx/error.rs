@@ -1,6 +1,6 @@
 //! Transaction error types.
 
-use super::types::TxId;
+use super::types::{TxId, TxState};
 
 /// Errors that can occur during transaction operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,9 +12,9 @@ pub enum TxError {
         /// Transaction ID.
         txid: TxId,
         /// Current state.
-        current: String,
+        current: TxState,
         /// Attempted new state.
-        attempted: String,
+        attempted: TxState,
     },
 }
 

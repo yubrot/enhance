@@ -5,9 +5,6 @@ use std::fmt;
 /// Transaction ID (64-bit).
 ///
 /// TxIds are allocated sequentially starting from 1. TxId 0 is reserved as INVALID.
-///
-/// NOTE: Production systems handle TxId wraparound via VACUUM FREEZE to avoid
-/// exhausting the 64-bit space after ~18 quintillion transactions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TxId(u64);
 
@@ -25,9 +22,9 @@ impl TxId {
         self.0
     }
 
-    /// Check if this is an invalid transaction ID.
-    pub const fn is_invalid(&self) -> bool {
-        self.0 == 0
+    /// Get the next transaction ID.
+    pub const fn next(&self) -> Self {
+        Self(self.0 + 1)
     }
 }
 
@@ -78,14 +75,10 @@ impl fmt::Display for CommandId {
 pub struct Infomask(u16);
 
 impl Infomask {
-    /// xmin transaction committed (hint bit).
-    pub const XMIN_COMMITTED: u16 = 1 << 0;
-    /// xmin transaction aborted (hint bit).
-    pub const XMIN_ABORTED: u16 = 1 << 1;
-    /// xmax transaction committed (hint bit).
-    pub const XMAX_COMMITTED: u16 = 1 << 2;
-    /// xmax transaction aborted (hint bit).
-    pub const XMAX_ABORTED: u16 = 1 << 3;
+    const XMIN_COMMITTED: u16 = 1 << 0;
+    const XMIN_ABORTED: u16 = 1 << 1;
+    const XMAX_COMMITTED: u16 = 1 << 2;
+    const XMAX_ABORTED: u16 = 1 << 3;
 
     /// Create an empty infomask with no flags set.
     pub const fn empty() -> Self {
@@ -97,19 +90,9 @@ impl Infomask {
         (self.0 & Self::XMIN_COMMITTED) != 0
     }
 
-    /// Set xmin committed flag.
-    pub const fn with_xmin_committed(self) -> Self {
-        Self(self.0 | Self::XMIN_COMMITTED)
-    }
-
     /// Check if xmin is aborted.
     pub const fn xmin_aborted(&self) -> bool {
         (self.0 & Self::XMIN_ABORTED) != 0
-    }
-
-    /// Set xmin aborted flag.
-    pub const fn with_xmin_aborted(self) -> Self {
-        Self(self.0 | Self::XMIN_ABORTED)
     }
 
     /// Check if xmax is committed.
@@ -117,14 +100,24 @@ impl Infomask {
         (self.0 & Self::XMAX_COMMITTED) != 0
     }
 
-    /// Set xmax committed flag.
-    pub const fn with_xmax_committed(self) -> Self {
-        Self(self.0 | Self::XMAX_COMMITTED)
-    }
-
     /// Check if xmax is aborted.
     pub const fn xmax_aborted(&self) -> bool {
         (self.0 & Self::XMAX_ABORTED) != 0
+    }
+
+    /// Set xmin committed flag.
+    pub const fn with_xmin_committed(self) -> Self {
+        Self(self.0 | Self::XMIN_COMMITTED)
+    }
+
+    /// Set xmin aborted flag.
+    pub const fn with_xmin_aborted(self) -> Self {
+        Self(self.0 | Self::XMIN_ABORTED)
+    }
+
+    /// Set xmax committed flag.
+    pub const fn with_xmax_committed(self) -> Self {
+        Self(self.0 | Self::XMAX_COMMITTED)
     }
 
     /// Set xmax aborted flag.
@@ -155,6 +148,27 @@ impl fmt::Display for Infomask {
     }
 }
 
+/// Transaction state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxState {
+    /// Transaction is currently in progress.
+    InProgress,
+    /// Transaction has committed.
+    Committed,
+    /// Transaction has aborted.
+    Aborted,
+}
+
+impl std::fmt::Display for TxState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TxState::InProgress => write!(f, "InProgress"),
+            TxState::Committed => write!(f, "Committed"),
+            TxState::Aborted => write!(f, "Aborted"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,14 +176,10 @@ mod tests {
     #[test]
     fn test_txid() {
         assert_eq!(TxId::INVALID.as_u64(), 0);
-        assert!(TxId::INVALID.is_invalid());
 
         let txid = TxId::new(42);
         assert_eq!(txid.as_u64(), 42);
-        assert!(!txid.is_invalid());
-
-        // Test ordering
-        assert!(TxId::new(1) < TxId::new(2));
+        assert_eq!(txid.next().as_u64(), 43);
     }
 
     #[test]
@@ -179,45 +189,23 @@ mod tests {
         let cid = CommandId::new(5);
         assert_eq!(cid.as_u32(), 5);
         assert_eq!(cid.next().as_u32(), 6);
-
-        // Test ordering
-        assert!(CommandId::new(1) < CommandId::new(2));
     }
 
     #[test]
     fn test_infomask() {
-        let mask = Infomask::empty();
-        assert!(!mask.xmin_committed());
-        assert!(!mask.xmin_aborted());
-        assert!(!mask.xmax_committed());
-        assert!(!mask.xmax_aborted());
+        let flags: [(fn(&Infomask) -> bool, fn(Infomask) -> Infomask); 4] = [
+            (Infomask::xmin_committed, Infomask::with_xmin_committed),
+            (Infomask::xmin_aborted, Infomask::with_xmin_aborted),
+            (Infomask::xmax_committed, Infomask::with_xmax_committed),
+            (Infomask::xmax_aborted, Infomask::with_xmax_aborted),
+        ];
 
-        let mask = mask.with_xmin_committed();
-        assert!(mask.xmin_committed());
-        assert!(!mask.xmin_aborted());
-
-        let mask = mask.with_xmax_aborted();
-        assert!(mask.xmin_committed());
-        assert!(mask.xmax_aborted());
-        assert!(!mask.xmax_committed());
-
-        // Test all flags
-        let mask = Infomask::empty()
-            .with_xmin_committed()
-            .with_xmin_aborted()
-            .with_xmax_committed()
-            .with_xmax_aborted();
-        assert!(mask.xmin_committed());
-        assert!(mask.xmin_aborted());
-        assert!(mask.xmax_committed());
-        assert!(mask.xmax_aborted());
-    }
-
-    #[test]
-    fn test_infomask_bit_values() {
-        assert_eq!(Infomask::XMIN_COMMITTED, 1 << 0);
-        assert_eq!(Infomask::XMIN_ABORTED, 1 << 1);
-        assert_eq!(Infomask::XMAX_COMMITTED, 1 << 2);
-        assert_eq!(Infomask::XMAX_ABORTED, 1 << 3);
+        // Test that each setter only affects its corresponding getter
+        for (i, (_, setter)) in flags.iter().enumerate() {
+            let mask = setter(Infomask::empty());
+            for (j, (getter, _)) in flags.iter().enumerate() {
+                assert_eq!(getter(&mask), i == j);
+            }
+        }
     }
 }

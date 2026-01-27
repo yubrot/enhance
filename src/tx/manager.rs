@@ -5,30 +5,17 @@
 
 use super::error::TxError;
 use super::snapshot::Snapshot;
-use super::types::{CommandId, TxId};
+use super::types::{CommandId, TxId, TxState};
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 
-/// Transaction state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransactionState {
-    /// Transaction is currently in progress.
-    InProgress,
-    /// Transaction has committed.
-    Committed,
-    /// Transaction has aborted.
-    Aborted,
-}
-
-impl std::fmt::Display for TransactionState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TransactionState::InProgress => write!(f, "InProgress"),
-            TransactionState::Committed => write!(f, "Committed"),
-            TransactionState::Aborted => write!(f, "Aborted"),
-        }
-    }
+/// Internal state protected by a single mutex to ensure atomicity
+/// between txid allocation and active transaction tracking.
+struct TxManagerState {
+    /// Next transaction ID to allocate (starts at 1).
+    next_txid: u64,
+    /// Active (in-progress) transaction IDs for snapshot generation.
+    active_txids: Vec<TxId>,
 }
 
 /// Transaction manager.
@@ -40,24 +27,21 @@ impl std::fmt::Display for TransactionState {
 ///
 /// NOTE: Transaction state is lost on restart. Step 13 (WAL) will add CLOG
 /// persistence for durable transaction state across restarts.
-///
-/// NOTE: Mutex-protected Vec for active transactions doesn't scale to high
-/// concurrency. Production systems use lock-free ProcArray structures.
 pub struct TransactionManager {
-    /// Next transaction ID to allocate (starts at 1).
-    next_txid: AtomicU64,
-    /// Active (in-progress) transaction IDs for snapshot generation.
-    active_txids: Mutex<Vec<TxId>>,
+    /// Atomic state for txid allocation and active tracking.
+    state: Mutex<TxManagerState>,
     /// Transaction state map (in-progress, committed, aborted).
-    tx_states: Mutex<HashMap<TxId, TransactionState>>,
+    tx_states: Mutex<HashMap<TxId, TxState>>,
 }
 
 impl TransactionManager {
     /// Create a new transaction manager.
     pub fn new() -> Self {
         Self {
-            next_txid: AtomicU64::new(1), // Start from 1 (0 is INVALID)
-            active_txids: Mutex::new(Vec::new()),
+            state: Mutex::new(TxManagerState {
+                next_txid: 1, // Start from 1 (0 is INVALID)
+                active_txids: Vec::new(),
+            }),
             tx_states: Mutex::new(HashMap::new()),
         }
     }
@@ -66,14 +50,15 @@ impl TransactionManager {
     ///
     /// Allocates a new TxId, marks it as in-progress, and adds it to the active list.
     pub fn begin(&self) -> TxId {
-        let txid = TxId::new(self.next_txid.fetch_add(1, Ordering::SeqCst));
+        let txid = {
+            let mut state = self.state.lock();
+            let txid = TxId::new(state.next_txid);
+            state.next_txid += 1;
+            state.active_txids.push(txid);
+            txid
+        };
 
-        let mut active = self.active_txids.lock().unwrap();
-        active.push(txid);
-
-        let mut states = self.tx_states.lock().unwrap();
-        states.insert(txid, TransactionState::InProgress);
-
+        self.tx_states.lock().insert(txid, TxState::InProgress);
         txid
     }
 
@@ -81,61 +66,67 @@ impl TransactionManager {
     ///
     /// Marks the transaction as committed and removes it from the active list.
     pub fn commit(&self, txid: TxId) -> Result<(), TxError> {
-        let mut states = self.tx_states.lock().unwrap();
-        let state = states
-            .get(&txid)
-            .ok_or(TxError::TransactionNotFound(txid))?;
-
-        if *state != TransactionState::InProgress {
-            return Err(TxError::InvalidStateTransition {
-                txid,
-                current: state.to_string(),
-                attempted: "Committed".to_string(),
-            });
-        }
-
-        states.insert(txid, TransactionState::Committed);
-        drop(states);
-
-        let mut active = self.active_txids.lock().unwrap();
-        active.retain(|&t| t != txid);
-
-        Ok(())
+        self.complete(txid, TxState::Committed)
     }
 
     /// Abort a transaction.
     ///
     /// Marks the transaction as aborted and removes it from the active list.
+    ///
+    /// NOTE: This follows PostgreSQL's lazy hint bit strategy - hint bits are NOT set during
+    /// abort. Instead:
+    /// - Readers (SeqScan) set hint bits when they first encounter tuples (Step 10)
+    /// - VACUUM ensures all tuples eventually get hint bits set (Step 15)
+    ///
+    /// This keeps abort O(1) even for large transactions, avoiding the need to track and
+    /// update all written tuples.
+    ///
+    /// IMPORTANT: Currently, tx_states is volatile. Once a transaction is GC'd from tx_states,
+    /// visibility checks will incorrectly assume it was committed (see snapshot.rs:123).
+    /// Step 13 (WAL) will add CLOG-equivalent persistence to fix this.
     pub fn abort(&self, txid: TxId) -> Result<(), TxError> {
-        let mut states = self.tx_states.lock().unwrap();
-        let state = states
-            .get(&txid)
-            .ok_or(TxError::TransactionNotFound(txid))?;
+        self.complete(txid, TxState::Aborted)
+    }
 
-        if *state != TransactionState::InProgress {
-            return Err(TxError::InvalidStateTransition {
-                txid,
-                current: state.to_string(),
-                attempted: "Aborted".to_string(),
-            });
+    /// Marks the transaction as `state` and removes it from the active list.
+    fn complete(&self, txid: TxId, new_state: TxState) -> Result<(), TxError> {
+        {
+            let mut tx_states = self.tx_states.lock();
+            match tx_states.insert(txid, new_state) {
+                Some(TxState::InProgress) => {}
+                Some(current_state) => {
+                    tx_states.insert(txid, current_state);
+                    return Err(TxError::InvalidStateTransition {
+                        txid,
+                        current: current_state,
+                        attempted: new_state,
+                    });
+                }
+                None => {
+                    tx_states.remove(&txid);
+                    return Err(TxError::TransactionNotFound(txid));
+                }
+            }
         }
 
-        states.insert(txid, TransactionState::Aborted);
-        drop(states);
-
-        let mut active = self.active_txids.lock().unwrap();
-        active.retain(|&t| t != txid);
+        self.state.lock().active_txids.retain(|&t| t != txid);
 
         Ok(())
     }
 
     /// Get the state of a transaction.
     ///
-    /// Returns None if the transaction is not found (likely completed long ago
-    /// and garbage collected from the state map).
-    pub fn get_state(&self, txid: TxId) -> Option<TransactionState> {
-        let states = self.tx_states.lock().unwrap();
-        states.get(&txid).copied()
+    /// # Panics
+    ///
+    /// Panics if the transaction is not found. This indicates a bug in the DBMS,
+    /// since all TxIds are created through `begin()` and tx_states entries are
+    /// never removed (GC requires CLOG from Step 13).
+    pub fn state(&self, txid: TxId) -> TxState {
+        self.tx_states
+            .lock()
+            .get(&txid)
+            .copied()
+            .expect("TxId not found in tx_states - this is a bug")
     }
 
     /// Create a snapshot for the current transaction.
@@ -143,20 +134,14 @@ impl TransactionManager {
     /// Captures the set of active transactions at this moment to determine
     /// which tuple versions are visible to this snapshot.
     pub fn snapshot(&self, current_txid: TxId, current_cid: CommandId) -> Snapshot {
-        let active = self.active_txids.lock().unwrap();
-
-        // xmin: All transactions < xmin are visible (committed before snapshot)
-        // xmax: All transactions >= xmax are invisible (started after snapshot)
-        // xip: Transactions in progress at snapshot time
-        let xip: Vec<TxId> = active.iter().copied().collect();
-
-        let xmin = if xip.is_empty() {
-            current_txid
-        } else {
-            *xip.iter().min().unwrap()
+        let (xmax, xip) = {
+            let state = self.state.lock();
+            (TxId::new(state.next_txid), state.active_txids.to_vec())
         };
 
-        let xmax = TxId::new(self.next_txid.load(Ordering::SeqCst));
+        // xmin = oldest active transaction, or current_txid if none active
+        // (In practice, current_txid should always be in active_txids after begin())
+        let xmin = xip.iter().min().copied().unwrap_or(current_txid);
 
         Snapshot {
             xmin,
@@ -196,10 +181,7 @@ mod tests {
         let manager = TransactionManager::new();
         let txid = manager.begin();
 
-        assert_eq!(
-            manager.get_state(txid),
-            Some(TransactionState::InProgress)
-        );
+        assert_eq!(manager.state(txid), TxState::InProgress);
     }
 
     #[test]
@@ -208,7 +190,7 @@ mod tests {
         let txid = manager.begin();
 
         manager.commit(txid).unwrap();
-        assert_eq!(manager.get_state(txid), Some(TransactionState::Committed));
+        assert_eq!(manager.state(txid), TxState::Committed);
     }
 
     #[test]
@@ -217,7 +199,7 @@ mod tests {
         let txid = manager.begin();
 
         manager.abort(txid).unwrap();
-        assert_eq!(manager.get_state(txid), Some(TransactionState::Aborted));
+        assert_eq!(manager.state(txid), TxState::Aborted);
     }
 
     #[test]
@@ -257,7 +239,10 @@ mod tests {
 
         // Try to commit again
         let result = manager.commit(txid);
-        assert!(matches!(result, Err(TxError::InvalidStateTransition { .. })));
+        assert!(matches!(
+            result,
+            Err(TxError::InvalidStateTransition { .. })
+        ));
     }
 
     #[test]
@@ -287,9 +272,48 @@ mod tests {
 
         let snapshot = manager.snapshot(TxId::new(999), CommandId::FIRST);
 
-        // xmin should be the minimum active transaction
+        // xmin = oldest active = tx1
         assert_eq!(snapshot.xmin, tx1);
-        // xmax should be the next TxId to be allocated (3)
+        // xmax = next_txid = 3
+        assert_eq!(snapshot.xmax, TxId::new(3));
+    }
+
+    #[test]
+    fn test_snapshot_xmax_equals_next_txid() {
+        let manager = TransactionManager::new();
+
+        // No transactions yet
+        let snapshot = manager.snapshot(TxId::new(999), CommandId::FIRST);
+        assert_eq!(snapshot.xmax, TxId::new(1));
+
+        let _tx1 = manager.begin();
+        let snapshot = manager.snapshot(TxId::new(999), CommandId::FIRST);
+        assert_eq!(snapshot.xmax, TxId::new(2));
+
+        let _tx2 = manager.begin();
+        let snapshot = manager.snapshot(TxId::new(999), CommandId::FIRST);
+        assert_eq!(snapshot.xmax, TxId::new(3));
+    }
+
+    #[test]
+    fn test_snapshot_xmax_unaffected_by_commit() {
+        let manager = TransactionManager::new();
+
+        let tx1 = manager.begin(); // TxId 1
+        let tx2 = manager.begin(); // TxId 2
+
+        // Before any commits
+        let snapshot = manager.snapshot(TxId::new(999), CommandId::FIRST);
+        assert_eq!(snapshot.xmax, TxId::new(3));
+
+        // After commit, xmax is still next_txid (unchanged)
+        manager.commit(tx1).unwrap();
+        let snapshot = manager.snapshot(TxId::new(999), CommandId::FIRST);
+        assert_eq!(snapshot.xmax, TxId::new(3));
+
+        // tx2 no longer in active list
+        manager.commit(tx2).unwrap();
+        let snapshot = manager.snapshot(TxId::new(999), CommandId::FIRST);
         assert_eq!(snapshot.xmax, TxId::new(3));
     }
 }
