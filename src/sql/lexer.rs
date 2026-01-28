@@ -534,9 +534,9 @@ mod tests {
     #[test]
     fn test_floats() {
         assert_eq!(
-            lex("3.14 0.5 1e10 2.5e-3"),
+            lex("3.5 0.5 1e10 2.5e-3"),
             vec![
-                TokenKind::FloatLit(3.14),
+                TokenKind::FloatLit(3.5),
                 TokenKind::FloatLit(0.5),
                 TokenKind::FloatLit(1e10),
                 TokenKind::FloatLit(2.5e-3),

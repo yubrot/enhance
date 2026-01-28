@@ -160,13 +160,15 @@ async fn verify_final_state(ctx: &TestContext) {
     let address_space = address_space_size(ctx.config.total_pages);
     let mut expected = vec![0u8; address_space];
 
-    let log = ctx.write_log.lock().unwrap();
-    println!("Verifying {} write records...", log.len());
+    {
+        let log = ctx.write_log.lock().unwrap();
+        println!("Verifying {} write records...", log.len());
 
-    for record in log.iter() {
-        for i in 0..record.length {
-            let offset = record.start_offset + i;
-            expected[offset] = expected[offset].wrapping_add(record.add_value);
+        for record in log.iter() {
+            for i in 0..record.length {
+                let offset = record.start_offset + i;
+                expected[offset] = expected[offset].wrapping_add(record.add_value);
+            }
         }
     }
 

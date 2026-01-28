@@ -1,15 +1,24 @@
-//! Record (tuple) representation and serialization.
+//! Record representation and serialization.
 //!
-//! A [`Record`] represents a single row in a table, consisting of multiple
+//! A [`Record`] represents the data portion of a database row, consisting of multiple
 //! [`Value`]s. Records can be serialized to a compact binary format for storage.
+//!
+//! ## Relationship to Tuples
+//!
+//! In the storage layer:
+//! - **Tuple** = TupleHeader (MVCC metadata) + Record (data values)
+//! - **Record** = Just the data values (Vec<Value>), without MVCC information
+//!
+//! Records are combined with TupleHeaders when stored in heap pages to form complete tuples.
 
 use super::error::SerializationError;
 use super::value::Value;
 use crate::ensure_buf_len;
 
-/// A record (tuple/row) consisting of multiple values.
+/// A record (row of data values).
 ///
-/// This is the logical representation of a row in memory.
+/// This represents the data portion of a row, without MVCC metadata (TupleHeader).
+/// When combined with a TupleHeader, a Record forms a complete tuple in storage.
 /// Use [`serialize`](Self::serialize) to convert to on-disk format.
 ///
 /// # Serialization Format
@@ -273,7 +282,7 @@ mod tests {
             Value::Int16(i16::MAX),
             Value::Int32(i32::MAX),
             Value::Int64(i64::MAX),
-            Value::Float32(3.14),
+            Value::Float32(std::f32::consts::PI),
             Value::Float64(std::f64::consts::PI),
             Value::Text("hello".to_string()),
             Value::Bytea(vec![1, 2, 3]),
