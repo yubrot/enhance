@@ -42,6 +42,8 @@ impl fmt::Display for TxId {
 pub struct CommandId(u32);
 
 impl CommandId {
+    /// Invalid command ID (indicates no command, e.g., tuple not yet deleted).
+    pub const INVALID: Self = Self(u32::MAX);
     /// First command ID in a transaction.
     pub const FIRST: Self = Self(0);
 
@@ -184,6 +186,7 @@ mod tests {
 
     #[test]
     fn test_command_id() {
+        assert_eq!(CommandId::INVALID.as_u32(), u32::MAX);
         assert_eq!(CommandId::FIRST.as_u32(), 0);
 
         let cid = CommandId::new(5);

@@ -4,7 +4,6 @@
 //! - Transaction ID allocation and lifecycle management ([`TransactionManager`])
 //! - Tuple headers with xmin/xmax for versioning ([`TupleHeader`])
 //! - Snapshot isolation for consistent reads ([`Snapshot`])
-//! - Visibility rules to determine which tuple versions are visible ([`Snapshot::is_tuple_visible`])
 
 pub mod error;
 pub mod manager;

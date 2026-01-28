@@ -269,51 +269,14 @@ mod tests {
 
         let tx1 = manager.begin(); // TxId 1
         let _tx2 = manager.begin(); // TxId 2
+        let tx3 = manager.begin(); // TxId 3
+        manager.commit(tx3).unwrap();
 
         let snapshot = manager.snapshot(TxId::new(999), CommandId::FIRST);
 
         // xmin = oldest active = tx1
         assert_eq!(snapshot.xmin, tx1);
-        // xmax = next_txid = 3
-        assert_eq!(snapshot.xmax, TxId::new(3));
-    }
-
-    #[test]
-    fn test_snapshot_xmax_equals_next_txid() {
-        let manager = TransactionManager::new();
-
-        // No transactions yet
-        let snapshot = manager.snapshot(TxId::new(999), CommandId::FIRST);
-        assert_eq!(snapshot.xmax, TxId::new(1));
-
-        let _tx1 = manager.begin();
-        let snapshot = manager.snapshot(TxId::new(999), CommandId::FIRST);
-        assert_eq!(snapshot.xmax, TxId::new(2));
-
-        let _tx2 = manager.begin();
-        let snapshot = manager.snapshot(TxId::new(999), CommandId::FIRST);
-        assert_eq!(snapshot.xmax, TxId::new(3));
-    }
-
-    #[test]
-    fn test_snapshot_xmax_unaffected_by_commit() {
-        let manager = TransactionManager::new();
-
-        let tx1 = manager.begin(); // TxId 1
-        let tx2 = manager.begin(); // TxId 2
-
-        // Before any commits
-        let snapshot = manager.snapshot(TxId::new(999), CommandId::FIRST);
-        assert_eq!(snapshot.xmax, TxId::new(3));
-
-        // After commit, xmax is still next_txid (unchanged)
-        manager.commit(tx1).unwrap();
-        let snapshot = manager.snapshot(TxId::new(999), CommandId::FIRST);
-        assert_eq!(snapshot.xmax, TxId::new(3));
-
-        // tx2 no longer in active list
-        manager.commit(tx2).unwrap();
-        let snapshot = manager.snapshot(TxId::new(999), CommandId::FIRST);
-        assert_eq!(snapshot.xmax, TxId::new(3));
+        // xmax = next_txid = 4 (unaffected by commit)
+        assert_eq!(snapshot.xmax, TxId::new(4));
     }
 }

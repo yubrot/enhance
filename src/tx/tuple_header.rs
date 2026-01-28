@@ -2,8 +2,8 @@
 
 use super::types::{CommandId, Infomask, TxId};
 
-/// Size of the tuple header in bytes: 8 (xmin) + 8 (xmax) + 4 (cid) + 2 (infomask) = 22 bytes.
-pub const TUPLE_HEADER_SIZE: usize = 22;
+/// Size of the tuple header in bytes: 8 (xmin) + 8 (xmax) + 4 (cmin) + 4 (cmax) + 2 (infomask) = 26 bytes.
+pub const TUPLE_HEADER_SIZE: usize = 26;
 
 /// Tuple header for MVCC.
 ///
@@ -16,8 +16,10 @@ pub struct TupleHeader {
     pub xmin: TxId,
     /// Transaction ID that deleted this tuple (INVALID if not deleted).
     pub xmax: TxId,
-    /// Command ID within the transaction (for intra-transaction visibility).
-    pub cid: CommandId,
+    /// Command ID when this tuple was inserted (for intra-transaction visibility).
+    pub cmin: CommandId,
+    /// Command ID when this tuple was deleted (INVALID if not deleted).
+    pub cmax: CommandId,
     /// Information mask with commit/abort hint bits.
     pub infomask: Infomask,
 }
@@ -26,12 +28,13 @@ impl TupleHeader {
     /// Create a new tuple header for an INSERT operation.
     ///
     /// Sets xmin to the inserting transaction, xmax to INVALID (not deleted),
-    /// and initializes infomask to empty.
-    pub fn new(xmin: TxId, cid: CommandId) -> Self {
+    /// cmax to INVALID (not deleted), and initializes infomask to empty.
+    pub fn new(xmin: TxId, cmin: CommandId) -> Self {
         Self {
             xmin,
             xmax: TxId::INVALID,
-            cid,
+            cmin,
+            cmax: CommandId::INVALID,
             infomask: Infomask::empty(),
         }
     }
@@ -45,23 +48,26 @@ impl TupleHeader {
             xmax: TxId::new(u64::from_le_bytes([
                 data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
             ])),
-            cid: CommandId::new(u32::from_le_bytes([data[16], data[17], data[18], data[19]])),
-            infomask: Infomask::from_raw(u16::from_le_bytes([data[20], data[21]])),
+            cmin: CommandId::new(u32::from_le_bytes([data[16], data[17], data[18], data[19]])),
+            cmax: CommandId::new(u32::from_le_bytes([data[20], data[21], data[22], data[23]])),
+            infomask: Infomask::from_raw(u16::from_le_bytes([data[24], data[25]])),
         }
     }
 
     /// Writes the tuple header to bytes.
     ///
-    /// Layout (22 bytes):
+    /// Layout (26 bytes):
     /// - xmin: 8 bytes (little-endian u64)
     /// - xmax: 8 bytes (little-endian u64)
-    /// - cid: 4 bytes (little-endian u32)
+    /// - cmin: 4 bytes (little-endian u32)
+    /// - cmax: 4 bytes (little-endian u32)
     /// - infomask: 2 bytes (little-endian u16)
     pub fn write(&self, data: &mut [u8]) {
         data[0..8].copy_from_slice(&self.xmin.as_u64().to_le_bytes());
         data[8..16].copy_from_slice(&self.xmax.as_u64().to_le_bytes());
-        data[16..20].copy_from_slice(&self.cid.as_u32().to_le_bytes());
-        data[20..22].copy_from_slice(&self.infomask.as_u16().to_le_bytes());
+        data[16..20].copy_from_slice(&self.cmin.as_u32().to_le_bytes());
+        data[20..24].copy_from_slice(&self.cmax.as_u32().to_le_bytes());
+        data[24..26].copy_from_slice(&self.infomask.as_u16().to_le_bytes());
     }
 }
 
@@ -74,7 +80,8 @@ mod tests {
         let header = TupleHeader::new(TxId::new(100), CommandId::new(5));
         assert_eq!(header.xmin, TxId::new(100));
         assert_eq!(header.xmax, TxId::INVALID);
-        assert_eq!(header.cid, CommandId::new(5));
+        assert_eq!(header.cmin, CommandId::new(5));
+        assert_eq!(header.cmax, CommandId::INVALID);
         assert_eq!(header.infomask, Infomask::empty());
     }
 
@@ -83,7 +90,8 @@ mod tests {
         let original = TupleHeader {
             xmin: TxId::new(42),
             xmax: TxId::new(100),
-            cid: CommandId::new(7),
+            cmin: CommandId::new(7),
+            cmax: CommandId::new(12),
             infomask: Infomask::empty().with_xmin_committed().with_xmax_aborted(),
         };
 

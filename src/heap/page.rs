@@ -485,10 +485,10 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> HeapPage<T> {
         &mut self,
         record: &Record,
         xmin: TxId,
-        cid: CommandId,
+        cmin: CommandId,
     ) -> Result<SlotId, HeapError> {
         // Serialize tuple header + record
-        let header = TupleHeader::new(xmin, cid);
+        let header = TupleHeader::new(xmin, cmin);
         let record_size = record.serialized_size();
         let total_size = TUPLE_HEADER_SIZE + record_size;
 
@@ -755,7 +755,8 @@ mod tests {
 
         assert_eq!(header.xmin, TxId::new(1));
         assert_eq!(header.xmax, TxId::INVALID);
-        assert_eq!(header.cid, CommandId::FIRST);
+        assert_eq!(header.cmin, CommandId::FIRST);
+        assert_eq!(header.cmax, CommandId::INVALID);
         assert_eq!(read_record, record);
     }
 
@@ -787,7 +788,8 @@ mod tests {
         let new_header = TupleHeader {
             xmin: TxId::new(1),
             xmax: TxId::new(2), // Mark as deleted by transaction 2
-            cid: CommandId::FIRST,
+            cmin: CommandId::FIRST,
+            cmax: CommandId::new(1), // Deleted at command 1
             infomask: Infomask::empty().with_xmin_committed(),
         };
         page.update_header(slot, new_header).unwrap();

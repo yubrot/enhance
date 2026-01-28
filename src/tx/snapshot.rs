@@ -21,7 +21,7 @@ use super::types::{CommandId, TxId, TxState};
 ///
 /// - `txid < xmin`: **Past** (committed before snapshot, always visible)
 /// - `xmin <= txid < xmax`: **Present** (check `xip` to determine if in-progress)
-/// - `txid >= xmax`: **Future** (started after snapshot, always invisible)
+/// - `xmax <= txid`: **Future** (started after snapshot, always invisible)
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     /// Lower bound
@@ -58,18 +58,6 @@ impl Snapshot {
     /// This implements PostgreSQL's `HeapTupleSatisfiesMVCC` visibility rules for
     /// READ COMMITTED isolation, where each statement gets a fresh snapshot.
     ///
-    /// **Visibility rules:**
-    ///
-    /// 1. **xmin check** - Tuple is visible if:
-    ///    - xmin is the current transaction AND cid < current_cid (self-visibility), OR
-    ///    - xmin committed before snapshot
-    ///
-    /// 2. **xmax check** - Tuple is NOT deleted if:
-    ///    - xmax is INVALID (never deleted), OR
-    ///    - xmax aborted, OR
-    ///    - xmax is in progress by another transaction, OR
-    ///    - xmax is the current transaction AND cid >= current_cid (not yet deleted)
-    ///
     /// NOTE: This function does NOT update hint bits (xmin_committed, xmin_aborted, etc.) in
     /// the tuple header. Following PostgreSQL's lazy hint bit strategy, hint bits will be set by:
     /// - Readers (SeqScan in Step 10): Set hint bits on first tuple access
@@ -97,13 +85,17 @@ impl Snapshot {
     /// Check if the tuple is inserted according to this snapshot.
     ///
     /// Returns true if the inserting transaction (xmin) is visible.
+    ///
+    /// **Visibility rules** - Tuple is inserted if:
+    /// - xmin is the current transaction AND cmin < current_cid (self-visibility), OR
+    /// - xmin committed before snapshot
     fn is_inserted(&self, header: &TupleHeader, tx_manager: &TransactionManager) -> bool {
         let xmin = header.xmin;
 
         // Self-visibility: tuple inserted by current transaction
         if xmin == self.current_txid {
             // Only visible if inserted by an earlier command in this transaction
-            return header.cid < self.current_cid;
+            return header.cmin < self.current_cid;
         }
 
         // Check hint bits first for optimization
@@ -128,6 +120,10 @@ impl Snapshot {
     /// Check if the tuple is deleted according to this snapshot.
     ///
     /// Returns true if the deleting transaction (xmax) is visible.
+    ///
+    /// **Visibility rules** - Tuple is deleted if:
+    /// - xmax is the current transaction AND cmax < current_cid (self-deletion), OR
+    /// - xmax committed before snapshot
     fn is_deleted(&self, header: &TupleHeader, tx_manager: &TransactionManager) -> bool {
         let xmax = header.xmax;
 
@@ -139,7 +135,7 @@ impl Snapshot {
         // Self-deletion: tuple deleted by current transaction
         if xmax == self.current_txid {
             // Only deleted if deleted by an earlier command in this transaction
-            return header.cid < self.current_cid;
+            return header.cmax < self.current_cid;
         }
 
         // Check hint bits first for optimization
@@ -167,239 +163,276 @@ mod tests {
     use super::*;
     use crate::tx::types::Infomask;
 
-    fn make_snapshot(xmin: u64, xmax: u64, xip: Vec<u64>, current: u64, cid: u32) -> Snapshot {
-        Snapshot {
-            xmin: TxId::new(xmin),
-            xmax: TxId::new(xmax),
-            xip: xip.into_iter().map(TxId::new).collect(),
-            current_txid: TxId::new(current),
-            current_cid: CommandId::new(cid),
+    /// Helper: create a TupleHeader inserted by the given transaction, not deleted.
+    fn inserted_by(xmin: TxId, cmin: CommandId, infomask: Infomask) -> TupleHeader {
+        TupleHeader {
+            xmin,
+            xmax: TxId::INVALID,
+            cmin,
+            cmax: CommandId::INVALID,
+            infomask,
+        }
+    }
+
+    // Tests for xmin visibility (insertion visibility)
+
+    #[test]
+    fn test_xmin_aborted_are_invisible() {
+        let manager = TransactionManager::new();
+
+        let tx1 = manager.begin();
+        manager.abort(tx1).unwrap();
+
+        let tx2 = manager.begin();
+        let snapshot = manager.snapshot(tx2, CommandId::FIRST);
+
+        let tx3 = manager.begin();
+        manager.abort(tx3).unwrap();
+
+        for infomask in [Infomask::empty(), Infomask::empty().with_xmin_aborted()] {
+            let h1 = inserted_by(tx1, CommandId::FIRST, infomask);
+            let h3 = inserted_by(tx3, CommandId::FIRST, infomask);
+            assert!(!snapshot.is_tuple_visible(&h1, &manager));
+            assert!(!snapshot.is_tuple_visible(&h3, &manager));
         }
     }
 
     #[test]
-    fn test_visibility_committed_before_snapshot() {
+    fn test_xmin_committed_visibility() {
         let manager = TransactionManager::new();
-        let tx1 = manager.begin(); // TxId 1
-        manager.commit(tx1).unwrap();
 
-        let snapshot = make_snapshot(2, 3, vec![2], 2, 0);
+        // tx0: started before snapshot and committed long before (< xmin)
+        let tx0 = manager.begin();
+        manager.commit(tx0).unwrap();
 
-        let header = TupleHeader {
-            xmin: tx1,
-            xmax: TxId::INVALID,
-            cid: CommandId::FIRST,
-            infomask: Infomask::empty().with_xmin_committed(),
-        };
-
-        assert!(snapshot.is_tuple_visible(&header, &manager));
-    }
-
-    #[test]
-    fn test_visibility_aborted_xmin() {
-        let manager = TransactionManager::new();
-        let tx1 = manager.begin();
-        manager.abort(tx1).unwrap();
-
-        let snapshot = make_snapshot(2, 3, vec![2], 2, 0);
-
-        let header = TupleHeader {
-            xmin: tx1,
-            xmax: TxId::INVALID,
-            cid: CommandId::FIRST,
-            infomask: Infomask::empty().with_xmin_aborted(),
-        };
-
-        assert!(!snapshot.is_tuple_visible(&header, &manager));
-    }
-
-    #[test]
-    fn test_visibility_in_progress_at_snapshot() {
-        let manager = TransactionManager::new();
-        let tx1 = manager.begin(); // TxId 1
-
-        // Snapshot taken while tx1 is in progress
-        let snapshot = make_snapshot(1, 2, vec![1], 2, 0);
-
-        let header = TupleHeader {
-            xmin: tx1,
-            xmax: TxId::INVALID,
-            cid: CommandId::FIRST,
-            infomask: Infomask::empty(),
-        };
-
-        assert!(!snapshot.is_tuple_visible(&header, &manager));
-    }
-
-    #[test]
-    fn test_visibility_self_earlier_cid() {
-        let manager = TransactionManager::new();
-        let tx1 = manager.begin(); // TxId 1
-
-        // Current transaction, current cid = 5
-        let snapshot = make_snapshot(1, 2, vec![1], 1, 5);
-
-        // Tuple inserted at cid 3 (earlier than current cid 5)
-        let header = TupleHeader {
-            xmin: tx1,
-            xmax: TxId::INVALID,
-            cid: CommandId::new(3),
-            infomask: Infomask::empty(),
-        };
-
-        assert!(snapshot.is_tuple_visible(&header, &manager));
-    }
-
-    #[test]
-    fn test_visibility_self_same_or_later_cid() {
-        let manager = TransactionManager::new();
+        // tx1: started before snapshot and uncommitted (= xmin & in xip)
         let tx1 = manager.begin();
 
-        // Current transaction, current cid = 5
-        let snapshot = make_snapshot(1, 2, vec![1], 1, 5);
-
-        // Tuple inserted at cid 5 (same as current)
-        let header = TupleHeader {
-            xmin: tx1,
-            xmax: TxId::INVALID,
-            cid: CommandId::new(5),
-            infomask: Infomask::empty(),
-        };
-
-        assert!(!snapshot.is_tuple_visible(&header, &manager));
-    }
-
-    #[test]
-    fn test_visibility_deleted_by_committed_tx() {
-        let manager = TransactionManager::new();
-        let tx1 = manager.begin(); // TxId 1 (insert)
-        manager.commit(tx1).unwrap();
-
-        let tx2 = manager.begin(); // TxId 2 (delete)
+        // tx2: started before snapshot and committed before snapshot
+        let tx2 = manager.begin();
         manager.commit(tx2).unwrap();
 
-        let snapshot = make_snapshot(3, 4, vec![3], 3, 0);
+        // tx3: started before snapshot and committed after snapshot (in xip)
+        let tx3 = manager.begin();
 
-        let header = TupleHeader {
-            xmin: tx1,
-            xmax: tx2,
-            cid: CommandId::FIRST,
-            infomask: Infomask::empty()
-                .with_xmin_committed()
-                .with_xmax_committed(),
-        };
+        // main tx
+        let tx = manager.begin();
 
-        // Inserted by tx1 (visible), deleted by tx2 (also visible) -> not visible
-        assert!(!snapshot.is_tuple_visible(&header, &manager));
+        // tx4: started before snapshot and committed before snapshot
+        let tx4 = manager.begin();
+        manager.commit(tx4).unwrap();
+
+        // tx5: started before snapshot and committed after snapshot (in xip)
+        let tx5 = manager.begin();
+
+        let snapshot = manager.snapshot(tx, CommandId::FIRST);
+        manager.commit(tx3).unwrap();
+        manager.commit(tx5).unwrap();
+
+        // tx6: started after snapshot and committed (>= xmax)
+        let tx6 = manager.begin();
+        manager.commit(tx6).unwrap();
+
+        for infomask in [Infomask::empty(), Infomask::empty().with_xmin_committed()] {
+            for (target_tx, visible) in [
+                (tx0, true),  // past: < xmin
+                (tx1, false), // present: in xip (uncommitted)
+                (tx2, true),  // present: not in xip (committed before snapshot)
+                (tx3, false), // present: in xip (committed after snapshot)
+                (tx4, true),  // present: not in xip (committed before snapshot)
+                (tx5, false), // present: in xip (committed after snapshot)
+                (tx6, false), // future: >= xmax
+            ] {
+                let header = inserted_by(target_tx, CommandId::FIRST, infomask);
+                assert_eq!(snapshot.is_tuple_visible(&header, &manager), visible);
+            }
+        }
+    }
+
+    // Tests for xmax visibility (deletion visibility)
+
+    #[test]
+    fn test_xmax_aborted_are_visible() {
+        let manager = TransactionManager::new();
+
+        let tx_insert = manager.begin();
+        manager.commit(tx_insert).unwrap();
+
+        let tx_delete1 = manager.begin();
+        manager.abort(tx_delete1).unwrap();
+
+        let tx = manager.begin();
+        let snapshot = manager.snapshot(tx, CommandId::FIRST);
+
+        let tx_delete2 = manager.begin();
+        manager.abort(tx_delete2).unwrap();
+
+        for infomask in [Infomask::empty(), Infomask::empty().with_xmax_aborted()] {
+            let infomask = infomask.with_xmin_committed();
+            let h1 = TupleHeader {
+                xmin: tx_insert,
+                xmax: tx_delete1,
+                cmin: CommandId::FIRST,
+                cmax: CommandId::FIRST,
+                infomask,
+            };
+            let h2 = TupleHeader {
+                xmin: tx_insert,
+                xmax: tx_delete2,
+                cmin: CommandId::FIRST,
+                cmax: CommandId::FIRST,
+                infomask,
+            };
+            assert!(snapshot.is_tuple_visible(&h1, &manager));
+            assert!(snapshot.is_tuple_visible(&h2, &manager));
+        }
     }
 
     #[test]
-    fn test_visibility_deleted_by_aborted_tx() {
+    fn test_xmax_committed_visibility() {
         let manager = TransactionManager::new();
-        let tx1 = manager.begin();
-        manager.commit(tx1).unwrap();
 
+        let tx_insert = manager.begin();
+        manager.commit(tx_insert).unwrap();
+
+        // tx0: started before snapshot and committed long before (< xmin)
+        let tx0 = manager.begin();
+        manager.commit(tx0).unwrap();
+
+        // tx1: started before snapshot and uncommitted (= xmin & in xip)
+        let tx1 = manager.begin();
+
+        // tx2: started before snapshot and committed before snapshot
         let tx2 = manager.begin();
-        manager.abort(tx2).unwrap();
+        manager.commit(tx2).unwrap();
 
-        let snapshot = make_snapshot(3, 4, vec![3], 3, 0);
+        // tx3: started before snapshot and committed after snapshot (in xip)
+        let tx3 = manager.begin();
 
-        let header = TupleHeader {
-            xmin: tx1,
-            xmax: tx2,
-            cid: CommandId::FIRST,
-            infomask: Infomask::empty().with_xmin_committed().with_xmax_aborted(),
-        };
+        // main tx
+        let tx = manager.begin();
 
-        // Inserted by tx1 (visible), deleted by tx2 (aborted) -> visible
-        assert!(snapshot.is_tuple_visible(&header, &manager));
+        // tx4: started before snapshot and committed before snapshot
+        let tx4 = manager.begin();
+        manager.commit(tx4).unwrap();
+
+        // tx5: started before snapshot and committed after snapshot (in xip)
+        let tx5 = manager.begin();
+
+        let snapshot = manager.snapshot(tx, CommandId::FIRST);
+        manager.commit(tx3).unwrap();
+        manager.commit(tx5).unwrap();
+
+        // tx6: started after snapshot and committed (>= xmax)
+        let tx6 = manager.begin();
+        manager.commit(tx6).unwrap();
+
+        // visible=true means tuple is visible (deletion NOT visible)
+        // visible=false means tuple is NOT visible (deletion IS visible)
+        for infomask in [Infomask::empty(), Infomask::empty().with_xmax_committed()] {
+            let infomask = infomask.with_xmin_committed();
+            for (target_tx, visible) in [
+                (tx0, false), // past: < xmin → deletion visible
+                (tx1, true),  // present: in xip (uncommitted) → deletion not visible
+                (tx2, false), // present: not in xip (committed before snapshot) → deletion visible
+                (tx3, true),  // present: in xip (committed after snapshot) → deletion not visible
+                (tx4, false), // present: not in xip (committed before snapshot) → deletion visible
+                (tx5, true),  // present: in xip (committed after snapshot) → deletion not visible
+                (tx6, true),  // future: >= xmax → deletion not visible
+            ] {
+                let header = TupleHeader {
+                    xmin: tx_insert,
+                    xmax: target_tx,
+                    cmin: CommandId::FIRST,
+                    cmax: CommandId::FIRST,
+                    infomask,
+                };
+                assert_eq!(snapshot.is_tuple_visible(&header, &manager), visible);
+            }
+        }
     }
 
-    #[test]
-    fn test_visibility_deleted_by_in_progress() {
-        let manager = TransactionManager::new();
-        let tx1 = manager.begin();
-        manager.commit(tx1).unwrap();
-
-        let tx2 = manager.begin(); // In progress
-
-        let snapshot = make_snapshot(3, 4, vec![2, 3], 3, 0);
-
-        let header = TupleHeader {
-            xmin: tx1,
-            xmax: tx2,
-            cid: CommandId::FIRST,
-            infomask: Infomask::empty().with_xmin_committed(),
-        };
-
-        // Inserted by tx1 (visible), deleted by tx2 (in progress) -> visible
-        assert!(snapshot.is_tuple_visible(&header, &manager));
-    }
+    // Tests for self-visibility (current transaction)
+    // Note: Hint bits are irrelevant for self-visibility as txid match is checked first
 
     #[test]
-    fn test_visibility_self_delete_earlier_cid() {
-        let manager = TransactionManager::new();
-        let tx1 = manager.begin();
-
-        // Current cid = 5
-        let snapshot = make_snapshot(1, 2, vec![1], 1, 5);
-
-        // Tuple inserted at cid 3 by tx1, later deleted by tx1
-        let header = TupleHeader {
-            xmin: tx1,
-            xmax: tx1,
-            cid: CommandId::new(3), // INSERT cid
-            infomask: Infomask::empty(),
-        };
-
-        // cid=3 < current_cid=5, so insert is visible
-        // xmax is set by same tx, and cid=3 < current_cid=5, so delete is also visible
-        // Result: tuple is NOT visible (deleted)
-        assert!(!snapshot.is_tuple_visible(&header, &manager));
-    }
-
-    #[test]
-    fn test_visibility_self_delete_same_or_later_cid() {
+    fn test_visibility_self_insert_earlier_cid() {
         let manager = TransactionManager::new();
         let tx1 = manager.begin();
 
-        // Current cid = 5
-        let snapshot = make_snapshot(1, 2, vec![1], 1, 5);
+        let snapshot = manager.snapshot(tx1, CommandId::new(5));
 
-        // Tuple inserted at cid 1 by tx1, later deleted by tx1
-        // NOTE: In our simplified design, cid represents INSERT cid only.
-        // For same-transaction updates/deletes, we check if the DELETE
-        // happened (by checking xmax is set), but we can't determine
-        // the exact delete cid without combo-cid infrastructure.
-        // This means once xmax is set by the same transaction, we consider
-        // the tuple deleted regardless of which command within the transaction.
+        // Tuple inserted at cmin 3 (earlier than current cid 5)
         let header = TupleHeader {
             xmin: tx1,
-            xmax: tx1,
-            cid: CommandId::new(1), // INSERT cid
-            infomask: Infomask::empty(),
-        };
-
-        // cid=1 < current_cid=5, so insert is visible
-        // xmax is set by same tx, and cid=1 < current_cid=5, so delete is also visible
-        // Result: tuple is NOT visible (deleted)
-        assert!(!snapshot.is_tuple_visible(&header, &manager));
-    }
-
-    #[test]
-    fn test_visibility_started_after_snapshot() {
-        let manager = TransactionManager::new();
-
-        // Snapshot xmax = 5, so tx5 started after snapshot
-        let snapshot = make_snapshot(1, 5, vec![], 6, 0);
-
-        let header = TupleHeader {
-            xmin: TxId::new(5),
             xmax: TxId::INVALID,
-            cid: CommandId::FIRST,
-            infomask: Infomask::empty().with_xmin_committed(),
+            cmin: CommandId::new(3),
+            cmax: CommandId::INVALID,
+            infomask: Infomask::empty(),
+        };
+
+        assert!(snapshot.is_tuple_visible(&header, &manager));
+    }
+
+    #[test]
+    fn test_visibility_self_insert_same_or_later_cid() {
+        let manager = TransactionManager::new();
+        let tx1 = manager.begin();
+
+        let snapshot = manager.snapshot(tx1, CommandId::new(5));
+
+        // Tuple inserted at cmin 5 (same as current) - not yet visible
+        let header = TupleHeader {
+            xmin: tx1,
+            xmax: TxId::INVALID,
+            cmin: CommandId::new(5),
+            cmax: CommandId::INVALID,
+            infomask: Infomask::empty(),
         };
 
         assert!(!snapshot.is_tuple_visible(&header, &manager));
+    }
+
+    #[test]
+    fn test_visibility_self_delete() {
+        let manager = TransactionManager::new();
+        let tx1 = manager.begin();
+
+        let snapshot = manager.snapshot(tx1, CommandId::new(5));
+
+        // Tuple inserted at cmin 3 and deleted at cmax 4 by same transaction
+        // Both are earlier than current_cid=5, so insert visible and delete visible
+        let header = TupleHeader {
+            xmin: tx1,
+            xmax: tx1,
+            cmin: CommandId::new(3),
+            cmax: CommandId::new(4),
+            infomask: Infomask::empty(),
+        };
+
+        // Insert visible (cmin=3 < current_cid=5), delete also visible (cmax=4 < current_cid=5)
+        // -> tuple NOT visible
+        assert!(!snapshot.is_tuple_visible(&header, &manager));
+    }
+
+    #[test]
+    fn test_visibility_self_insert_then_delete_later_cid() {
+        let manager = TransactionManager::new();
+        let tx1 = manager.begin();
+
+        let snapshot = manager.snapshot(tx1, CommandId::new(5));
+
+        // Tuple inserted at cmin 3, deleted at cmax 7 (later than current_cid=5)
+        let header = TupleHeader {
+            xmin: tx1,
+            xmax: tx1,
+            cmin: CommandId::new(3),
+            cmax: CommandId::new(7),
+            infomask: Infomask::empty(),
+        };
+
+        // Insert visible (cmin=3 < current_cid=5), but delete NOT visible (cmax=7 >= current_cid=5)
+        // -> tuple IS visible
+        assert!(snapshot.is_tuple_visible(&header, &manager));
     }
 }
