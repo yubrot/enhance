@@ -121,6 +121,10 @@ impl TransactionManager {
     /// Panics if the transaction is not found. This indicates a bug in the DBMS,
     /// since all TxIds are created through `begin()` and tx_states entries are
     /// never removed (GC requires CLOG from Step 13).
+    ///
+    /// NOTE: After tx_states GC is implemented (Step 13+), this function must
+    /// fall back to CLOG lookup for GC'd TxIds instead of panicking. The return
+    /// type may need to change or CLOG lookup could be transparent.
     pub fn state(&self, txid: TxId) -> TxState {
         self.tx_states
             .lock()

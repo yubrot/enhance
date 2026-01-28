@@ -5,6 +5,7 @@ use std::fmt;
 /// Transaction ID (64-bit).
 ///
 /// TxIds are allocated sequentially starting from 1. TxId 0 is reserved as INVALID.
+/// Using 64-bit IDs (vs PostgreSQL's 32-bit) eliminates wraparound concerns entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TxId(u64);
 

@@ -50,6 +50,8 @@ impl Snapshot {
         }
 
         // Check if transaction was in progress at snapshot time (present)
+        // NOTE: Linear search O(n) on xip. Production systems with many concurrent
+        // transactions could use a sorted Vec with binary search, or a HashSet.
         !self.xip.contains(&txid)
     }
 
@@ -69,17 +71,7 @@ impl Snapshot {
     /// (catalog scans, VACUUM) would require additional visibility functions like
     /// `HeapTupleSatisfiesSelf`, `HeapTupleSatisfiesAny`, or `HeapTupleSatisfiesDirty`.
     pub fn is_tuple_visible(&self, header: &TupleHeader, tx_manager: &TransactionManager) -> bool {
-        // Check if tuple was inserted (xmin visibility)
-        if !self.is_inserted(header, tx_manager) {
-            return false;
-        }
-
-        // Check if tuple was deleted (xmax visibility)
-        if self.is_deleted(header, tx_manager) {
-            return false;
-        }
-
-        true
+        self.is_inserted(header, tx_manager) && !self.is_deleted(header, tx_manager)
     }
 
     /// Check if the tuple is inserted according to this snapshot.
