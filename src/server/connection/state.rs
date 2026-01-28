@@ -4,35 +4,8 @@ use crate::protocol::{FormatCode, TransactionStatus};
 use crate::sql::Statement;
 use crate::tx::{CommandId, TxId};
 
-/// Transaction state for a connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TxState {
-    /// Not in a transaction (auto-commit mode).
-    #[default]
-    Idle,
-    /// In an active transaction block.
-    InTransaction,
-    /// Transaction failed, awaiting ROLLBACK.
-    /// NOTE: Will be used in future statement error handling (Step 8+).
-    #[allow(dead_code)]
-    Failed,
-}
-
-impl TxState {
-    /// Convert to PostgreSQL wire protocol TransactionStatus.
-    pub fn to_protocol_status(self) -> TransactionStatus {
-        match self {
-            TxState::Idle => TransactionStatus::Idle,
-            TxState::InTransaction => TransactionStatus::InTransaction,
-            TxState::Failed => TransactionStatus::Failed,
-        }
-    }
-}
-
 /// Per-connection state for Extended Query Protocol.
-///
-/// NOTE: No synchronization needed - this state is owned by a single connection.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ConnectionState {
     /// Named prepared statements. Key "" is the unnamed statement.
     statements: HashMap<String, PreparedStatement>,
@@ -40,25 +13,8 @@ pub struct ConnectionState {
     portals: HashMap<String, Portal>,
     /// Error state flag. When true, extended query messages are skipped until Sync.
     pub in_error: bool,
-    /// Transaction state (Idle, InTransaction, Failed).
-    tx_state: TxState,
-    /// Current transaction ID (None if not in a transaction).
-    current_txid: Option<TxId>,
-    /// Current command ID within the transaction.
-    current_cid: CommandId,
-}
-
-impl Default for ConnectionState {
-    fn default() -> Self {
-        Self {
-            statements: HashMap::new(),
-            portals: HashMap::new(),
-            in_error: false,
-            tx_state: TxState::Idle,
-            current_txid: None,
-            current_cid: CommandId::FIRST,
-        }
-    }
+    /// Transaction state. `None` means idle (auto-commit mode).
+    transaction: Option<TransactionState>,
 }
 
 impl ConnectionState {
@@ -111,53 +67,55 @@ impl ConnectionState {
         self.close_portal("");
     }
 
-    // ========================================================================
-    // Transaction State Methods
-    // ========================================================================
-
-    /// Get the current transaction state.
-    pub fn tx_state(&self) -> TxState {
-        self.tx_state
-    }
-
-    /// Get the current transaction ID (None if not in a transaction).
-    pub fn current_txid(&self) -> Option<TxId> {
-        self.current_txid
-    }
-
-    /// Get the current command ID.
-    /// NOTE: Will be used for statement-level snapshots (Step 8+).
-    #[allow(dead_code)]
-    pub fn current_cid(&self) -> CommandId {
-        self.current_cid
+    /// Get the current transaction state (None if idle).
+    pub fn transaction(&self) -> Option<TransactionState> {
+        self.transaction
     }
 
     /// Begin a transaction with the given TxId.
     pub fn begin_transaction(&mut self, txid: TxId) {
-        self.tx_state = TxState::InTransaction;
-        self.current_txid = Some(txid);
-        self.current_cid = CommandId::FIRST;
+        self.transaction = Some(TransactionState {
+            txid,
+            cid: CommandId::FIRST,
+            failed: false,
+        });
     }
 
     /// End the current transaction (commit or rollback).
     pub fn end_transaction(&mut self) {
-        self.tx_state = TxState::Idle;
-        self.current_txid = None;
-        self.current_cid = CommandId::FIRST;
-    }
-
-    /// Set the transaction state to Failed.
-    /// NOTE: Will be used when a statement fails within a transaction (Step 8+).
-    #[allow(dead_code)]
-    pub fn set_failed(&mut self) {
-        if self.tx_state == TxState::InTransaction {
-            self.tx_state = TxState::Failed;
-        }
+        self.transaction = None;
     }
 
     /// Increment the command ID (call at the start of each statement).
+    /// Does nothing if not in a transaction or if transaction has failed.
     pub fn increment_cid(&mut self) {
-        self.current_cid = self.current_cid.next();
+        if let Some(tx) = &mut self.transaction
+            && !tx.failed
+        {
+            tx.cid = tx.cid.next();
+        }
+    }
+}
+
+/// Transaction state for a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionState {
+    /// Transaction ID.
+    pub txid: TxId,
+    /// Command ID within this transaction.
+    pub cid: CommandId,
+    /// Whether the transaction has failed and awaits ROLLBACK.
+    pub failed: bool,
+}
+
+impl TransactionState {
+    /// Get the PostgreSQL wire protocol transaction status.
+    pub fn status(&self) -> TransactionStatus {
+        if self.failed {
+            TransactionStatus::Failed
+        } else {
+            TransactionStatus::InTransaction
+        }
     }
 }
 

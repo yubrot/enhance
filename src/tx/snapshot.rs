@@ -174,6 +174,15 @@ mod tests {
         }
     }
 
+    /// Helper: mark a TupleHeader as deleted by the given transaction.
+    fn deleted_by(header: TupleHeader, xmax: TxId, cmax: CommandId) -> TupleHeader {
+        TupleHeader {
+            xmax,
+            cmax,
+            ..header
+        }
+    }
+
     // Tests for xmin visibility (insertion visibility)
 
     #[test]
@@ -269,20 +278,9 @@ mod tests {
 
         for infomask in [Infomask::empty(), Infomask::empty().with_xmax_aborted()] {
             let infomask = infomask.with_xmin_committed();
-            let h1 = TupleHeader {
-                xmin: tx_insert,
-                xmax: tx_delete1,
-                cmin: CommandId::FIRST,
-                cmax: CommandId::FIRST,
-                infomask,
-            };
-            let h2 = TupleHeader {
-                xmin: tx_insert,
-                xmax: tx_delete2,
-                cmin: CommandId::FIRST,
-                cmax: CommandId::FIRST,
-                infomask,
-            };
+            let base = inserted_by(tx_insert, CommandId::FIRST, infomask);
+            let h1 = deleted_by(base, tx_delete1, CommandId::FIRST);
+            let h2 = deleted_by(base, tx_delete2, CommandId::FIRST);
             assert!(snapshot.is_tuple_visible(&h1, &manager));
             assert!(snapshot.is_tuple_visible(&h2, &manager));
         }
@@ -331,6 +329,7 @@ mod tests {
         // visible=false means tuple is NOT visible (deletion IS visible)
         for infomask in [Infomask::empty(), Infomask::empty().with_xmax_committed()] {
             let infomask = infomask.with_xmin_committed();
+            let base = inserted_by(tx_insert, CommandId::FIRST, infomask);
             for (target_tx, visible) in [
                 (tx0, false), // past: < xmin → deletion visible
                 (tx1, true),  // present: in xip (uncommitted) → deletion not visible
@@ -340,13 +339,7 @@ mod tests {
                 (tx5, true),  // present: in xip (committed after snapshot) → deletion not visible
                 (tx6, true),  // future: >= xmax → deletion not visible
             ] {
-                let header = TupleHeader {
-                    xmin: tx_insert,
-                    xmax: target_tx,
-                    cmin: CommandId::FIRST,
-                    cmax: CommandId::FIRST,
-                    infomask,
-                };
+                let header = deleted_by(base, target_tx, CommandId::FIRST);
                 assert_eq!(snapshot.is_tuple_visible(&header, &manager), visible);
             }
         }
@@ -363,14 +356,7 @@ mod tests {
         let snapshot = manager.snapshot(tx1, CommandId::new(5));
 
         // Tuple inserted at cmin 3 (earlier than current cid 5)
-        let header = TupleHeader {
-            xmin: tx1,
-            xmax: TxId::INVALID,
-            cmin: CommandId::new(3),
-            cmax: CommandId::INVALID,
-            infomask: Infomask::empty(),
-        };
-
+        let header = inserted_by(tx1, CommandId::new(3), Infomask::empty());
         assert!(snapshot.is_tuple_visible(&header, &manager));
     }
 
@@ -382,14 +368,7 @@ mod tests {
         let snapshot = manager.snapshot(tx1, CommandId::new(5));
 
         // Tuple inserted at cmin 5 (same as current) - not yet visible
-        let header = TupleHeader {
-            xmin: tx1,
-            xmax: TxId::INVALID,
-            cmin: CommandId::new(5),
-            cmax: CommandId::INVALID,
-            infomask: Infomask::empty(),
-        };
-
+        let header = inserted_by(tx1, CommandId::new(5), Infomask::empty());
         assert!(!snapshot.is_tuple_visible(&header, &manager));
     }
 
@@ -402,13 +381,8 @@ mod tests {
 
         // Tuple inserted at cmin 3 and deleted at cmax 4 by same transaction
         // Both are earlier than current_cid=5, so insert visible and delete visible
-        let header = TupleHeader {
-            xmin: tx1,
-            xmax: tx1,
-            cmin: CommandId::new(3),
-            cmax: CommandId::new(4),
-            infomask: Infomask::empty(),
-        };
+        let base = inserted_by(tx1, CommandId::new(3), Infomask::empty());
+        let header = deleted_by(base, tx1, CommandId::new(4));
 
         // Insert visible (cmin=3 < current_cid=5), delete also visible (cmax=4 < current_cid=5)
         // -> tuple NOT visible
@@ -423,13 +397,8 @@ mod tests {
         let snapshot = manager.snapshot(tx1, CommandId::new(5));
 
         // Tuple inserted at cmin 3, deleted at cmax 7 (later than current_cid=5)
-        let header = TupleHeader {
-            xmin: tx1,
-            xmax: tx1,
-            cmin: CommandId::new(3),
-            cmax: CommandId::new(7),
-            infomask: Infomask::empty(),
-        };
+        let base = inserted_by(tx1, CommandId::new(3), Infomask::empty());
+        let header = deleted_by(base, tx1, CommandId::new(7));
 
         // Insert visible (cmin=3 < current_cid=5), but delete NOT visible (cmax=7 >= current_cid=5)
         // -> tuple IS visible

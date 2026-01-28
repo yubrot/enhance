@@ -2,7 +2,7 @@ mod error;
 mod state;
 
 pub use error::ConnectionError;
-use state::{ConnectionState, Portal, PreparedStatement, TxState};
+use state::{ConnectionState, Portal, PreparedStatement};
 
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -12,7 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::protocol::{
     BackendMessage, BindMessage, CloseMessage, CloseTarget, DescribeMessage, DescribeTarget,
-    ErrorInfo, ExecuteMessage, FrontendMessage, ParseMessage, PostgresCodec, sql_state,
+    ErrorInfo, ExecuteMessage, FrontendMessage, ParseMessage, PostgresCodec, TransactionStatus,
+    sql_state,
 };
 use crate::sql::{Parser, Statement};
 use crate::tx::TransactionManager;
@@ -152,29 +153,27 @@ impl Connection {
                 // Handle transaction control commands
                 match &stmt {
                     Statement::Begin => {
-                        if self.state.tx_state() == TxState::Idle {
+                        if self.state.transaction().is_none() {
                             let txid = self.tx_manager.begin();
                             self.state.begin_transaction(txid);
                         }
                         // If already in transaction, BEGIN is a no-op (PostgreSQL behavior)
                     }
                     Statement::Commit => {
-                        if let Some(txid) = self.state.current_txid() {
-                            self.tx_manager.commit(txid)?;
+                        if let Some(transaction) = self.state.transaction() {
+                            self.tx_manager.commit(transaction.txid)?;
                         }
                         self.state.end_transaction();
                     }
                     Statement::Rollback => {
-                        if let Some(txid) = self.state.current_txid() {
-                            let _ = self.tx_manager.abort(txid);
+                        if let Some(transaction) = self.state.transaction() {
+                            let _ = self.tx_manager.abort(transaction.txid);
                         }
                         self.state.end_transaction();
                     }
                     _ => {
-                        // For other statements, increment cid if in transaction
-                        if self.state.tx_state() == TxState::InTransaction {
-                            self.state.increment_cid();
-                        }
+                        // For other statements, increment cid if in active transaction
+                        self.state.increment_cid();
                     }
                 }
 
@@ -200,15 +199,7 @@ impl Connection {
             }
         }
 
-        // Always send ReadyForQuery after response with actual transaction status
-        self.framed
-            .send(BackendMessage::ReadyForQuery {
-                status: self.state.tx_state().to_protocol_status(),
-            })
-            .await?;
-
-        self.framed.flush().await?;
-        Ok(())
+        self.send_ready_for_query().await
     }
 
     /// Handle a Parse message - create a prepared statement.
@@ -382,14 +373,7 @@ impl Connection {
         self.state.in_error = false;
         self.state.clear_unnamed();
 
-        self.framed
-            .send(BackendMessage::ReadyForQuery {
-                status: self.state.tx_state().to_protocol_status(),
-            })
-            .await?;
-
-        self.framed.flush().await?;
-        Ok(())
+        self.send_ready_for_query().await
     }
 
     /// Send an error response and mark the connection as in-error state.
@@ -403,6 +387,21 @@ impl Connection {
     ) -> Result<(), ConnectionError> {
         self.framed.send(error.into()).await?;
         self.state.in_error = into_error_state;
+        Ok(())
+    }
+
+    /// Send ReadyForQuery and flush the connection.
+    ///
+    /// This is the common termination sequence for both Simple Query Protocol
+    /// (after Query message) and Extended Query Protocol (after Sync message).
+    async fn send_ready_for_query(&mut self) -> Result<(), ConnectionError> {
+        let status = match self.state.transaction() {
+            Some(tx) => tx.status(),
+            None => TransactionStatus::Idle,
+        };
+        let message = BackendMessage::ReadyForQuery { status };
+        self.framed.send(message).await?;
+        self.framed.flush().await?;
         Ok(())
     }
 }
