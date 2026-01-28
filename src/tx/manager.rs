@@ -130,6 +130,7 @@ impl TransactionManager {
             .lock()
             .get(&txid)
             .copied()
+            // TODO: Corrupted tuple headers from disk could trigger this, should be fixed
             .expect("TxId not found in tx_states - this is a bug")
     }
 

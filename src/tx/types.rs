@@ -60,6 +60,7 @@ impl CommandId {
 
     /// Get the next command ID.
     pub const fn next(&self) -> Self {
+        // TODO: Limit CommandId (potential overflow)
         Self(self.0 + 1)
     }
 }
