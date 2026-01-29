@@ -3,6 +3,7 @@
 use std::fmt;
 
 use crate::catalog::CatalogError;
+use crate::heap::HeapError;
 use crate::storage::BufferPoolError;
 
 /// Errors that can occur during query execution.
@@ -20,10 +21,16 @@ pub enum ExecutorError {
     InvalidOperation { message: String },
     /// Unsupported feature.
     Unsupported { feature: String },
+    /// Column count mismatch in INSERT statement.
+    ColumnCountMismatch { expected: usize, found: usize },
+    /// Page is full and cannot accept more tuples.
+    PageFull { required: usize, available: usize },
     /// Catalog error.
     Catalog(CatalogError),
     /// Buffer pool error.
     BufferPool(BufferPoolError),
+    /// Heap error.
+    Heap(HeapError),
 }
 
 impl fmt::Display for ExecutorError {
@@ -47,8 +54,23 @@ impl fmt::Display for ExecutorError {
             ExecutorError::Unsupported { feature } => {
                 write!(f, "unsupported feature: {}", feature)
             }
+            ExecutorError::ColumnCountMismatch { expected, found } => {
+                write!(
+                    f,
+                    "INSERT has more expressions than target columns ({} > {})",
+                    found, expected
+                )
+            }
+            ExecutorError::PageFull { required, available } => {
+                write!(
+                    f,
+                    "page full: need {} bytes but only {} available",
+                    required, available
+                )
+            }
             ExecutorError::Catalog(e) => write!(f, "catalog error: {}", e),
             ExecutorError::BufferPool(e) => write!(f, "buffer pool error: {}", e),
+            ExecutorError::Heap(e) => write!(f, "heap error: {}", e),
         }
     }
 }
@@ -58,6 +80,7 @@ impl std::error::Error for ExecutorError {
         match self {
             ExecutorError::Catalog(e) => Some(e),
             ExecutorError::BufferPool(e) => Some(e),
+            ExecutorError::Heap(e) => Some(e),
             _ => None,
         }
     }
@@ -72,6 +95,17 @@ impl From<CatalogError> for ExecutorError {
 impl From<BufferPoolError> for ExecutorError {
     fn from(e: BufferPoolError) -> Self {
         ExecutorError::BufferPool(e)
+    }
+}
+
+impl From<HeapError> for ExecutorError {
+    fn from(e: HeapError) -> Self {
+        match e {
+            HeapError::PageFull { required, available } => {
+                ExecutorError::PageFull { required, available }
+            }
+            _ => ExecutorError::Heap(e),
+        }
     }
 }
 

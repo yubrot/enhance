@@ -178,6 +178,8 @@ pub struct InsertStmt {
     pub columns: Vec<String>,
     /// VALUES to insert.
     pub values: Vec<Vec<Expr>>,
+    /// RETURNING clause.
+    pub returning: Option<Vec<SelectItem>>,
 }
 
 /// UPDATE statement.
@@ -189,6 +191,8 @@ pub struct UpdateStmt {
     pub assignments: Vec<Assignment>,
     /// WHERE clause.
     pub where_clause: Option<Expr>,
+    /// RETURNING clause.
+    pub returning: Option<Vec<SelectItem>>,
 }
 
 /// SET assignment (column = value).
@@ -207,6 +211,8 @@ pub struct DeleteStmt {
     pub table: String,
     /// WHERE clause.
     pub where_clause: Option<Expr>,
+    /// RETURNING clause.
+    pub returning: Option<Vec<SelectItem>>,
 }
 
 /// CREATE TABLE statement.

@@ -11,14 +11,16 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::Database;
-use crate::executor::plan_select;
+use crate::executor::{
+    execute_delete, execute_insert, execute_update, plan_select, OutputColumn,
+};
 use crate::heap::Value;
 use crate::protocol::{
     BackendMessage, BindMessage, CloseMessage, CloseTarget, DataValue, DescribeMessage,
     DescribeTarget, ErrorInfo, ExecuteMessage, FieldDescription, FormatCode, FrontendMessage,
     ParseMessage, PostgresCodec, TransactionStatus, sql_state,
 };
-use crate::sql::{Parser, Statement};
+use crate::sql::{DeleteStmt, InsertStmt, Parser, Statement, UpdateStmt};
 use crate::storage::{Replacer, Storage};
 use crate::tx::CommandId;
 
@@ -210,12 +212,11 @@ impl<S: Storage + 'static, R: Replacer + 'static> Connection<S, R> {
     /// Returns the number of rows affected or returned.
     async fn execute_statement(&mut self, stmt: &Statement) -> Result<u64, ConnectionError> {
         match stmt {
-            Statement::Select(select_stmt) => {
-                self.execute_select(select_stmt).await
-            }
-            Statement::Explain(inner_stmt) => {
-                self.execute_explain(inner_stmt).await
-            }
+            Statement::Select(select_stmt) => self.execute_select(select_stmt).await,
+            Statement::Insert(insert_stmt) => self.execute_insert(insert_stmt).await,
+            Statement::Update(update_stmt) => self.execute_update(update_stmt).await,
+            Statement::Delete(delete_stmt) => self.execute_delete(delete_stmt).await,
+            Statement::Explain(inner_stmt) => self.execute_explain(inner_stmt).await,
             Statement::CreateTable(create_stmt) => {
                 // Get or create transaction for DDL
                 let (txid, cid) = self.get_or_create_transaction();
@@ -369,6 +370,130 @@ impl<S: Storage + 'static, R: Replacer + 'static> Connection<S, R> {
         }
 
         Ok(row_count)
+    }
+
+    /// Execute an INSERT statement.
+    async fn execute_insert(&mut self, stmt: &InsertStmt) -> Result<u64, ConnectionError> {
+        let (txid, cid) = self.get_or_create_transaction();
+        let snapshot = self.database.tx_manager().snapshot(txid, cid);
+
+        let result = execute_insert(
+            stmt,
+            txid,
+            cid,
+            self.database.catalog(),
+            self.database.pool().clone(),
+            &snapshot,
+        )
+        .await
+        .map_err(ConnectionError::Executor)?;
+
+        // Send RETURNING rows if any
+        if !result.returning_tuples.is_empty() {
+            self.send_returning_rows(&result.returning_tuples, &result.returning_schema)
+                .await?;
+        }
+
+        // If not in explicit transaction, commit
+        if self.state.transaction().is_none() {
+            self.database.tx_manager().commit(txid)?;
+        }
+
+        Ok(result.row_count)
+    }
+
+    /// Execute an UPDATE statement.
+    async fn execute_update(&mut self, stmt: &UpdateStmt) -> Result<u64, ConnectionError> {
+        let (txid, cid) = self.get_or_create_transaction();
+        let snapshot = self.database.tx_manager().snapshot(txid, cid);
+
+        let result = execute_update(
+            stmt,
+            txid,
+            cid,
+            self.database.catalog(),
+            self.database.pool().clone(),
+            &snapshot,
+            self.database.tx_manager(),
+        )
+        .await
+        .map_err(ConnectionError::Executor)?;
+
+        // Send RETURNING rows if any
+        if !result.returning_tuples.is_empty() {
+            self.send_returning_rows(&result.returning_tuples, &result.returning_schema)
+                .await?;
+        }
+
+        // If not in explicit transaction, commit
+        if self.state.transaction().is_none() {
+            self.database.tx_manager().commit(txid)?;
+        }
+
+        Ok(result.row_count)
+    }
+
+    /// Execute a DELETE statement.
+    async fn execute_delete(&mut self, stmt: &DeleteStmt) -> Result<u64, ConnectionError> {
+        let (txid, cid) = self.get_or_create_transaction();
+        let snapshot = self.database.tx_manager().snapshot(txid, cid);
+
+        let result = execute_delete(
+            stmt,
+            txid,
+            cid,
+            self.database.catalog(),
+            self.database.pool().clone(),
+            &snapshot,
+            self.database.tx_manager(),
+        )
+        .await
+        .map_err(ConnectionError::Executor)?;
+
+        // Send RETURNING rows if any
+        if !result.returning_tuples.is_empty() {
+            self.send_returning_rows(&result.returning_tuples, &result.returning_schema)
+                .await?;
+        }
+
+        // If not in explicit transaction, commit
+        if self.state.transaction().is_none() {
+            self.database.tx_manager().commit(txid)?;
+        }
+
+        Ok(result.row_count)
+    }
+
+    /// Send RETURNING rows as DataRow messages.
+    async fn send_returning_rows(
+        &mut self,
+        tuples: &[Vec<Value>],
+        schema: &[OutputColumn],
+    ) -> Result<(), ConnectionError> {
+        // Send RowDescription
+        let fields: Vec<FieldDescription> = schema
+            .iter()
+            .map(|col| FieldDescription {
+                name: col.name.clone(),
+                table_oid: 0,
+                column_id: 0,
+                type_oid: col.type_oid,
+                type_size: type_size(col.type_oid),
+                type_modifier: -1,
+                format_code: FormatCode::Text,
+            })
+            .collect();
+        self.framed
+            .send(BackendMessage::RowDescription { fields })
+            .await?;
+
+        // Send each row
+        for tuple in tuples {
+            let values: Vec<DataValue> = tuple.iter().map(value_to_data_value).collect();
+            self.framed.send(BackendMessage::DataRow { values }).await?;
+        }
+
+        Ok(())
     }
 
     /// Get the current transaction or create a new one for auto-commit mode.

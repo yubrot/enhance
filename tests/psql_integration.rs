@@ -129,8 +129,14 @@ async fn test_psql_create_table() {
 async fn test_psql_insert_update_delete() {
     let server = PsqlTestServer::start().await;
 
-    let result = server
-        .run_psql("INSERT INTO test VALUES (1); UPDATE test SET id = 2; DELETE FROM test;\\q");
+    // Create table, insert, update, delete with RETURNING
+    let result = server.run_psql(
+        "CREATE TABLE dml_test (id SERIAL, name TEXT, age INTEGER); \
+         INSERT INTO dml_test (name, age) VALUES ('Alice', 30) RETURNING id, name; \
+         UPDATE dml_test SET age = 31 WHERE name = 'Alice' RETURNING *; \
+         DELETE FROM dml_test WHERE id = 1 RETURNING name; \
+         \\q",
+    );
     result.assert_success();
 }
 

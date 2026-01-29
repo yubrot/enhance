@@ -75,6 +75,7 @@ pub enum TokenKind {
     Set,
     From,
     Where,
+    Returning,
 
     // SELECT clause keywords
     As,
@@ -235,6 +236,7 @@ impl TokenKind {
             TokenKind::Set => "SET".to_string(),
             TokenKind::From => "FROM".to_string(),
             TokenKind::Where => "WHERE".to_string(),
+            TokenKind::Returning => "RETURNING".to_string(),
             TokenKind::As => "AS".to_string(),
             TokenKind::Distinct => "DISTINCT".to_string(),
             TokenKind::All => "ALL".to_string(),
@@ -351,6 +353,7 @@ impl TokenKind {
             "SET" => TokenKind::Set,
             "FROM" => TokenKind::From,
             "WHERE" => TokenKind::Where,
+            "RETURNING" => TokenKind::Returning,
             "AS" => TokenKind::As,
             "DISTINCT" => TokenKind::Distinct,
             "ALL" => TokenKind::All,

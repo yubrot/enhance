@@ -560,6 +560,216 @@ pub fn is_truthy(val: &Value) -> bool {
     matches!(val, Value::Boolean(true))
 }
 
+/// Coerces a value to a target type for DML operations.
+///
+/// This implements implicit type conversion for INSERT/UPDATE assignments.
+/// The coercion rules follow PostgreSQL semantics:
+///
+/// - NULL → any type (stays NULL)
+/// - Smaller integers → larger integers (Int16 → Int32 → Int64)
+/// - Integers → floats (Int* → Float64)
+/// - Float32 → Float64
+/// - Any type → Text (via to_string)
+/// - Text → integers (parse)
+/// - Boolean → Text ("true"/"false")
+///
+/// # Errors
+///
+/// Returns `TypeMismatch` if the conversion is not possible.
+pub fn coerce_to_type(value: Value, target_type_oid: i32) -> Result<Value, ExecutorError> {
+    use crate::protocol::type_oid;
+
+    // NULL coerces to any type
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+
+    match target_type_oid {
+        type_oid::BOOL => coerce_to_bool(value),
+        type_oid::INT2 => coerce_to_int16(value),
+        type_oid::INT4 => coerce_to_int32(value),
+        type_oid::INT8 => coerce_to_int64(value),
+        type_oid::FLOAT4 => coerce_to_float32(value),
+        type_oid::FLOAT8 => coerce_to_float64(value),
+        type_oid::TEXT | type_oid::VARCHAR => coerce_to_text(value),
+        type_oid::BYTEA => coerce_to_bytea(value),
+        _ => Err(ExecutorError::Unsupported {
+            feature: format!("coercion to type OID {}", target_type_oid),
+        }),
+    }
+}
+
+fn coerce_to_bool(value: Value) -> Result<Value, ExecutorError> {
+    match value {
+        Value::Boolean(b) => Ok(Value::Boolean(b)),
+        Value::Text(s) => match s.to_lowercase().as_str() {
+            "true" | "t" | "yes" | "y" | "on" | "1" => Ok(Value::Boolean(true)),
+            "false" | "f" | "no" | "n" | "off" | "0" => Ok(Value::Boolean(false)),
+            _ => Err(ExecutorError::InvalidOperation {
+                message: format!("cannot coerce '{}' to BOOLEAN", s),
+            }),
+        },
+        _ => Err(ExecutorError::TypeMismatch {
+            expected: "BOOLEAN".to_string(),
+            found: type_name(&value),
+        }),
+    }
+}
+
+fn coerce_to_int16(value: Value) -> Result<Value, ExecutorError> {
+    match value {
+        Value::Int16(n) => Ok(Value::Int16(n)),
+        Value::Int32(n) => {
+            if n >= i16::MIN as i32 && n <= i16::MAX as i32 {
+                Ok(Value::Int16(n as i16))
+            } else {
+                Err(ExecutorError::InvalidOperation {
+                    message: format!("integer {} out of range for SMALLINT", n),
+                })
+            }
+        }
+        Value::Int64(n) => {
+            if n >= i16::MIN as i64 && n <= i16::MAX as i64 {
+                Ok(Value::Int16(n as i16))
+            } else {
+                Err(ExecutorError::InvalidOperation {
+                    message: format!("integer {} out of range for SMALLINT", n),
+                })
+            }
+        }
+        Value::Text(s) => s
+            .trim()
+            .parse::<i16>()
+            .map(Value::Int16)
+            .map_err(|_| ExecutorError::InvalidOperation {
+                message: format!("cannot coerce '{}' to SMALLINT", s),
+            }),
+        _ => Err(ExecutorError::TypeMismatch {
+            expected: "SMALLINT".to_string(),
+            found: type_name(&value),
+        }),
+    }
+}
+
+fn coerce_to_int32(value: Value) -> Result<Value, ExecutorError> {
+    match value {
+        Value::Int16(n) => Ok(Value::Int32(n as i32)),
+        Value::Int32(n) => Ok(Value::Int32(n)),
+        Value::Int64(n) => {
+            if n >= i32::MIN as i64 && n <= i32::MAX as i64 {
+                Ok(Value::Int32(n as i32))
+            } else {
+                Err(ExecutorError::InvalidOperation {
+                    message: format!("integer {} out of range for INTEGER", n),
+                })
+            }
+        }
+        Value::Text(s) => s
+            .trim()
+            .parse::<i32>()
+            .map(Value::Int32)
+            .map_err(|_| ExecutorError::InvalidOperation {
+                message: format!("cannot coerce '{}' to INTEGER", s),
+            }),
+        _ => Err(ExecutorError::TypeMismatch {
+            expected: "INTEGER".to_string(),
+            found: type_name(&value),
+        }),
+    }
+}
+
+fn coerce_to_int64(value: Value) -> Result<Value, ExecutorError> {
+    match value {
+        Value::Int16(n) => Ok(Value::Int64(n as i64)),
+        Value::Int32(n) => Ok(Value::Int64(n as i64)),
+        Value::Int64(n) => Ok(Value::Int64(n)),
+        Value::Text(s) => s
+            .trim()
+            .parse::<i64>()
+            .map(Value::Int64)
+            .map_err(|_| ExecutorError::InvalidOperation {
+                message: format!("cannot coerce '{}' to BIGINT", s),
+            }),
+        _ => Err(ExecutorError::TypeMismatch {
+            expected: "BIGINT".to_string(),
+            found: type_name(&value),
+        }),
+    }
+}
+
+fn coerce_to_float32(value: Value) -> Result<Value, ExecutorError> {
+    match value {
+        Value::Int16(n) => Ok(Value::Float32(n as f32)),
+        Value::Int32(n) => Ok(Value::Float32(n as f32)),
+        Value::Int64(n) => Ok(Value::Float32(n as f32)),
+        Value::Float32(n) => Ok(Value::Float32(n)),
+        Value::Float64(n) => Ok(Value::Float32(n as f32)),
+        Value::Text(s) => s
+            .trim()
+            .parse::<f32>()
+            .map(Value::Float32)
+            .map_err(|_| ExecutorError::InvalidOperation {
+                message: format!("cannot coerce '{}' to REAL", s),
+            }),
+        _ => Err(ExecutorError::TypeMismatch {
+            expected: "REAL".to_string(),
+            found: type_name(&value),
+        }),
+    }
+}
+
+fn coerce_to_float64(value: Value) -> Result<Value, ExecutorError> {
+    match value {
+        Value::Int16(n) => Ok(Value::Float64(n as f64)),
+        Value::Int32(n) => Ok(Value::Float64(n as f64)),
+        Value::Int64(n) => Ok(Value::Float64(n as f64)),
+        Value::Float32(n) => Ok(Value::Float64(n as f64)),
+        Value::Float64(n) => Ok(Value::Float64(n)),
+        Value::Text(s) => s
+            .trim()
+            .parse::<f64>()
+            .map(Value::Float64)
+            .map_err(|_| ExecutorError::InvalidOperation {
+                message: format!("cannot coerce '{}' to DOUBLE PRECISION", s),
+            }),
+        _ => Err(ExecutorError::TypeMismatch {
+            expected: "DOUBLE PRECISION".to_string(),
+            found: type_name(&value),
+        }),
+    }
+}
+
+fn coerce_to_text(value: Value) -> Result<Value, ExecutorError> {
+    match value {
+        Value::Text(s) => Ok(Value::Text(s)),
+        Value::Boolean(b) => Ok(Value::Text(if b { "true" } else { "false" }.to_string())),
+        Value::Int16(n) => Ok(Value::Text(n.to_string())),
+        Value::Int32(n) => Ok(Value::Text(n.to_string())),
+        Value::Int64(n) => Ok(Value::Text(n.to_string())),
+        Value::Float32(n) => Ok(Value::Text(n.to_string())),
+        Value::Float64(n) => Ok(Value::Text(n.to_string())),
+        Value::Null => Ok(Value::Null),
+        Value::Bytea(_) => Err(ExecutorError::TypeMismatch {
+            expected: "TEXT".to_string(),
+            found: "BYTEA".to_string(),
+        }),
+    }
+}
+
+fn coerce_to_bytea(value: Value) -> Result<Value, ExecutorError> {
+    match value {
+        Value::Bytea(b) => Ok(Value::Bytea(b)),
+        Value::Text(s) => {
+            // Simple conversion: treat text as raw bytes
+            Ok(Value::Bytea(s.into_bytes()))
+        }
+        _ => Err(ExecutorError::TypeMismatch {
+            expected: "BYTEA".to_string(),
+            found: type_name(&value),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1039,5 +1249,115 @@ mod tests {
             evaluate(&expr, &tuple, &columns).unwrap(),
             Value::Boolean(true)
         );
+    }
+
+    #[test]
+    fn test_coerce_null() {
+        use crate::protocol::type_oid;
+
+        // NULL coerces to any type
+        assert_eq!(
+            coerce_to_type(Value::Null, type_oid::INT4).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            coerce_to_type(Value::Null, type_oid::TEXT).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_coerce_int_widening() {
+        use crate::protocol::type_oid;
+
+        // Int16 -> Int32
+        assert_eq!(
+            coerce_to_type(Value::Int16(42), type_oid::INT4).unwrap(),
+            Value::Int32(42)
+        );
+
+        // Int32 -> Int64
+        assert_eq!(
+            coerce_to_type(Value::Int32(42), type_oid::INT8).unwrap(),
+            Value::Int64(42)
+        );
+
+        // Int16 -> Int64
+        assert_eq!(
+            coerce_to_type(Value::Int16(42), type_oid::INT8).unwrap(),
+            Value::Int64(42)
+        );
+    }
+
+    #[test]
+    fn test_coerce_int_to_float() {
+        use crate::protocol::type_oid;
+
+        assert_eq!(
+            coerce_to_type(Value::Int32(42), type_oid::FLOAT8).unwrap(),
+            Value::Float64(42.0)
+        );
+
+        assert_eq!(
+            coerce_to_type(Value::Int64(100), type_oid::FLOAT4).unwrap(),
+            Value::Float32(100.0)
+        );
+    }
+
+    #[test]
+    fn test_coerce_to_text() {
+        use crate::protocol::type_oid;
+
+        assert_eq!(
+            coerce_to_type(Value::Int32(42), type_oid::TEXT).unwrap(),
+            Value::Text("42".to_string())
+        );
+
+        assert_eq!(
+            coerce_to_type(Value::Boolean(true), type_oid::TEXT).unwrap(),
+            Value::Text("true".to_string())
+        );
+    }
+
+    #[test]
+    fn test_coerce_text_to_int() {
+        use crate::protocol::type_oid;
+
+        assert_eq!(
+            coerce_to_type(Value::Text("123".to_string()), type_oid::INT4).unwrap(),
+            Value::Int32(123)
+        );
+
+        // Invalid text should fail
+        assert!(coerce_to_type(Value::Text("abc".to_string()), type_oid::INT4).is_err());
+    }
+
+    #[test]
+    fn test_coerce_text_to_bool() {
+        use crate::protocol::type_oid;
+
+        assert_eq!(
+            coerce_to_type(Value::Text("true".to_string()), type_oid::BOOL).unwrap(),
+            Value::Boolean(true)
+        );
+
+        assert_eq!(
+            coerce_to_type(Value::Text("f".to_string()), type_oid::BOOL).unwrap(),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn test_coerce_int_narrowing() {
+        use crate::protocol::type_oid;
+
+        // Int32 -> Int16 (in range)
+        assert_eq!(
+            coerce_to_type(Value::Int32(100), type_oid::INT2).unwrap(),
+            Value::Int16(100)
+        );
+
+        // Int32 -> Int16 (out of range)
+        assert!(coerce_to_type(Value::Int32(100000), type_oid::INT2).is_err());
     }
 }

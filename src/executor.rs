@@ -12,6 +12,7 @@
 //! - **Planner** ([`planner`]): Converts SQL AST to execution plan
 //! - **Expression evaluation** ([`value`]): Evaluates SQL expressions with NULL handling
 //! - **Execution context** ([`context`]): Provides access to MVCC, catalog, and storage
+//! - **DML operations** ([`dml`]): INSERT, UPDATE, DELETE with MVCC support
 //!
 //! # Example
 //!
@@ -35,16 +36,19 @@
 //! - No optimization (rule-based planner in Step 17)
 //! - No aggregation (Step 12)
 //! - No joins (Step 19)
-//! - No DML execution (Step 11)
 
 mod context;
+mod dml;
 mod error;
 mod plan;
 mod planner;
 mod value;
 
 pub use context::ExecutionContext;
+pub use dml::{
+    execute_delete, execute_insert, execute_update, DeleteResult, InsertResult, UpdateResult,
+};
 pub use error::ExecutorError;
 pub use plan::{Executor, Filter, OutputColumn, Projection, SeqScan, Tuple};
 pub use planner::plan_select;
-pub use value::{evaluate, is_truthy};
+pub use value::{coerce_to_type, evaluate, is_truthy};

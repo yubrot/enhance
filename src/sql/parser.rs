@@ -565,10 +565,17 @@ impl<'a> Parser<'a> {
             p.parse_parenthesized(|p| p.parse_comma_separated(Self::parse_expr))
         })?;
 
+        // Optional RETURNING clause
+        let returning = match_tokens!(self, {
+            [Returning]! => Some(self.parse_comma_separated(Self::parse_select_item)?),
+            _ => None
+        });
+
         Ok(Statement::Insert(Box::new(InsertStmt {
             table,
             columns,
             values,
+            returning,
         })))
     }
 
@@ -587,10 +594,17 @@ impl<'a> Parser<'a> {
 
         let where_clause = match_tokens!(self, { [Where]! => Some(self.parse_expr()?), _ => None });
 
+        // Optional RETURNING clause
+        let returning = match_tokens!(self, {
+            [Returning]! => Some(self.parse_comma_separated(Self::parse_select_item)?),
+            _ => None
+        });
+
         Ok(Statement::Update(Box::new(UpdateStmt {
             table,
             assignments,
             where_clause,
+            returning,
         })))
     }
 
@@ -601,9 +615,16 @@ impl<'a> Parser<'a> {
 
         let where_clause = match_tokens!(self, { [Where]! => Some(self.parse_expr()?), _ => None });
 
+        // Optional RETURNING clause
+        let returning = match_tokens!(self, {
+            [Returning]! => Some(self.parse_comma_separated(Self::parse_select_item)?),
+            _ => None
+        });
+
         Ok(Statement::Delete(Box::new(DeleteStmt {
             table,
             where_clause,
+            returning,
         })))
     }
 
@@ -1292,6 +1313,54 @@ mod tests {
         };
         assert_eq!(d.table, "users");
         assert!(d.where_clause.is_some());
+        assert!(d.returning.is_none());
+    }
+
+    #[test]
+    fn test_insert_returning() {
+        let Statement::Insert(i) =
+            parse("INSERT INTO users (name) VALUES ('Alice') RETURNING id, name").unwrap()
+        else {
+            panic!("expected INSERT");
+        };
+        assert_eq!(i.table, "users");
+        let returning = i.returning.expect("expected RETURNING clause");
+        assert_eq!(returning.len(), 2);
+    }
+
+    #[test]
+    fn test_insert_returning_wildcard() {
+        let Statement::Insert(i) =
+            parse("INSERT INTO users (name) VALUES ('Alice') RETURNING *").unwrap()
+        else {
+            panic!("expected INSERT");
+        };
+        let returning = i.returning.expect("expected RETURNING clause");
+        assert_eq!(returning.len(), 1);
+        assert!(matches!(returning[0], SelectItem::Wildcard));
+    }
+
+    #[test]
+    fn test_update_returning() {
+        let Statement::Update(u) =
+            parse("UPDATE users SET name = 'Bob' WHERE id = 1 RETURNING id, name AS new_name")
+                .unwrap()
+        else {
+            panic!("expected UPDATE");
+        };
+        let returning = u.returning.expect("expected RETURNING clause");
+        assert_eq!(returning.len(), 2);
+    }
+
+    #[test]
+    fn test_delete_returning() {
+        let Statement::Delete(d) = parse("DELETE FROM users WHERE id = 1 RETURNING *").unwrap()
+        else {
+            panic!("expected DELETE");
+        };
+        let returning = d.returning.expect("expected RETURNING clause");
+        assert_eq!(returning.len(), 1);
+        assert!(matches!(returning[0], SelectItem::Wildcard));
     }
 
     #[test]
