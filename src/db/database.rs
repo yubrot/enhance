@@ -128,7 +128,7 @@ impl<S: Storage, R: Replacer> Database<S, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::table_id;
+    use crate::catalog::LAST_RESERVED_TABLE_ID;
     use crate::sql::{ColumnDef, CreateTableStmt, DataType};
     use crate::storage::MemoryStorage;
     use crate::tx::CommandId;
@@ -140,7 +140,7 @@ mod tests {
 
         // Verify catalog is initialized
         let sb = db.catalog().superblock();
-        assert_eq!(sb.next_table_id, table_id::FIRST_USER_TABLE);
+        assert_eq!(sb.next_table_id, LAST_RESERVED_TABLE_ID + 1);
     }
 
     #[tokio::test]
@@ -171,7 +171,7 @@ mod tests {
         };
 
         let table_id = db.catalog().create_table(txid, cid, &stmt).await.unwrap();
-        assert_eq!(table_id, table_id::FIRST_USER_TABLE);
+        assert_eq!(table_id, LAST_RESERVED_TABLE_ID + 1);
 
         db.tx_manager().commit(txid).unwrap();
 
@@ -185,7 +185,7 @@ mod tests {
             .await
             .unwrap();
         assert!(table.is_some());
-        assert_eq!(table.unwrap().table_id, table_id::FIRST_USER_TABLE);
+        assert_eq!(table.unwrap().table_id, LAST_RESERVED_TABLE_ID + 1);
 
         db.tx_manager().commit(txid2).unwrap();
     }

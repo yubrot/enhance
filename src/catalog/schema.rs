@@ -1,111 +1,239 @@
-//! Hardcoded catalog table schemas and type mappings.
+//! System catalog schema definitions.
 //!
-//! This module defines the schema for system catalog tables and provides
-//! mappings between SQL data types and PostgreSQL type OIDs.
+//! This module defines the schema for system catalog tables (sys_tables,
+//! sys_columns, sys_sequences) including their table IDs, column layouts,
+//! and conversion logic between heap records and typed structs.
 
+use crate::heap::{Record, Value};
 use crate::protocol::type_oid;
-use crate::sql::DataType;
+use crate::storage::PageId;
 
-/// Reserved table IDs for system catalog tables.
-pub mod table_id {
-    /// sys_tables table ID.
-    pub const SYS_TABLES: u32 = 1;
-    /// sys_columns table ID.
-    pub const SYS_COLUMNS: u32 = 2;
-    /// sys_sequences table ID.
-    pub const SYS_SEQUENCES: u32 = 3;
-    /// First available ID for user tables.
-    pub const FIRST_USER_TABLE: u32 = 100;
+/// Last table ID reserved for system catalog tables.
+/// User tables start from `LAST_RESERVED_TABLE_ID + 1`.
+pub const LAST_RESERVED_TABLE_ID: u32 = 99;
+
+/// Metadata for a table stored in the catalog (sys_tables row).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableInfo {
+    /// Unique table identifier.
+    pub table_id: u32,
+    /// Table name.
+    pub table_name: String,
+    /// Page ID of the first heap page for this table.
+    pub first_page: PageId,
 }
 
-/// Schema for sys_tables catalog table.
-///
-/// Columns:
-/// - table_id: INT4 (primary key)
-/// - table_name: TEXT (unique)
-/// - first_page: INT8 (PageId of first heap page)
-pub const SYS_TABLES_SCHEMA: [i32; 3] = [type_oid::INT4, type_oid::TEXT, type_oid::INT8];
+impl TableInfo {
+    /// Table ID for sys_tables itself.
+    pub const TABLE_ID: u32 = 1;
 
-/// Column indices for sys_tables.
-pub mod sys_tables {
-    /// table_id column index.
-    pub const TABLE_ID: usize = 0;
-    /// table_name column index.
-    pub const TABLE_NAME: usize = 1;
-    /// first_page column index.
-    pub const FIRST_PAGE: usize = 2;
-}
+    /// Schema for sys_tables catalog table (type OIDs for deserialization).
+    pub const SCHEMA: [i32; 3] = [type_oid::INT4, type_oid::TEXT, type_oid::INT8];
 
-/// Schema for sys_columns catalog table.
-///
-/// Columns:
-/// - table_id: INT4 (FK to sys_tables)
-/// - column_num: INT4 (0-based position)
-/// - column_name: TEXT
-/// - type_oid: INT4 (intentionally using PostgreSQL's type OID values)
-/// - seq_id: INT4 (FK to sys_sequences, or 0 if not SERIAL)
-pub const SYS_COLUMNS_SCHEMA: [i32; 5] = [
-    type_oid::INT4,
-    type_oid::INT4,
-    type_oid::TEXT,
-    type_oid::INT4,
-    type_oid::INT4,
-];
+    // Column indices
+    const COL_TABLE_ID: usize = 0;
+    const COL_TABLE_NAME: usize = 1;
+    const COL_FIRST_PAGE: usize = 2;
 
-/// Column indices for sys_columns.
-pub mod sys_columns {
-    /// table_id column index.
-    pub const TABLE_ID: usize = 0;
-    /// column_num column index.
-    pub const COLUMN_NUM: usize = 1;
-    /// column_name column index.
-    pub const COLUMN_NAME: usize = 2;
-    /// type_oid column index.
-    pub const TYPE_OID: usize = 3;
-    /// seq_id column index (0 = not a SERIAL column).
-    pub const SEQ_ID: usize = 4;
-}
+    /// Creates a new TableInfo.
+    pub fn new(table_id: u32, table_name: String, first_page: PageId) -> Self {
+        Self {
+            table_id,
+            table_name,
+            first_page,
+        }
+    }
 
-/// Schema for sys_sequences catalog table.
-///
-/// Columns:
-/// - seq_id: INT4 (primary key)
-/// - seq_name: TEXT
-/// - next_val: INT8
-pub const SYS_SEQUENCES_SCHEMA: [i32; 3] = [type_oid::INT4, type_oid::TEXT, type_oid::INT8];
+    /// Converts a record from sys_tables into TableInfo.
+    ///
+    /// Returns `None` if the record has invalid or unexpected value types.
+    pub fn from_record(record: &Record) -> Option<Self> {
+        let table_id = match record.values.get(Self::COL_TABLE_ID)? {
+            Value::Int32(id) => *id as u32,
+            _ => return None,
+        };
+        let table_name = match record.values.get(Self::COL_TABLE_NAME)? {
+            Value::Text(s) => s.clone(),
+            _ => return None,
+        };
+        let first_page = match record.values.get(Self::COL_FIRST_PAGE)? {
+            Value::Int64(p) => PageId::new(*p as u64),
+            _ => return None,
+        };
+        Some(Self::new(table_id, table_name, first_page))
+    }
 
-/// Column indices for sys_sequences.
-pub mod sys_sequences {
-    /// seq_id column index.
-    pub const SEQ_ID: usize = 0;
-    /// seq_name column index.
-    pub const SEQ_NAME: usize = 1;
-    /// next_val column index.
-    pub const NEXT_VAL: usize = 2;
-}
-
-/// Converts a SQL `DataType` to a type OID (using PostgreSQL's OID values for psql compatibility).
-///
-/// SERIAL columns are stored as INT4 with a linked sequence.
-pub fn data_type_to_oid(data_type: &DataType) -> i32 {
-    match data_type {
-        DataType::Boolean => type_oid::BOOL,
-        DataType::Smallint => type_oid::INT2,
-        DataType::Integer => type_oid::INT4,
-        DataType::Bigint => type_oid::INT8,
-        DataType::Real => type_oid::FLOAT4,
-        DataType::DoublePrecision => type_oid::FLOAT8,
-        DataType::Text => type_oid::TEXT,
-        DataType::Varchar(_) => type_oid::VARCHAR,
-        DataType::Bytea => type_oid::BYTEA,
-        // SERIAL is stored as INT4 internally; sequence handles auto-increment
-        DataType::Serial => type_oid::INT4,
+    /// Converts this TableInfo into a record for sys_tables.
+    pub fn to_record(&self) -> Record {
+        Record::new(vec![
+            Value::Int32(self.table_id as i32),
+            Value::Text(self.table_name.clone()),
+            Value::Int64(self.first_page.page_num() as i64),
+        ])
     }
 }
 
-/// Returns true if the data type is SERIAL (auto-increment).
-pub fn is_serial(data_type: &DataType) -> bool {
-    matches!(data_type, DataType::Serial)
+/// Metadata for a column stored in the catalog (sys_columns row).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnInfo {
+    /// Table this column belongs to.
+    pub table_id: u32,
+    /// 0-based column position.
+    pub column_num: u32,
+    /// Column name.
+    pub column_name: String,
+    /// Type OID (using PostgreSQL's OID values for psql compatibility).
+    pub type_oid: i32,
+    /// Linked sequence ID for SERIAL columns (0 if not SERIAL).
+    pub seq_id: u32,
+}
+
+impl ColumnInfo {
+    /// Table ID for sys_columns.
+    pub const TABLE_ID: u32 = 2;
+
+    /// Schema for sys_columns catalog table (type OIDs for deserialization).
+    pub const SCHEMA: [i32; 5] = [
+        type_oid::INT4,
+        type_oid::INT4,
+        type_oid::TEXT,
+        type_oid::INT4,
+        type_oid::INT4,
+    ];
+
+    // Column indices
+    const COL_TABLE_ID: usize = 0;
+    const COL_COLUMN_NUM: usize = 1;
+    const COL_COLUMN_NAME: usize = 2;
+    const COL_TYPE_OID: usize = 3;
+    const COL_SEQ_ID: usize = 4;
+
+    /// Creates a new ColumnInfo.
+    pub fn new(
+        table_id: u32,
+        column_num: u32,
+        column_name: String,
+        type_oid: i32,
+        seq_id: u32,
+    ) -> Self {
+        Self {
+            table_id,
+            column_num,
+            column_name,
+            type_oid,
+            seq_id,
+        }
+    }
+
+    /// Converts a record from sys_columns into ColumnInfo.
+    ///
+    /// Returns `None` if the record has invalid or unexpected value types.
+    pub fn from_record(record: &Record) -> Option<Self> {
+        let table_id = match record.values.get(Self::COL_TABLE_ID)? {
+            Value::Int32(id) => *id as u32,
+            _ => return None,
+        };
+        let column_num = match record.values.get(Self::COL_COLUMN_NUM)? {
+            Value::Int32(n) => *n as u32,
+            _ => return None,
+        };
+        let column_name = match record.values.get(Self::COL_COLUMN_NAME)? {
+            Value::Text(s) => s.clone(),
+            _ => return None,
+        };
+        let type_oid = match record.values.get(Self::COL_TYPE_OID)? {
+            Value::Int32(oid) => *oid,
+            _ => return None,
+        };
+        let seq_id = match record.values.get(Self::COL_SEQ_ID)? {
+            Value::Int32(id) => *id as u32,
+            _ => return None,
+        };
+        Some(Self::new(
+            table_id,
+            column_num,
+            column_name,
+            type_oid,
+            seq_id,
+        ))
+    }
+
+    /// Converts this ColumnInfo into a record for sys_columns.
+    pub fn to_record(&self) -> Record {
+        Record::new(vec![
+            Value::Int32(self.table_id as i32),
+            Value::Int32(self.column_num as i32),
+            Value::Text(self.column_name.clone()),
+            Value::Int32(self.type_oid),
+            Value::Int32(self.seq_id as i32),
+        ])
+    }
+
+    /// Returns true if this column is a SERIAL (auto-increment) column.
+    pub fn is_serial(&self) -> bool {
+        self.seq_id != 0
+    }
+}
+
+/// Metadata for a sequence stored in the catalog (sys_sequences row).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequenceInfo {
+    /// Unique sequence identifier.
+    pub seq_id: u32,
+    /// Sequence name.
+    pub seq_name: String,
+    /// Next value to return.
+    pub next_val: i64,
+}
+
+impl SequenceInfo {
+    /// Table ID for sys_sequences.
+    pub const TABLE_ID: u32 = 3;
+
+    /// Schema for sys_sequences catalog table (type OIDs for deserialization).
+    pub const SCHEMA: [i32; 3] = [type_oid::INT4, type_oid::TEXT, type_oid::INT8];
+
+    // Column indices
+    const COL_SEQ_ID: usize = 0;
+    const COL_SEQ_NAME: usize = 1;
+    const COL_NEXT_VAL: usize = 2;
+
+    /// Creates a new SequenceInfo.
+    pub fn new(seq_id: u32, seq_name: String, next_val: i64) -> Self {
+        Self {
+            seq_id,
+            seq_name,
+            next_val,
+        }
+    }
+
+    /// Converts a record from sys_sequences into SequenceInfo.
+    ///
+    /// Returns `None` if the record has invalid or unexpected value types.
+    pub fn from_record(record: &Record) -> Option<Self> {
+        let seq_id = match record.values.get(Self::COL_SEQ_ID)? {
+            Value::Int32(id) => *id as u32,
+            _ => return None,
+        };
+        let seq_name = match record.values.get(Self::COL_SEQ_NAME)? {
+            Value::Text(s) => s.clone(),
+            _ => return None,
+        };
+        let next_val = match record.values.get(Self::COL_NEXT_VAL)? {
+            Value::Int64(v) => *v,
+            _ => return None,
+        };
+        Some(Self::new(seq_id, seq_name, next_val))
+    }
+
+    /// Converts this SequenceInfo into a record for sys_sequences.
+    pub fn to_record(&self) -> Record {
+        Record::new(vec![
+            Value::Int32(self.seq_id as i32),
+            Value::Text(self.seq_name.clone()),
+            Value::Int64(self.next_val),
+        ])
+    }
 }
 
 #[cfg(test)]
@@ -113,31 +241,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_data_type_to_oid() {
-        assert_eq!(data_type_to_oid(&DataType::Boolean), type_oid::BOOL);
-        assert_eq!(data_type_to_oid(&DataType::Smallint), type_oid::INT2);
-        assert_eq!(data_type_to_oid(&DataType::Integer), type_oid::INT4);
-        assert_eq!(data_type_to_oid(&DataType::Bigint), type_oid::INT8);
-        assert_eq!(data_type_to_oid(&DataType::Real), type_oid::FLOAT4);
-        assert_eq!(data_type_to_oid(&DataType::DoublePrecision), type_oid::FLOAT8);
-        assert_eq!(data_type_to_oid(&DataType::Text), type_oid::TEXT);
-        assert_eq!(data_type_to_oid(&DataType::Varchar(Some(255))), type_oid::VARCHAR);
-        assert_eq!(data_type_to_oid(&DataType::Bytea), type_oid::BYTEA);
-        // SERIAL is stored as INT4
-        assert_eq!(data_type_to_oid(&DataType::Serial), type_oid::INT4);
+    fn test_table_info() {
+        let info = TableInfo::new(1, "users".to_string(), PageId::new(10));
+        assert_eq!(info.table_id, 1);
+        assert_eq!(info.table_name, "users");
+        assert_eq!(info.first_page, PageId::new(10));
     }
 
     #[test]
-    fn test_is_serial() {
-        assert!(is_serial(&DataType::Serial));
-        assert!(!is_serial(&DataType::Integer));
-        assert!(!is_serial(&DataType::Text));
+    fn test_column_info() {
+        let col = ColumnInfo::new(1, 0, "id".to_string(), 23, 5);
+        assert_eq!(col.table_id, 1);
+        assert_eq!(col.column_num, 0);
+        assert_eq!(col.column_name, "id");
+        assert_eq!(col.type_oid, 23);
+        assert_eq!(col.seq_id, 5);
+        assert!(col.is_serial());
+
+        let col2 = ColumnInfo::new(1, 1, "name".to_string(), 25, 0);
+        assert!(!col2.is_serial());
     }
 
     #[test]
-    fn test_schema_lengths() {
-        assert_eq!(SYS_TABLES_SCHEMA.len(), 3);
-        assert_eq!(SYS_COLUMNS_SCHEMA.len(), 5);
-        assert_eq!(SYS_SEQUENCES_SCHEMA.len(), 3);
+    fn test_sequence_info() {
+        let seq = SequenceInfo::new(1, "users_id_seq".to_string(), 100);
+        assert_eq!(seq.seq_id, 1);
+        assert_eq!(seq.seq_name, "users_id_seq");
+        assert_eq!(seq.next_val, 100);
     }
 }

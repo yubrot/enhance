@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use parking_lot::RwLock;
 
-use super::types::{ColumnInfo, TableInfo};
+use super::schema::{ColumnInfo, TableInfo};
 
 /// In-memory cache for catalog lookups.
 ///

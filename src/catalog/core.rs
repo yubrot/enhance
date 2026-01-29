@@ -6,13 +6,10 @@ use parking_lot::Mutex;
 
 use super::cache::CatalogCache;
 use super::error::CatalogError;
-use super::schema::{
-    self, data_type_to_oid, is_serial, SYS_COLUMNS_SCHEMA, SYS_SEQUENCES_SCHEMA, SYS_TABLES_SCHEMA,
-};
+use super::schema::{ColumnInfo, SequenceInfo, TableInfo, LAST_RESERVED_TABLE_ID};
 use super::superblock::{Superblock, SUPERBLOCK_MAGIC, SUPERBLOCK_VERSION};
-use super::types::{ColumnInfo, TableInfo};
-use crate::heap::{HeapPage, Record, SlotId, Value};
-use crate::sql::CreateTableStmt;
+use crate::heap::{HeapPage, SlotId};
+use crate::sql::{CreateTableStmt, DataType};
 use crate::storage::{BufferPool, PageId, Replacer, Storage};
 use crate::tx::{CommandId, Snapshot, TransactionManager, TxId};
 
@@ -104,9 +101,9 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         // Process columns and create sequences for SERIAL columns
         let mut columns = Vec::with_capacity(stmt.columns.len());
         for (col_num, col_def) in stmt.columns.iter().enumerate() {
-            let type_oid = data_type_to_oid(&col_def.data_type);
+            let type_oid = col_def.data_type.to_oid();
 
-            let seq_id = if is_serial(&col_def.data_type) {
+            let seq_id = if col_def.data_type == DataType::Serial {
                 // Create sequence for SERIAL column
                 let seq_name = format!("{}_{}_seq", stmt.name, col_def.name);
                 self.create_sequence(txid, cid, &seq_name).await?
@@ -160,27 +157,16 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         let guard = self.pool.fetch_page(sys_tables_page).await?;
         let page = HeapPage::new(guard.data());
 
-        for (_slot_id, header, record) in page.scan(&SYS_TABLES_SCHEMA) {
+        for (_slot_id, header, record) in page.scan(&TableInfo::SCHEMA) {
             if !snapshot.is_tuple_visible(&header, &self.tx_manager) {
                 continue;
             }
 
-            let table_name = match &record.values[schema::sys_tables::TABLE_NAME] {
-                Value::Text(s) => s.as_str(),
-                _ => continue,
+            let Some(info) = TableInfo::from_record(&record) else {
+                continue;
             };
 
-            if table_name == name {
-                let table_id = match record.values[schema::sys_tables::TABLE_ID] {
-                    Value::Int32(id) => id as u32,
-                    _ => continue,
-                };
-                let first_page = match record.values[schema::sys_tables::FIRST_PAGE] {
-                    Value::Int64(p) => PageId::new(p as u64),
-                    _ => continue,
-                };
-
-                let info = TableInfo::new(table_id, table_name.to_string(), first_page);
+            if info.table_name == name {
                 self.cache.put_table(info.clone());
                 return Ok(Some(info));
             }
@@ -209,44 +195,20 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         let page = HeapPage::new(guard.data());
 
         let mut columns = Vec::new();
-        for (_slot_id, header, record) in page.scan(&SYS_COLUMNS_SCHEMA) {
+        for (_slot_id, header, record) in page.scan(&ColumnInfo::SCHEMA) {
             if !snapshot.is_tuple_visible(&header, &self.tx_manager) {
                 continue;
             }
 
-            let row_table_id = match record.values[schema::sys_columns::TABLE_ID] {
-                Value::Int32(id) => id as u32,
-                _ => continue,
+            let Some(col) = ColumnInfo::from_record(&record) else {
+                continue;
             };
 
-            if row_table_id != table_id {
+            if col.table_id != table_id {
                 continue;
             }
 
-            let column_num = match record.values[schema::sys_columns::COLUMN_NUM] {
-                Value::Int32(n) => n as u32,
-                _ => continue,
-            };
-            let column_name = match &record.values[schema::sys_columns::COLUMN_NAME] {
-                Value::Text(s) => s.clone(),
-                _ => continue,
-            };
-            let type_oid = match record.values[schema::sys_columns::TYPE_OID] {
-                Value::Int32(oid) => oid,
-                _ => continue,
-            };
-            let seq_id = match record.values[schema::sys_columns::SEQ_ID] {
-                Value::Int32(id) => id as u32,
-                _ => continue,
-            };
-
-            columns.push(ColumnInfo::new(
-                table_id,
-                column_num,
-                column_name,
-                type_oid,
-                seq_id,
-            ));
+            columns.push(col);
         }
 
         // Sort by column_num
@@ -267,35 +229,19 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         let mut page = HeapPage::new(guard.data_mut());
 
         // Find and update the sequence
-        for (slot_id, header, record) in page.scan(&SYS_SEQUENCES_SCHEMA).collect::<Vec<_>>() {
-            let row_seq_id = match record.values[schema::sys_sequences::SEQ_ID] {
-                Value::Int32(id) => id as u32,
-                _ => continue,
+        for (slot_id, header, record) in page.scan(&SequenceInfo::SCHEMA).collect::<Vec<_>>() {
+            let Some(seq) = SequenceInfo::from_record(&record) else {
+                continue;
             };
 
-            if row_seq_id != seq_id {
+            if seq.seq_id != seq_id {
                 continue;
             }
 
-            let current_val = match record.values[schema::sys_sequences::NEXT_VAL] {
-                Value::Int64(v) => v,
-                _ => continue,
-            };
+            let current_val = seq.next_val;
 
-            // Update the sequence value in place
-            // We need to delete and re-insert since we can't update in place
-            // This is a simplification - production would use UPDATE logic
-            let seq_name = match &record.values[schema::sys_sequences::SEQ_NAME] {
-                Value::Text(s) => s.clone(),
-                _ => continue,
-            };
-
-            // Create updated record
-            let new_record = Record::new(vec![
-                Value::Int32(seq_id as i32),
-                Value::Text(seq_name),
-                Value::Int64(current_val + 1),
-            ]);
+            // Create updated record with incremented value
+            let updated_seq = SequenceInfo::new(seq.seq_id, seq.seq_name, current_val + 1);
 
             // Mark old tuple as deleted and insert new one
             // For now, we just update the header's xmax and insert a new tuple
@@ -306,7 +252,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
             page.update_header(slot_id, new_header)?;
 
             // Insert new tuple
-            page.insert(&new_record, TxId::new(1), CommandId::FIRST)?;
+            page.insert(&updated_seq.to_record(), TxId::new(1), CommandId::FIRST)?;
 
             return Ok(current_val);
         }
@@ -328,15 +274,11 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
 
         let sys_sequences_page = { self.superblock.lock().sys_sequences_page };
 
-        let record = Record::new(vec![
-            Value::Int32(seq_id as i32),
-            Value::Text(name.to_string()),
-            Value::Int64(1), // Start at 1
-        ]);
+        let seq = SequenceInfo::new(seq_id, name.to_string(), 1); // Start at 1
 
         let mut guard = self.pool.fetch_page_mut(sys_sequences_page).await?;
         let mut page = HeapPage::new(guard.data_mut());
-        page.insert(&record, txid, cid)
+        page.insert(&seq.to_record(), txid, cid)
             .map_err(|_| CatalogError::PageFull)?;
 
         Ok(seq_id)
@@ -353,16 +295,12 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
     ) -> Result<SlotId, CatalogError> {
         let sys_tables_page = { self.superblock.lock().sys_tables_page };
 
-        let record = Record::new(vec![
-            Value::Int32(table_id as i32),
-            Value::Text(name.to_string()),
-            Value::Int64(first_page.page_num() as i64),
-        ]);
+        let table = TableInfo::new(table_id, name.to_string(), first_page);
 
         let mut guard = self.pool.fetch_page_mut(sys_tables_page).await?;
         let mut page = HeapPage::new(guard.data_mut());
         let slot_id = page
-            .insert(&record, txid, cid)
+            .insert(&table.to_record(), txid, cid)
             .map_err(|_| CatalogError::PageFull)?;
 
         Ok(slot_id)
@@ -377,18 +315,10 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
     ) -> Result<SlotId, CatalogError> {
         let sys_columns_page = { self.superblock.lock().sys_columns_page };
 
-        let record = Record::new(vec![
-            Value::Int32(col.table_id as i32),
-            Value::Int32(col.column_num as i32),
-            Value::Text(col.column_name.clone()),
-            Value::Int32(col.type_oid),
-            Value::Int32(col.seq_id as i32),
-        ]);
-
         let mut guard = self.pool.fetch_page_mut(sys_columns_page).await?;
         let mut page = HeapPage::new(guard.data_mut());
         let slot_id = page
-            .insert(&record, txid, cid)
+            .insert(&col.to_record(), txid, cid)
             .map_err(|_| CatalogError::PageFull)?;
 
         Ok(slot_id)
@@ -437,7 +367,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         superblock.sys_tables_page = sys_tables_page;
         superblock.sys_columns_page = sys_columns_page;
         superblock.sys_sequences_page = sys_sequences_page;
-        superblock.next_table_id = schema::table_id::FIRST_USER_TABLE;
+        superblock.next_table_id = LAST_RESERVED_TABLE_ID + 1;
         superblock.next_seq_id = 1;
 
         // Write superblock
@@ -455,104 +385,78 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
             let mut page = HeapPage::new(guard.data_mut());
 
             // sys_tables entry
-            page.insert(
-                &Record::new(vec![
-                    Value::Int32(schema::table_id::SYS_TABLES as i32),
-                    Value::Text("sys_tables".to_string()),
-                    Value::Int64(sys_tables_page.page_num() as i64),
-                ]),
-                txid,
-                cid,
-            )?;
+            let sys_tables_info = TableInfo::new(
+                TableInfo::TABLE_ID,
+                "sys_tables".to_string(),
+                sys_tables_page,
+            );
+            page.insert(&sys_tables_info.to_record(), txid, cid)?;
 
             // sys_columns entry
-            page.insert(
-                &Record::new(vec![
-                    Value::Int32(schema::table_id::SYS_COLUMNS as i32),
-                    Value::Text("sys_columns".to_string()),
-                    Value::Int64(sys_columns_page.page_num() as i64),
-                ]),
-                txid,
-                cid,
-            )?;
+            let sys_columns_info = TableInfo::new(
+                ColumnInfo::TABLE_ID,
+                "sys_columns".to_string(),
+                sys_columns_page,
+            );
+            page.insert(&sys_columns_info.to_record(), txid, cid)?;
 
             // sys_sequences entry
-            page.insert(
-                &Record::new(vec![
-                    Value::Int32(schema::table_id::SYS_SEQUENCES as i32),
-                    Value::Text("sys_sequences".to_string()),
-                    Value::Int64(sys_sequences_page.page_num() as i64),
-                ]),
-                txid,
-                cid,
-            )?;
+            let sys_sequences_info = TableInfo::new(
+                SequenceInfo::TABLE_ID,
+                "sys_sequences".to_string(),
+                sys_sequences_page,
+            );
+            page.insert(&sys_sequences_info.to_record(), txid, cid)?;
         }
 
         // Insert column metadata into sys_columns
         {
+            use crate::protocol::type_oid;
+
             let mut guard = pool.fetch_page_mut(sys_columns_page).await?;
             let mut page = HeapPage::new(guard.data_mut());
 
             // sys_tables columns (3 columns)
             let sys_tables_cols = [
-                ("table_id", crate::protocol::type_oid::INT4),
-                ("table_name", crate::protocol::type_oid::TEXT),
-                ("first_page", crate::protocol::type_oid::INT8),
+                ("table_id", type_oid::INT4),
+                ("table_name", type_oid::TEXT),
+                ("first_page", type_oid::INT8),
             ];
             for (i, (name, oid)) in sys_tables_cols.iter().enumerate() {
-                page.insert(
-                    &Record::new(vec![
-                        Value::Int32(schema::table_id::SYS_TABLES as i32),
-                        Value::Int32(i as i32),
-                        Value::Text(name.to_string()),
-                        Value::Int32(*oid),
-                        Value::Int32(0), // No sequence
-                    ]),
-                    txid,
-                    cid,
-                )?;
+                let col =
+                    ColumnInfo::new(TableInfo::TABLE_ID, i as u32, name.to_string(), *oid, 0);
+                page.insert(&col.to_record(), txid, cid)?;
             }
 
             // sys_columns columns (5 columns)
             let sys_columns_cols = [
-                ("table_id", crate::protocol::type_oid::INT4),
-                ("column_num", crate::protocol::type_oid::INT4),
-                ("column_name", crate::protocol::type_oid::TEXT),
-                ("type_oid", crate::protocol::type_oid::INT4),
-                ("seq_id", crate::protocol::type_oid::INT4),
+                ("table_id", type_oid::INT4),
+                ("column_num", type_oid::INT4),
+                ("column_name", type_oid::TEXT),
+                ("type_oid", type_oid::INT4),
+                ("seq_id", type_oid::INT4),
             ];
             for (i, (name, oid)) in sys_columns_cols.iter().enumerate() {
-                page.insert(
-                    &Record::new(vec![
-                        Value::Int32(schema::table_id::SYS_COLUMNS as i32),
-                        Value::Int32(i as i32),
-                        Value::Text(name.to_string()),
-                        Value::Int32(*oid),
-                        Value::Int32(0), // No sequence
-                    ]),
-                    txid,
-                    cid,
-                )?;
+                let col =
+                    ColumnInfo::new(ColumnInfo::TABLE_ID, i as u32, name.to_string(), *oid, 0);
+                page.insert(&col.to_record(), txid, cid)?;
             }
 
             // sys_sequences columns (3 columns)
             let sys_sequences_cols = [
-                ("seq_id", crate::protocol::type_oid::INT4),
-                ("seq_name", crate::protocol::type_oid::TEXT),
-                ("next_val", crate::protocol::type_oid::INT8),
+                ("seq_id", type_oid::INT4),
+                ("seq_name", type_oid::TEXT),
+                ("next_val", type_oid::INT8),
             ];
             for (i, (name, oid)) in sys_sequences_cols.iter().enumerate() {
-                page.insert(
-                    &Record::new(vec![
-                        Value::Int32(schema::table_id::SYS_SEQUENCES as i32),
-                        Value::Int32(i as i32),
-                        Value::Text(name.to_string()),
-                        Value::Int32(*oid),
-                        Value::Int32(0), // No sequence
-                    ]),
-                    txid,
-                    cid,
-                )?;
+                let col = ColumnInfo::new(
+                    SequenceInfo::TABLE_ID,
+                    i as u32,
+                    name.to_string(),
+                    *oid,
+                    0,
+                );
+                page.insert(&col.to_record(), txid, cid)?;
             }
         }
 
@@ -618,7 +522,7 @@ mod tests {
         assert_eq!(sb.sys_tables_page, PageId::new(1));
         assert_eq!(sb.sys_columns_page, PageId::new(2));
         assert_eq!(sb.sys_sequences_page, PageId::new(3));
-        assert_eq!(sb.next_table_id, schema::table_id::FIRST_USER_TABLE);
+        assert_eq!(sb.next_table_id, LAST_RESERVED_TABLE_ID + 1);
     }
 
     #[tokio::test]
@@ -631,7 +535,7 @@ mod tests {
         let table = catalog.get_table(&snapshot, "sys_tables").await.unwrap();
         assert!(table.is_some());
         let table = table.unwrap();
-        assert_eq!(table.table_id, schema::table_id::SYS_TABLES);
+        assert_eq!(table.table_id, TableInfo::TABLE_ID);
         assert_eq!(table.table_name, "sys_tables");
 
         // Should find sys_columns
@@ -653,7 +557,7 @@ mod tests {
 
         // Get sys_tables columns
         let columns = catalog
-            .get_columns(&snapshot, schema::table_id::SYS_TABLES)
+            .get_columns(&snapshot, TableInfo::TABLE_ID)
             .await
             .unwrap();
 
@@ -690,7 +594,7 @@ mod tests {
         };
 
         let table_id = catalog.create_table(txid, cid, &stmt).await.unwrap();
-        assert_eq!(table_id, schema::table_id::FIRST_USER_TABLE);
+        assert_eq!(table_id, LAST_RESERVED_TABLE_ID + 1);
 
         catalog.tx_manager.commit(txid).unwrap();
 
@@ -701,7 +605,7 @@ mod tests {
         let table = catalog.get_table(&snapshot, "users").await.unwrap();
         assert!(table.is_some());
         let table = table.unwrap();
-        assert_eq!(table.table_id, schema::table_id::FIRST_USER_TABLE);
+        assert_eq!(table.table_id, LAST_RESERVED_TABLE_ID + 1);
 
         // Verify columns
         let columns = catalog.get_columns(&snapshot, table.table_id).await.unwrap();

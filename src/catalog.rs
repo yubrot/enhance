@@ -26,13 +26,8 @@ mod core;
 mod error;
 mod schema;
 mod superblock;
-mod types;
 
 pub use self::core::Catalog;
 pub use error::CatalogError;
-pub use schema::{
-    data_type_to_oid, is_serial, table_id, sys_columns, sys_sequences, sys_tables,
-    SYS_COLUMNS_SCHEMA, SYS_SEQUENCES_SCHEMA, SYS_TABLES_SCHEMA,
-};
+pub use schema::{ColumnInfo, SequenceInfo, TableInfo, LAST_RESERVED_TABLE_ID};
 pub use superblock::{Superblock, SUPERBLOCK_MAGIC, SUPERBLOCK_SIZE, SUPERBLOCK_VERSION};
-pub use types::{ColumnInfo, SequenceInfo, TableInfo};
