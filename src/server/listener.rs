@@ -3,35 +3,29 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use tokio::net::TcpListener;
 
+use crate::db::Database;
 use crate::server::connection::Connection;
 use crate::server::handshake::{Handshake, HandshakeResult};
 use crate::server::registry::Registry;
-use crate::tx::TransactionManager;
+use crate::storage::{Replacer, Storage};
 
 /// TCP server implementing PostgreSQL wire protocol.
-pub struct Server {
+pub struct Server<S: Storage, R: Replacer> {
     listener: TcpListener,
     next_pid: Arc<AtomicI32>,
     registry: Arc<Registry>,
-    tx_manager: Arc<TransactionManager>,
+    database: Arc<Database<S, R>>,
 }
 
-impl Server {
-    /// Creates a new server from an already-bound `TcpListener`.
-    pub fn new(listener: TcpListener) -> Self {
+impl<S: Storage + 'static, R: Replacer + 'static> Server<S, R> {
+    /// Creates a new server with a given listener and database.
+    pub fn new(listener: TcpListener, database: Database<S, R>) -> Self {
         Self {
             listener,
             next_pid: Arc::new(AtomicI32::new(1)),
             registry: Arc::new(Registry::new()),
-            tx_manager: Arc::new(TransactionManager::new()),
+            database: Arc::new(database),
         }
-    }
-
-    /// Binds to the given address and returns a ready-to-serve `Server`.
-    pub async fn bind(addr: impl Into<String>) -> Result<Self, std::io::Error> {
-        let addr = addr.into();
-        let listener = TcpListener::bind(&addr).await?;
-        Ok(Self::new(listener))
     }
 
     /// Starts accepting connections and serving clients.
@@ -67,7 +61,7 @@ impl Server {
             let (socket, peer_addr) = self.listener.accept().await?;
             let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
             let registry = self.registry.clone();
-            let tx_manager = self.tx_manager.clone();
+            let database = self.database.clone();
 
             println!("(pid={}) Accepted connection from {}", pid, peer_addr);
 
@@ -76,7 +70,7 @@ impl Server {
                 let (mut connection, secret_key) = match handshake.run().await {
                     Ok(HandshakeResult::Success { framed, secret_key }) => {
                         println!("(pid={}) Connection ready", pid);
-                        (Connection::new(framed, pid, tx_manager), secret_key)
+                        (Connection::new(framed, pid, database), secret_key)
                     }
                     Ok(HandshakeResult::CancelRequested {
                         pid: target_pid,
