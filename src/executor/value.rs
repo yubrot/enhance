@@ -299,7 +299,14 @@ where
 }
 
 /// Compares two values, returning their ordering.
-fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering, ExecutorError> {
+///
+/// Both values must be non-NULL and of compatible types.
+/// This is used by comparison operators and Sort executor.
+///
+/// # Errors
+///
+/// Returns `TypeMismatch` if the values are of incompatible types.
+pub fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering, ExecutorError> {
     use std::cmp::Ordering;
 
     match (left, right) {
@@ -768,6 +775,63 @@ fn coerce_to_bytea(value: Value) -> Result<Value, ExecutorError> {
             found: type_name(&value),
         }),
     }
+}
+
+/// Converts a numeric value to f64 for aggregate computations (e.g., AVG).
+///
+/// Returns `None` if the value is NULL or non-numeric.
+pub fn value_to_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Null => None,
+        Value::Int16(n) => Some(*n as f64),
+        Value::Int32(n) => Some(*n as f64),
+        Value::Int64(n) => Some(*n as f64),
+        Value::Float32(n) => Some(*n as f64),
+        Value::Float64(n) => Some(*n),
+        _ => None, // Non-numeric types
+    }
+}
+
+/// Converts a numeric value to i64 for integer aggregate computations (e.g., SUM).
+///
+/// Returns `None` if the value is NULL.
+/// Returns `Err` if the value is non-numeric.
+#[allow(dead_code)] // Reserved for future use in integer-specific aggregation
+pub fn value_to_i64(value: &Value) -> Result<Option<i64>, ExecutorError> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Int16(n) => Ok(Some(*n as i64)),
+        Value::Int32(n) => Ok(Some(*n as i64)),
+        Value::Int64(n) => Ok(Some(*n)),
+        _ => Err(ExecutorError::TypeMismatch {
+            expected: "integer".to_string(),
+            found: type_name(value),
+        }),
+    }
+}
+
+/// Checks if a value is numeric (integer or float).
+#[allow(dead_code)] // Reserved for future type checking
+pub fn is_numeric(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Int16(_)
+            | Value::Int32(_)
+            | Value::Int64(_)
+            | Value::Float32(_)
+            | Value::Float64(_)
+    )
+}
+
+/// Checks if a value is an integer type.
+#[allow(dead_code)] // Reserved for future type checking
+pub fn is_integer(value: &Value) -> bool {
+    matches!(value, Value::Int16(_) | Value::Int32(_) | Value::Int64(_))
+}
+
+/// Checks if a value is a float type.
+pub fn is_float(value: &Value) -> bool {
+    matches!(value, Value::Float32(_) | Value::Float64(_))
 }
 
 #[cfg(test)]
@@ -1359,5 +1423,80 @@ mod tests {
 
         // Int32 -> Int16 (out of range)
         assert!(coerce_to_type(Value::Int32(100000), type_oid::INT2).is_err());
+    }
+
+    #[test]
+    fn test_value_to_f64() {
+        assert_eq!(value_to_f64(&Value::Int16(42)), Some(42.0));
+        assert_eq!(value_to_f64(&Value::Int32(42)), Some(42.0));
+        assert_eq!(value_to_f64(&Value::Int64(42)), Some(42.0));
+        assert_eq!(value_to_f64(&Value::Float32(3.14)), Some(3.14_f32 as f64));
+        assert_eq!(value_to_f64(&Value::Float64(3.14)), Some(3.14));
+        assert_eq!(value_to_f64(&Value::Null), None);
+        assert_eq!(value_to_f64(&Value::Text("hello".to_string())), None);
+    }
+
+    #[test]
+    fn test_value_to_i64() {
+        assert_eq!(value_to_i64(&Value::Int16(42)).unwrap(), Some(42));
+        assert_eq!(value_to_i64(&Value::Int32(42)).unwrap(), Some(42));
+        assert_eq!(value_to_i64(&Value::Int64(42)).unwrap(), Some(42));
+        assert_eq!(value_to_i64(&Value::Null).unwrap(), None);
+        assert!(value_to_i64(&Value::Float64(3.14)).is_err());
+    }
+
+    #[test]
+    fn test_is_numeric() {
+        assert!(is_numeric(&Value::Int16(1)));
+        assert!(is_numeric(&Value::Int32(1)));
+        assert!(is_numeric(&Value::Int64(1)));
+        assert!(is_numeric(&Value::Float32(1.0)));
+        assert!(is_numeric(&Value::Float64(1.0)));
+        assert!(!is_numeric(&Value::Null));
+        assert!(!is_numeric(&Value::Text("hello".to_string())));
+    }
+
+    #[test]
+    fn test_is_integer_and_float() {
+        assert!(is_integer(&Value::Int16(1)));
+        assert!(is_integer(&Value::Int32(1)));
+        assert!(is_integer(&Value::Int64(1)));
+        assert!(!is_integer(&Value::Float64(1.0)));
+
+        assert!(is_float(&Value::Float32(1.0)));
+        assert!(is_float(&Value::Float64(1.0)));
+        assert!(!is_float(&Value::Int32(1)));
+    }
+
+    #[test]
+    fn test_compare_values_basic() {
+        use std::cmp::Ordering;
+
+        // Same type comparisons
+        assert_eq!(
+            compare_values(&Value::Int32(5), &Value::Int32(3)).unwrap(),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_values(&Value::Int32(3), &Value::Int32(5)).unwrap(),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_values(&Value::Int32(5), &Value::Int32(5)).unwrap(),
+            Ordering::Equal
+        );
+
+        // Mixed integer types
+        assert_eq!(
+            compare_values(&Value::Int16(5), &Value::Int64(3)).unwrap(),
+            Ordering::Greater
+        );
+
+        // Text comparison
+        assert_eq!(
+            compare_values(&Value::Text("apple".to_string()), &Value::Text("banana".to_string()))
+                .unwrap(),
+            Ordering::Less
+        );
     }
 }

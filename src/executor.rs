@@ -34,7 +34,6 @@
 //!
 //! - Single-page tables only (multi-page support in Step 15)
 //! - No optimization (rule-based planner in Step 17)
-//! - No aggregation (Step 12)
 //! - No joins (Step 19)
 
 mod context;
@@ -49,6 +48,9 @@ pub use dml::{
     execute_delete, execute_insert, execute_update, DeleteResult, InsertResult, UpdateResult,
 };
 pub use error::ExecutorError;
-pub use plan::{Executor, Filter, OutputColumn, Projection, SeqScan, Tuple};
+pub use plan::{
+    Accumulator, Aggregate, AggregateExpr, AggregateFunction, Executor, Filter, GroupKey,
+    OutputColumn, Projection, SeqScan, Sort, SortKey, Tuple,
+};
 pub use planner::plan_select;
-pub use value::{coerce_to_type, evaluate, is_truthy};
+pub use value::{coerce_to_type, compare_values, evaluate, is_truthy, value_to_f64};

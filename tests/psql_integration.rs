@@ -234,12 +234,12 @@ LINE 1: SELECT FROM "users";
 async fn test_psql_complex_select() {
     let server = PsqlTestServer::start().await;
 
-    // ORDER BY and LIMIT are not yet supported (Step 12)
+    // LIMIT is not yet supported
     // Test that we correctly report unsupported features
     let result = server.run_psql(
         "SELECT id, name, age FROM users WHERE active = TRUE AND age >= 18 ORDER BY name ASC LIMIT 10;",
     );
-    result.assert_output_contains("unsupported feature: ORDER BY");
+    result.assert_output_contains("unsupported feature: LIMIT");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -302,4 +302,124 @@ async fn test_psql_explain() {
     result.assert_success();
     result.assert_output_contains("Filter");
     result.assert_output_contains("Seq Scan on test_explain");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_order_by() {
+    let server = PsqlTestServer::start().await;
+
+    // Create and populate a table with only integers (to avoid shell escaping issues with strings)
+    let result = server.run_psql("CREATE TABLE test_sort (id INTEGER, value INTEGER);");
+    result.assert_success();
+
+    let result = server.run_psql("INSERT INTO test_sort VALUES (3, 30);");
+    result.assert_success();
+
+    let result = server.run_psql("INSERT INTO test_sort VALUES (1, 10);");
+    result.assert_success();
+
+    let result = server.run_psql("INSERT INTO test_sort VALUES (2, 20);");
+    result.assert_success();
+
+    // ORDER BY ASC - values should be ordered 10, 20, 30
+    let result = server.run_psql("SELECT * FROM test_sort ORDER BY id ASC;");
+    result.assert_success();
+    result.assert_output_contains("(3 rows)");
+    // Verify values are present
+    result.assert_output_contains("10");
+    result.assert_output_contains("20");
+    result.assert_output_contains("30");
+    // Verify order: 10 appears before 20 before 30
+    let output = &result.output;
+    let pos_10 = output.find(" 10").expect("10 should be in output");
+    let pos_20 = output.find(" 20").expect("20 should be in output");
+    let pos_30 = output.find(" 30").expect("30 should be in output");
+    assert!(
+        pos_10 < pos_20 && pos_20 < pos_30,
+        "ASC order incorrect: 10={}, 20={}, 30={}\nOutput: {}",
+        pos_10, pos_20, pos_30, output
+    );
+
+    // ORDER BY DESC - values should be ordered 30, 20, 10
+    let result = server.run_psql("SELECT * FROM test_sort ORDER BY id DESC;");
+    result.assert_success();
+    let output = &result.output;
+    let pos_10 = output.find(" 10").expect("10 should be in output");
+    let pos_20 = output.find(" 20").expect("20 should be in output");
+    let pos_30 = output.find(" 30").expect("30 should be in output");
+    assert!(
+        pos_30 < pos_20 && pos_20 < pos_10,
+        "DESC order incorrect: 30={}, 20={}, 10={}\nOutput: {}",
+        pos_30, pos_20, pos_10, output
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_aggregate_functions() {
+    let server = PsqlTestServer::start().await;
+
+    // Create and populate a table
+    let result = server.run_psql("CREATE TABLE test_agg (id INTEGER, value INTEGER);");
+    result.assert_success();
+
+    let result = server.run_psql("INSERT INTO test_agg VALUES (1, 10);");
+    result.assert_success();
+
+    let result = server.run_psql("INSERT INTO test_agg VALUES (2, 20);");
+    result.assert_success();
+
+    let result = server.run_psql("INSERT INTO test_agg VALUES (3, 30);");
+    result.assert_success();
+
+    // COUNT(*)
+    let result = server.run_psql("SELECT COUNT(*) FROM test_agg;");
+    result.assert_success();
+    result.assert_output_contains("3");
+
+    // SUM
+    let result = server.run_psql("SELECT SUM(value) FROM test_agg;");
+    result.assert_success();
+    result.assert_output_contains("60");
+
+    // AVG
+    let result = server.run_psql("SELECT AVG(value) FROM test_agg;");
+    result.assert_success();
+    result.assert_output_contains("20");
+
+    // MIN/MAX
+    let result = server.run_psql("SELECT MIN(value), MAX(value) FROM test_agg;");
+    result.assert_success();
+    result.assert_output_contains("10");
+    result.assert_output_contains("30");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_group_by() {
+    let server = PsqlTestServer::start().await;
+
+    // Create and populate a table with groups (use integer for dept to avoid shell escaping)
+    let result = server.run_psql("CREATE TABLE test_group (dept INTEGER, salary INTEGER);");
+    result.assert_success();
+
+    // dept 1 = 50000 + 60000 = 110000
+    let result = server.run_psql("INSERT INTO test_group VALUES (1, 50000);");
+    result.assert_success();
+
+    let result = server.run_psql("INSERT INTO test_group VALUES (1, 60000);");
+    result.assert_success();
+
+    // dept 2 = 80000 + 90000 = 170000
+    let result = server.run_psql("INSERT INTO test_group VALUES (2, 80000);");
+    result.assert_success();
+
+    let result = server.run_psql("INSERT INTO test_group VALUES (2, 90000);");
+    result.assert_success();
+
+    // GROUP BY with aggregate
+    let result = server.run_psql("SELECT dept, SUM(salary) FROM test_group GROUP BY dept;");
+    result.assert_success();
+    result.assert_output_contains("(2 rows)");
+    // Check for expected sum values
+    result.assert_output_contains("110000");
+    result.assert_output_contains("170000");
 }
