@@ -76,7 +76,7 @@ Goal: Execute queries with MVCC awareness.
 
 10. ✅ Basic Executor & EXPLAIN: Implement Volcano trait (`next() -> Option<Tuple>`), SeqScan (heap iteration with visibility check), Filter (WHERE evaluation), Projection (column selection), and EXPLAIN output for plan visualization.
 11. ✅ DML Operations: INSERT (set xmin), DELETE (set xmax), UPDATE (delete + insert as new version). Implement type coercion for mixed-type expressions.
-12. Sort & Aggregation: ORDER BY with in-memory sort, GROUP BY, aggregate functions (COUNT, SUM, AVG, MIN, MAX).
+12. ✅ Sort & Aggregation: ORDER BY with in-memory sort, GROUP BY, aggregate functions (COUNT, SUM, AVG, MIN, MAX).
 
 ### Month 6: Durability
 

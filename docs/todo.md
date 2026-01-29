@@ -8,7 +8,6 @@ This document evaluates remaining roadmap items from the perspective of Agentic 
 
 | # | Item | Difficulty | Rationale |
 |---|------|:----------:|-----------|
-| 12 | **Sort & Aggregation** | 2 | Standard algorithms. In-memory sort is simple. Aggregate functions are well-defined |
 | 13 | **Write-Ahead Log** | 4 | Strict write-ahead principle. Coordination with Buffer Pool. fsync timing |
 | 14 | **Checkpoint & Recovery** | **5** | Dirty page concurrency during checkpoint. Correct REDO replay ordering. Crash recovery testing is difficult |
 | 15 | **VACUUM & FSM** | 3 | Depends on visibility rules but extends existing compaction. FSM is an independent structure |
