@@ -8,7 +8,6 @@ This document evaluates remaining roadmap items from the perspective of Agentic 
 
 | # | Item | Difficulty | Rationale |
 |---|------|:----------:|-----------|
-| 9 | **System Catalog** | 4 | Bootstrap problem (reading catalog requires catalog definition). Once design is fixed, implementation is mechanical |
 | 10 | **Basic Executor & EXPLAIN** | 2 | Volcano model is a clear Iterator pattern. SeqScan/Filter/Projection are straightforward |
 | 11 | **DML Operations** | 3 | Setting xmin/xmax correctly. Relatively straightforward if MVCC Core is correct |
 | 12 | **Sort & Aggregation** | 2 | Standard algorithms. In-memory sort is simple. Aggregate functions are well-defined |

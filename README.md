@@ -68,7 +68,7 @@ Goal: Manage variable-length records within the 8KB limit and parse SQL into AST
 Goal: Establish MVCC infrastructure with transaction visibility and self-hosted catalog.
 
 8. ✅ MVCC Core: Transaction manager (TxId allocation, active transaction tracking, commit/abort state machine), tuple header extension (xmin/xmax/cid/infomask), Snapshot structure, visibility rules (`HeapTupleSatisfiesMVCC`).
-9. System Catalog: Store table/column definitions as heap tuples with MVCC. Bootstrap reserved catalog tables (pg_class, pg_attribute equivalent). Implement auto-increment sequences for SERIAL columns.
+9. ✅ System Catalog: Store table/column definitions as heap tuples with MVCC. Bootstrap reserved catalog tables (pg_class, pg_attribute equivalent). Implement auto-increment sequences for SERIAL columns.
 
 ### Month 5: Query Execution
 
