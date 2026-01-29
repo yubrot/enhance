@@ -10,13 +10,15 @@ use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
+use crate::db::Database;
 use crate::protocol::{
     BackendMessage, BindMessage, CloseMessage, CloseTarget, DescribeMessage, DescribeTarget,
     ErrorInfo, ExecuteMessage, FrontendMessage, ParseMessage, PostgresCodec, TransactionStatus,
     sql_state,
 };
 use crate::sql::{Parser, Statement};
-use crate::tx::TransactionManager;
+use crate::storage::{Replacer, Storage};
+use crate::tx::CommandId;
 
 /// A single client connection.
 ///
@@ -31,24 +33,24 @@ use crate::tx::TransactionManager;
 /// 2. Protocol Completeness:
 ///    - Handle all frontend message types
 ///    - Support COPY protocol for bulk data transfer
-pub struct Connection {
+pub struct Connection<S: Storage, R: Replacer> {
     framed: Framed<TcpStream, PostgresCodec>,
     pid: i32,
     state: ConnectionState,
-    tx_manager: Arc<TransactionManager>,
+    database: Arc<Database<S, R>>,
 }
 
-impl Connection {
+impl<S: Storage, R: Replacer> Connection<S, R> {
     pub fn new(
         framed: Framed<TcpStream, PostgresCodec>,
         pid: i32,
-        tx_manager: Arc<TransactionManager>,
+        database: Arc<Database<S, R>>,
     ) -> Self {
         Self {
             framed,
             pid,
             state: ConnectionState::new(),
-            tx_manager,
+            database,
         }
     }
 
@@ -140,7 +142,6 @@ impl Connection {
     /// Handle a query from the client (Simple Query Protocol).
     ///
     /// Parses the SQL, and returns appropriate responses.
-    /// NOTE: Actual execution is stubbed - real execution comes in later steps.
     async fn handle_query(&mut self, query: &str) -> Result<(), ConnectionError> {
         println!("(pid={}) Query: {}", self.pid, query);
 
@@ -154,20 +155,20 @@ impl Connection {
                 match &stmt {
                     Statement::Begin => {
                         if self.state.transaction().is_none() {
-                            let txid = self.tx_manager.begin();
+                            let txid = self.database.tx_manager().begin();
                             self.state.begin_transaction(txid);
                         }
                         // If already in transaction, BEGIN is a no-op (following PostgreSQL's behavior)
                     }
                     Statement::Commit => {
                         if let Some(transaction) = self.state.transaction() {
-                            self.tx_manager.commit(transaction.txid)?;
+                            self.database.tx_manager().commit(transaction.txid)?;
                         }
                         self.state.end_transaction();
                     }
                     Statement::Rollback => {
                         if let Some(transaction) = self.state.transaction() {
-                            let _ = self.tx_manager.abort(transaction.txid);
+                            let _ = self.database.tx_manager().abort(transaction.txid);
                         }
                         self.state.end_transaction();
                     }
@@ -177,7 +178,14 @@ impl Connection {
                     }
                 }
 
-                // Successfully parsed
+                // Execute statement
+                if let Err(e) = self.execute_statement(&stmt).await {
+                    let error = ErrorInfo::new(sql_state::INTERNAL_ERROR, e.to_string());
+                    self.framed.send(error.into()).await?;
+                    return self.send_ready_for_query().await;
+                }
+
+                // Successfully executed
                 let tag = Self::command_tag(&stmt);
 
                 // For SELECT, send RowDescription before CommandComplete
@@ -200,6 +208,62 @@ impl Connection {
         }
 
         self.send_ready_for_query().await
+    }
+
+    /// Execute a parsed statement.
+    async fn execute_statement(&mut self, stmt: &Statement) -> Result<(), ConnectionError> {
+        match stmt {
+            Statement::CreateTable(create_stmt) => {
+                // Get or create transaction for DDL
+                let (txid, cid) = self.get_or_create_transaction();
+
+                match self
+                    .database
+                    .catalog()
+                    .create_table(txid, cid, create_stmt)
+                    .await
+                {
+                    Ok(table_id) => {
+                        if table_id > 0 {
+                            println!(
+                                "(pid={}) Created table '{}' with id {}",
+                                self.pid, create_stmt.name, table_id
+                            );
+                        } else {
+                            println!(
+                                "(pid={}) Table '{}' already exists (IF NOT EXISTS)",
+                                self.pid, create_stmt.name
+                            );
+                        }
+                        // If not in explicit transaction, commit immediately
+                        if self.state.transaction().is_none() {
+                            self.database.tx_manager().commit(txid)?;
+                        }
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // Abort transaction on error
+                        let _ = self.database.tx_manager().abort(txid);
+                        if self.state.transaction().is_some() {
+                            self.state.end_transaction();
+                        }
+                        Err(ConnectionError::Catalog(e))
+                    }
+                }
+            }
+            // Other statements are stubbed for now
+            _ => Ok(()),
+        }
+    }
+
+    /// Get the current transaction or create a new one for auto-commit mode.
+    fn get_or_create_transaction(&mut self) -> (crate::tx::TxId, CommandId) {
+        if let Some(tx) = self.state.transaction() {
+            (tx.txid, tx.cid)
+        } else {
+            let txid = self.database.tx_manager().begin();
+            (txid, CommandId::FIRST)
+        }
     }
 
     /// Handle a Parse message - create a prepared statement.
@@ -328,7 +392,9 @@ impl Connection {
             return self.send_error(error, true).await;
         };
 
-        let Some(stmt) = self.state.get_statement(&portal.statement_name) else {
+        let statement_name = portal.statement_name.clone();
+
+        let Some(stmt) = self.state.get_statement(&statement_name) else {
             let error = ErrorInfo::new(
                 sql_state::INVALID_SQL_STATEMENT_NAME,
                 "statement for portal does not exist",
@@ -336,9 +402,16 @@ impl Connection {
             return self.send_error(error, true).await;
         };
 
-        // Stub execution - use stored AST to determine response
-        // NOTE: Real execution comes in later steps
-        let tag = Self::command_tag(&stmt.ast);
+        // Clone AST to avoid borrow issues
+        let ast = stmt.ast.clone();
+
+        // Execute the statement
+        if let Err(e) = self.execute_statement(&ast).await {
+            let error = ErrorInfo::new(sql_state::INTERNAL_ERROR, e.to_string());
+            return self.send_error(error, true).await;
+        }
+
+        let tag = Self::command_tag(&ast);
         self.framed
             .send(BackendMessage::CommandComplete { tag })
             .await?;
