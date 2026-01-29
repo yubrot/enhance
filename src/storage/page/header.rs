@@ -54,8 +54,8 @@ impl TryFrom<u8> for PageType {
 /// - `free_end`: u16 (2 bytes)
 /// - `reserved`: [u8; 4]
 ///
-/// This layout is inspired by PostgreSQL's PageHeaderData (24 bytes) and provides
-/// fields necessary for WAL integration (Week 21-23) and corruption detection.
+/// This layout intentionally mirrors PostgreSQL's PageHeaderData (24 bytes) for learning
+/// purposes, and provides fields necessary for WAL integration (Week 21-23) and corruption detection.
 #[derive(Debug, Clone, Copy)]
 pub struct PageHeader {
     /// Log Sequence Number of the last WAL record that modified this page.

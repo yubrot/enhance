@@ -14,7 +14,8 @@ use super::types::{CommandId, TxId, TxState};
 
 /// Snapshot for MVCC visibility determination.
 ///
-/// PostgreSQL-style snapshot with xmin, xmax, and in-progress transaction list.
+/// Snapshot with xmin, xmax, and in-progress transaction list (intentionally using
+/// the same structure as PostgreSQL for learning).
 /// Each statement within a READ COMMITTED transaction gets a fresh snapshot.
 ///
 /// # Transaction Visibility Ranges
@@ -57,11 +58,11 @@ impl Snapshot {
 
     /// Determine if a tuple is visible to this snapshot.
     ///
-    /// This implements PostgreSQL's `HeapTupleSatisfiesMVCC` visibility rules for
-    /// READ COMMITTED isolation, where each statement gets a fresh snapshot.
+    /// This implements MVCC visibility rules (equivalent to PostgreSQL's `HeapTupleSatisfiesMVCC`)
+    /// for READ COMMITTED isolation, where each statement gets a fresh snapshot.
     ///
     /// NOTE: This function does NOT update hint bits (xmin_committed, xmin_aborted, etc.) in
-    /// the tuple header. Following PostgreSQL's lazy hint bit strategy, hint bits will be set by:
+    /// the tuple header. Following a lazy hint bit strategy (the same approach PostgreSQL uses), hint bits will be set by:
     /// - Readers (SeqScan in Step 10): Set hint bits on first tuple access
     /// - VACUUM (Step 15): Ensures all tuples eventually get hint bits set
     ///

@@ -1,6 +1,6 @@
 # enhance
 
-enhance is an educational RDBMS implementation built from scratch in Rust. The goal is to understand database internals by manually implementing everything from the PostgreSQL wire protocol to the storage engine. This is a learning-focused project, not production software.
+enhance is an educational RDBMS implementation built from scratch in Rust. The goal is to understand database internals by manually implementing everything from the wire protocol (using PostgreSQL's protocol for psql compatibility) to the storage engine. This is a learning-focused project, not production software.
 
 See @README.md and @docs/ for the current status of this project.
 

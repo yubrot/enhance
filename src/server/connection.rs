@@ -157,7 +157,7 @@ impl Connection {
                             let txid = self.tx_manager.begin();
                             self.state.begin_transaction(txid);
                         }
-                        // If already in transaction, BEGIN is a no-op (PostgreSQL behavior)
+                        // If already in transaction, BEGIN is a no-op (following PostgreSQL's behavior)
                     }
                     Statement::Commit => {
                         if let Some(transaction) = self.state.transaction() {

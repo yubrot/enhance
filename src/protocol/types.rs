@@ -106,10 +106,10 @@ impl ErrorFieldCode {
     }
 }
 
-/// PostgreSQL type OIDs for common data types.
+/// Type OIDs for common data types.
 ///
-/// NOTE: This is not an exhaustive list. PostgreSQL has hundreds of built-in types
-/// plus user-defined types. These constants cover the most commonly used types.
+/// These values intentionally match PostgreSQL's type OIDs so that psql can correctly
+/// interpret query results.
 /// See: https://github.com/postgres/postgres/blob/master/src/include/catalog/pg_type.dat
 pub mod type_oid {
     /// Unknown type (used for type inference)

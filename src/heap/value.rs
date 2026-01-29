@@ -39,7 +39,7 @@ pub enum Value {
 }
 
 impl Value {
-    /// Returns the PostgreSQL type OID for this value.
+    /// Returns the type OID for this value (using PostgreSQL's OID values for psql compatibility).
     ///
     /// Returns `UNKNOWN` for Null since it has no concrete type.
     pub fn type_oid(&self) -> i32 {

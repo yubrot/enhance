@@ -2,7 +2,7 @@
 //!
 //! The storage layer provides page I/O abstractions for the enhance RDBMS.
 //! All persistent data is stored in 8KB pages, aligned with OS page sizes
-//! and PostgreSQL conventions.
+//! and intentionally using PostgreSQL-compatible conventions for learning purposes.
 //!
 //! # Architecture
 //!

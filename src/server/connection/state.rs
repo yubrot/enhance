@@ -61,7 +61,7 @@ impl ConnectionState {
     /// Clear all unnamed statement/portal (called at end of extended query).
     /// Named ones persist across queries.
     pub fn clear_unnamed(&mut self) {
-        // Per PostgreSQL: unnamed statement is closed at Sync
+        // Unnamed statement is closed at Sync (matching PostgreSQL protocol semantics)
         // Named statements persist until explicitly closed
         self.close_statement("");
         self.close_portal("");

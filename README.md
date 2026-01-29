@@ -7,7 +7,7 @@ This project is designed as an intensive learning journey, focusing on core data
 ## Project Vision & Philosophy
 
 - **Minimal Dependencies**: Rely on Tokio for the async runtime and a few essential crates. Avoid large frameworks to focus on manual implementation of core logic.
-- **PostgreSQL Compatibility**: Implement the wire protocol manually so that standard tools like `psql` can connect to the database.
+- **Wire Protocol**: Implement the PostgreSQL wire protocol manually so that standard tools like `psql` can be used for testing.
 - **Concurrency First**: Implement page-level locking and asynchronous I/O from the start to fully utilize Rust’s safety and performance.
 - **Transparency**: Every layer—from the byte-level storage to the SQL parser—is handwritten to ensure deep understanding.
 
@@ -17,10 +17,10 @@ This project is designed as an intensive learning journey, focusing on core data
 | ------------------- | ---------------------------------- | ----------------------------------------------------------------------------------------- |
 | Language & Runtime  | Rust + Tokio (Async)               | Deep dive into async Rust; suitable for handling concurrent database sessions.            |
 | Protocol            | PostgreSQL v3.0 (Handwritten)      | Support for Extended Query Protocol (Parse/Bind/Execute) to work with modern drivers.     |
-| Storage Unit        | 8KB Fixed-size Pages               | Aligns with OS page sizes and PostgreSQL standards for efficient I/O.                     |
+| Storage Unit        | 8KB Fixed-size Pages               | Aligns with OS page sizes. Intentionally uses the same 8KB as PostgreSQL for learning.   |
 | Storage Abstraction | Trait-based                        | Allows seamless switching between MemoryStorage and FileStorage (Disk).                   |
 | Concurrency Control | Page-level Latching                | High concurrency using Arc<RwLock<Page>>. Requires strict latch hierarchy.                |
-| Transaction Model   | MVCC (Multi-Version)               | PostgreSQL-style xmin/xmax in tuple header. Readers never block writers.                  |
+| Transaction Model   | MVCC (Multi-Version)               | Uses xmin/xmax tuple header fields (matching PostgreSQL's design for learning).           |
 | Isolation Level     | READ COMMITTED only                | Snapshot per statement. REPEATABLE READ/SERIALIZABLE out of scope for simplicity.         |
 | Row-Level Locking   | xmax-based with Deadlock Detection | FOR UPDATE/SHARE via tuple header. Wait-for graph for deadlock detection.                 |
 | Data Layout         | Slotted Page Structure             | Efficiently manages variable-length records within fixed 8KB pages.                       |
@@ -68,7 +68,7 @@ Goal: Manage variable-length records within the 8KB limit and parse SQL into AST
 Goal: Establish MVCC infrastructure with transaction visibility and self-hosted catalog.
 
 8. ✅ MVCC Core: Transaction manager (TxId allocation, active transaction tracking, commit/abort state machine), tuple header extension (xmin/xmax/cid/infomask), Snapshot structure, visibility rules (`HeapTupleSatisfiesMVCC`).
-9. System Catalog: Store table/column definitions as heap tuples with MVCC. Bootstrap reserved catalog tables (pg_class, pg_attribute equivalent). Implement auto-increment sequences for SERIAL columns.
+9. System Catalog: Store table/column definitions as heap tuples with MVCC. Bootstrap reserved catalog tables (sys_tables, sys_columns - similar concepts to PostgreSQL's pg_class/pg_attribute). Implement auto-increment sequences for SERIAL columns.
 
 ### Month 5: Query Execution
 

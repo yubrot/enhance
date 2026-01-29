@@ -9,7 +9,7 @@ pub mod header;
 pub use data::PageData;
 pub use header::{PAGE_HEADER_SIZE, PAGE_VERSION, PageHeader, PageType};
 
-/// 8KB page size (aligned with OS page size and PostgreSQL standard).
+/// 8KB page size (aligned with OS page size; intentionally using PostgreSQL's page size for learning).
 pub const PAGE_SIZE: usize = 8192;
 
 /// Unique identifier for a page within the storage system.
