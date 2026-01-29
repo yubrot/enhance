@@ -228,21 +228,72 @@ LINE 1: SELECT FROM "users";
 async fn test_psql_complex_select() {
     let server = PsqlTestServer::start().await;
 
-    // Test that complex SELECT statements parse correctly
+    // ORDER BY and LIMIT are not yet supported (Step 12)
+    // Test that we correctly report unsupported features
     let result = server.run_psql(
         "SELECT id, name, age FROM users WHERE active = TRUE AND age >= 18 ORDER BY name ASC LIMIT 10;",
     );
-    // psql shows "(0 rows)" for empty result sets
-    result.assert_success();
-    result.assert_output_contains("(0 rows)");
+    result.assert_output_contains("unsupported feature: ORDER BY");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_psql_comments() {
     let server = PsqlTestServer::start().await;
 
-    // Test that SQL comments are handled correctly
+    // Test that SQL comments are parsed correctly.
+    // Note: SELECT without FROM is not supported (we require a table).
     let result = server.run_psql("SELECT 1 /* this is a comment */ + 2; -- line comment");
+    result.assert_output_contains("unsupported feature: SELECT without FROM");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_basic_select() {
+    let server = PsqlTestServer::start().await;
+
+    // Create a table and select from it
+    let result = server.run_psql("CREATE TABLE test_select (id INTEGER, name TEXT);");
+    result.assert_success();
+    result.assert_output_contains("CREATE TABLE");
+
+    // SELECT * from empty table should return 0 rows
+    let result = server.run_psql("SELECT * FROM test_select;");
     result.assert_success();
     result.assert_output_contains("(0 rows)");
+
+    // SELECT with WHERE clause from empty table
+    let result = server.run_psql("SELECT id, name FROM test_select WHERE id > 0;");
+    result.assert_success();
+    result.assert_output_contains("(0 rows)");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_select_from_catalog() {
+    let server = PsqlTestServer::start().await;
+
+    // Select from system catalog table
+    let result = server.run_psql("SELECT * FROM sys_tables;");
+    result.assert_success();
+    // Should show the 3 system catalog tables
+    result.assert_output_contains("sys_tables");
+    result.assert_output_contains("sys_columns");
+    result.assert_output_contains("sys_sequences");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_explain() {
+    let server = PsqlTestServer::start().await;
+
+    // Create a table and EXPLAIN a query
+    let result = server.run_psql("CREATE TABLE test_explain (id INTEGER, name TEXT);");
+    result.assert_success();
+
+    let result = server.run_psql("EXPLAIN SELECT * FROM test_explain;");
+    result.assert_success();
+    result.assert_output_contains("Seq Scan on test_explain");
+
+    // EXPLAIN with WHERE clause shows Filter
+    let result = server.run_psql("EXPLAIN SELECT * FROM test_explain WHERE id > 5;");
+    result.assert_success();
+    result.assert_output_contains("Filter");
+    result.assert_output_contains("Seq Scan on test_explain");
 }

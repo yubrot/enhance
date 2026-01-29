@@ -1,4 +1,5 @@
 use crate::catalog::CatalogError;
+use crate::executor::ExecutorError;
 use crate::protocol::ProtocolError;
 use crate::tx::TxError;
 
@@ -9,6 +10,7 @@ pub enum ConnectionError {
     Protocol(ProtocolError),
     Transaction(TxError),
     Catalog(CatalogError),
+    Executor(ExecutorError),
 }
 
 impl std::fmt::Display for ConnectionError {
@@ -18,6 +20,7 @@ impl std::fmt::Display for ConnectionError {
             ConnectionError::Protocol(e) => write!(f, "Protocol error: {}", e),
             ConnectionError::Transaction(e) => write!(f, "Transaction error: {}", e),
             ConnectionError::Catalog(e) => write!(f, "Catalog error: {}", e),
+            ConnectionError::Executor(e) => write!(f, "Executor error: {}", e),
         }
     }
 }
@@ -45,5 +48,11 @@ impl From<TxError> for ConnectionError {
 impl From<CatalogError> for ConnectionError {
     fn from(e: CatalogError) -> Self {
         ConnectionError::Catalog(e)
+    }
+}
+
+impl From<ExecutorError> for ConnectionError {
+    fn from(e: ExecutorError) -> Self {
+        ConnectionError::Executor(e)
     }
 }

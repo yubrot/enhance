@@ -11,10 +11,12 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::Database;
+use crate::executor::plan_select;
+use crate::heap::Value;
 use crate::protocol::{
-    BackendMessage, BindMessage, CloseMessage, CloseTarget, DescribeMessage, DescribeTarget,
-    ErrorInfo, ExecuteMessage, FrontendMessage, ParseMessage, PostgresCodec, TransactionStatus,
-    sql_state,
+    BackendMessage, BindMessage, CloseMessage, CloseTarget, DataValue, DescribeMessage,
+    DescribeTarget, ErrorInfo, ExecuteMessage, FieldDescription, FormatCode, FrontendMessage,
+    ParseMessage, PostgresCodec, TransactionStatus, sql_state,
 };
 use crate::sql::{Parser, Statement};
 use crate::storage::{Replacer, Storage};
@@ -40,7 +42,7 @@ pub struct Connection<S: Storage, R: Replacer> {
     database: Arc<Database<S, R>>,
 }
 
-impl<S: Storage, R: Replacer> Connection<S, R> {
+impl<S: Storage + 'static, R: Replacer + 'static> Connection<S, R> {
     pub fn new(
         framed: Framed<TcpStream, PostgresCodec>,
         pid: i32,
@@ -54,15 +56,13 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
         }
     }
 
-    /// Returns the command completion tag for a statement.
-    ///
-    /// NOTE: Row counts are stubbed to 0 for now. Real execution comes in later steps.
-    fn command_tag(stmt: &Statement) -> String {
+    /// Returns the command completion tag for a statement with row count.
+    fn command_tag(stmt: &Statement, row_count: u64) -> String {
         match stmt {
-            Statement::Select(_) => "SELECT 0".to_string(),
-            Statement::Insert(_) => "INSERT 0 0".to_string(),
-            Statement::Update(_) => "UPDATE 0".to_string(),
-            Statement::Delete(_) => "DELETE 0".to_string(),
+            Statement::Select(_) => format!("SELECT {}", row_count),
+            Statement::Insert(_) => format!("INSERT 0 {}", row_count),
+            Statement::Update(_) => format!("UPDATE {}", row_count),
+            Statement::Delete(_) => format!("DELETE {}", row_count),
             Statement::CreateTable(_) => "CREATE TABLE".to_string(),
             Statement::DropTable(_) => "DROP TABLE".to_string(),
             Statement::CreateIndex(_) => "CREATE INDEX".to_string(),
@@ -71,7 +71,7 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
             Statement::Commit => "COMMIT".to_string(),
             Statement::Rollback => "ROLLBACK".to_string(),
             Statement::Set(_) => "SET".to_string(),
-            Statement::Explain(_) => "EXPLAIN".to_string(),
+            Statement::Explain(_) => format!("EXPLAIN {}", row_count),
         }
     }
 
@@ -179,22 +179,17 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
                 }
 
                 // Execute statement
-                if let Err(e) = self.execute_statement(&stmt).await {
-                    let error = ErrorInfo::new(sql_state::INTERNAL_ERROR, e.to_string());
-                    self.framed.send(error.into()).await?;
-                    return self.send_ready_for_query().await;
-                }
+                let row_count = match self.execute_statement(&stmt).await {
+                    Ok(count) => count,
+                    Err(e) => {
+                        let error = ErrorInfo::new(sql_state::INTERNAL_ERROR, e.to_string());
+                        self.framed.send(error.into()).await?;
+                        return self.send_ready_for_query().await;
+                    }
+                };
 
-                // Successfully executed
-                let tag = Self::command_tag(&stmt);
-
-                // For SELECT, send RowDescription before CommandComplete
-                if matches!(stmt, Statement::Select(_)) {
-                    self.framed
-                        .send(BackendMessage::RowDescription { fields: vec![] })
-                        .await?;
-                }
-
+                // Send CommandComplete with row count
+                let tag = Self::command_tag(&stmt, row_count);
                 self.framed
                     .send(BackendMessage::CommandComplete { tag })
                     .await?;
@@ -211,8 +206,16 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
     }
 
     /// Execute a parsed statement.
-    async fn execute_statement(&mut self, stmt: &Statement) -> Result<(), ConnectionError> {
+    ///
+    /// Returns the number of rows affected or returned.
+    async fn execute_statement(&mut self, stmt: &Statement) -> Result<u64, ConnectionError> {
         match stmt {
+            Statement::Select(select_stmt) => {
+                self.execute_select(select_stmt).await
+            }
+            Statement::Explain(inner_stmt) => {
+                self.execute_explain(inner_stmt).await
+            }
             Statement::CreateTable(create_stmt) => {
                 // Get or create transaction for DDL
                 let (txid, cid) = self.get_or_create_transaction();
@@ -239,7 +242,7 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
                         if self.state.transaction().is_none() {
                             self.database.tx_manager().commit(txid)?;
                         }
-                        Ok(())
+                        Ok(0)
                     }
                     Err(e) => {
                         // Abort transaction on error
@@ -252,8 +255,120 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
                 }
             }
             // Other statements are stubbed for now
-            _ => Ok(()),
+            _ => Ok(0),
         }
+    }
+
+    /// Execute a SELECT statement.
+    async fn execute_select(
+        &mut self,
+        select_stmt: &crate::sql::SelectStmt,
+    ) -> Result<u64, ConnectionError> {
+        let (txid, cid) = self.get_or_create_transaction();
+        let snapshot = self.database.tx_manager().snapshot(txid, cid);
+
+        // Plan the query
+        let mut executor = plan_select(
+            select_stmt,
+            snapshot,
+            self.database.catalog(),
+            self.database.pool().clone(),
+            self.database.tx_manager().clone(),
+        )
+        .await
+        .map_err(ConnectionError::Executor)?;
+
+        // Send RowDescription
+        let fields: Vec<FieldDescription> = executor
+            .schema()
+            .iter()
+            .map(|col| FieldDescription {
+                name: col.name.clone(),
+                table_oid: 0,
+                column_id: 0,
+                type_oid: col.type_oid,
+                type_size: type_size(col.type_oid),
+                type_modifier: -1,
+                format_code: FormatCode::Text,
+            })
+            .collect();
+        self.framed
+            .send(BackendMessage::RowDescription { fields })
+            .await?;
+
+        // Stream rows
+        let mut row_count = 0u64;
+        while let Some(tuple) = executor.next().await.map_err(ConnectionError::Executor)? {
+            let values: Vec<DataValue> = tuple.values.iter().map(value_to_data_value).collect();
+            self.framed.send(BackendMessage::DataRow { values }).await?;
+            row_count += 1;
+        }
+
+        // If not in explicit transaction, commit
+        if self.state.transaction().is_none() {
+            self.database.tx_manager().commit(txid)?;
+        }
+
+        Ok(row_count)
+    }
+
+    /// Execute an EXPLAIN statement.
+    async fn execute_explain(&mut self, inner_stmt: &Statement) -> Result<u64, ConnectionError> {
+        let (txid, cid) = self.get_or_create_transaction();
+        let snapshot = self.database.tx_manager().snapshot(txid, cid);
+
+        // Get the plan text based on the inner statement
+        let plan_text = match inner_stmt {
+            Statement::Select(select_stmt) => {
+                let executor = plan_select(
+                    select_stmt,
+                    snapshot,
+                    self.database.catalog(),
+                    self.database.pool().clone(),
+                    self.database.tx_manager().clone(),
+                )
+                .await
+                .map_err(ConnectionError::Executor)?;
+                executor.explain(0)
+            }
+            _ => {
+                // For non-SELECT statements, just return a placeholder
+                format!("{:?}", inner_stmt)
+            }
+        };
+
+        // Send RowDescription for EXPLAIN (single TEXT column)
+        self.framed
+            .send(BackendMessage::RowDescription {
+                fields: vec![FieldDescription {
+                    name: "QUERY PLAN".to_string(),
+                    table_oid: 0,
+                    column_id: 0,
+                    type_oid: crate::protocol::type_oid::TEXT,
+                    type_size: -1,
+                    type_modifier: -1,
+                    format_code: FormatCode::Text,
+                }],
+            })
+            .await?;
+
+        // Send each line as a separate row
+        let lines: Vec<&str> = plan_text.lines().collect();
+        let row_count = lines.len() as u64;
+        for line in lines {
+            self.framed
+                .send(BackendMessage::DataRow {
+                    values: vec![DataValue::Binary(line.as_bytes().to_vec())],
+                })
+                .await?;
+        }
+
+        // If not in explicit transaction, commit
+        if self.state.transaction().is_none() {
+            self.database.tx_manager().commit(txid)?;
+        }
+
+        Ok(row_count)
     }
 
     /// Get the current transaction or create a new one for auto-commit mode.
@@ -406,12 +521,15 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
         let ast = stmt.ast.clone();
 
         // Execute the statement
-        if let Err(e) = self.execute_statement(&ast).await {
-            let error = ErrorInfo::new(sql_state::INTERNAL_ERROR, e.to_string());
-            return self.send_error(error, true).await;
-        }
+        let row_count = match self.execute_statement(&ast).await {
+            Ok(count) => count,
+            Err(e) => {
+                let error = ErrorInfo::new(sql_state::INTERNAL_ERROR, e.to_string());
+                return self.send_error(error, true).await;
+            }
+        };
 
-        let tag = Self::command_tag(&ast);
+        let tag = Self::command_tag(&ast, row_count);
         self.framed
             .send(BackendMessage::CommandComplete { tag })
             .await?;
@@ -476,5 +594,43 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
         self.framed.send(message).await?;
         self.framed.flush().await?;
         Ok(())
+    }
+}
+
+/// Converts a heap::Value to a protocol DataValue (text format).
+fn value_to_data_value(val: &Value) -> DataValue {
+    match val {
+        Value::Null => DataValue::Null,
+        Value::Boolean(b) => {
+            let s = if *b { "t" } else { "f" };
+            DataValue::Binary(s.as_bytes().to_vec())
+        }
+        Value::Int16(n) => DataValue::Binary(n.to_string().into_bytes()),
+        Value::Int32(n) => DataValue::Binary(n.to_string().into_bytes()),
+        Value::Int64(n) => DataValue::Binary(n.to_string().into_bytes()),
+        Value::Float32(n) => DataValue::Binary(n.to_string().into_bytes()),
+        Value::Float64(n) => DataValue::Binary(n.to_string().into_bytes()),
+        Value::Text(s) => DataValue::Binary(s.as_bytes().to_vec()),
+        Value::Bytea(b) => {
+            // Encode as PostgreSQL bytea hex format: \x followed by hex digits
+            let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
+            DataValue::Binary(format!("\\x{}", hex).into_bytes())
+        }
+    }
+}
+
+/// Returns the type size for a given type OID.
+///
+/// Returns -1 for variable-length types, or the fixed size for fixed-size types.
+fn type_size(type_oid: i32) -> i16 {
+    use crate::protocol::type_oid::*;
+    match type_oid {
+        BOOL => 1,
+        INT2 => 2,
+        INT4 => 4,
+        INT8 => 8,
+        FLOAT4 => 4,
+        FLOAT8 => 8,
+        _ => -1, // Variable length (TEXT, BYTEA, etc.)
     }
 }

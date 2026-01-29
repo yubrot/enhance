@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.92"
 
 [dependencies]
+async-trait = "0.1"
 bytes = "1"
 futures-util = { version = "0.3", features = ["sink"] }
 parking_lot = "0.12"
