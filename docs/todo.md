@@ -8,7 +8,6 @@ This document evaluates remaining roadmap items from the perspective of Agentic 
 
 | # | Item | Difficulty | Rationale |
 |---|------|:----------:|-----------|
-| 11 | **DML Operations** | 3 | Setting xmin/xmax correctly. Relatively straightforward if MVCC Core is correct |
 | 12 | **Sort & Aggregation** | 2 | Standard algorithms. In-memory sort is simple. Aggregate functions are well-defined |
 | 13 | **Write-Ahead Log** | 4 | Strict write-ahead principle. Coordination with Buffer Pool. fsync timing |
 | 14 | **Checkpoint & Recovery** | **5** | Dirty page concurrency during checkpoint. Correct REDO replay ordering. Crash recovery testing is difficult |
