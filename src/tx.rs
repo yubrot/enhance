@@ -1,9 +1,16 @@
-//! Transaction management and MVCC (Multi-Version Concurrency Control) infrastructure.
+//! Transaction management and MVCC (Multi-Version Concurrency Control).
 //!
-//! This module implements the core components for MVCC:
-//! - Transaction ID allocation and lifecycle management ([`TransactionManager`])
-//! - Tuple headers with xmin/xmax for versioning ([`TupleHeader`])
-//! - Snapshot isolation for consistent reads ([`Snapshot`])
+//! This module implements the core infrastructure for MVCC, providing
+//! transaction isolation through tuple versioning and snapshot-based visibility.
+//!
+//! ## Terminology
+//!
+//! - **TxId**: Transaction identifier assigned at BEGIN
+//! - **CommandId**: Per-statement counter within a transaction
+//! - **Infomask**: Bit flags for tuple state (committed, aborted, etc.)
+//! - **TupleHeader**: MVCC metadata (xmin/xmax/cid/infomask) attached to each tuple
+//! - **Snapshot**: Point-in-time view of active transactions for visibility checks
+//! - **TransactionManager**: Allocates TxIds and tracks transaction states
 
 pub mod error;
 pub mod manager;
