@@ -1,13 +1,35 @@
 //! System catalog for table and column metadata.
 //!
-//! The catalog stores metadata about tables, columns, and sequences in
-//! self-hosted heap tables with MVCC support.
+//! This module manages metadata about tables, columns, and sequences
+//! in self-hosted heap tables with MVCC support.
+//!
+//! # Architecture
+//!
+//! ```text
+//! Page 0          Heap Pages
+//! +------------+  +-------------+  +---------------+  +----------------+
+//! | Superblock |  | sys_tables  |  | sys_columns   |  | sys_sequences  |
+//! +------------+  +-------------+  +---------------+  +----------------+
+//!       |               |                 |                   |
+//!       |               v                 v                   v
+//!       |         [ TableInfo ]    [ ColumnInfo ]     [ SequenceInfo ]
+//!       |
+//!       +-> Catalog Page IDs + ID Generators
+//! ```
 //!
 //! ## Catalog Tables
 //!
-//! - `sys_tables`: Table metadata (table_id, table_name, first_page)
-//! - `sys_columns`: Column metadata (table_id, column_num, column_name, type_oid, seq_id)
-//! - `sys_sequences`: Sequence metadata for SERIAL columns (seq_id, seq_name, next_val)
+//! | Table Name      | Rust Type        | Description                     |
+//! |-----------------|------------------|---------------------------------|
+//! | `sys_tables`    | [`TableInfo`]    | Table metadata (id, name, page) |
+//! | `sys_columns`   | [`ColumnInfo`]   | Column metadata per table       |
+//! | `sys_sequences` | [`SequenceInfo`] | SERIAL column sequences         |
+//!
+//! ## Components
+//!
+//! - [`Catalog`]: Main entry point for catalog operations (create table, lookups)
+//! - [`Superblock`]: Database metadata stored in page 0 (page IDs, ID generators)
+//! - [`TableInfo`], [`ColumnInfo`], [`SequenceInfo`]: Typed wrappers for catalog rows
 //!
 //! ## Bootstrap
 //!
@@ -21,13 +43,13 @@
 //! The catalog is accessed through the [`Database`](crate::db::Database) type,
 //! which orchestrates the buffer pool, transaction manager, and catalog.
 
-mod cache;
+mod cached;
 mod core;
 mod error;
 mod schema;
 mod superblock;
 
-pub use self::core::Catalog;
+pub use self::cached::Catalog;
 pub use error::CatalogError;
-pub use schema::{ColumnInfo, SequenceInfo, TableInfo, LAST_RESERVED_TABLE_ID};
-pub use superblock::{Superblock, SUPERBLOCK_MAGIC, SUPERBLOCK_SIZE, SUPERBLOCK_VERSION};
+pub use schema::{ColumnInfo, LAST_RESERVED_TABLE_ID, SequenceInfo, TableInfo};
+pub use superblock::Superblock;
