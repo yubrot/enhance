@@ -200,6 +200,13 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
         self.inner.frames.len()
     }
 
+    /// Returns the total number of pages in storage.
+    ///
+    /// This queries the underlying storage to get the count of allocated pages.
+    pub async fn page_count(&self) -> usize {
+        self.inner.storage.page_count().await
+    }
+
     /// Fetches a page for reading.
     ///
     /// Returns a guard that holds a pin on the page, preventing eviction
