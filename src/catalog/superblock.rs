@@ -3,16 +3,14 @@
 //! The superblock occupies page 0 and contains metadata about the database,
 //! including pointers to catalog tables and ID generators.
 
+use super::error::CatalogError;
 use crate::storage::PageId;
 
 /// Magic number for the enhance database format ("ENHN" in hex).
-pub const SUPERBLOCK_MAGIC: u32 = 0x454E_484E;
+const MAGIC: u32 = 0x454E_484E;
 
 /// Current superblock format version.
-pub const SUPERBLOCK_VERSION: u32 = 1;
-
-/// Size of the superblock data in bytes.
-pub const SUPERBLOCK_SIZE: usize = 48;
+const VERSION: u32 = 1;
 
 /// Superblock containing database metadata.
 ///
@@ -44,13 +42,16 @@ pub struct Superblock {
 }
 
 impl Superblock {
+    /// Size of the superblock data in bytes.
+    pub const SIZE: usize = 48;
+
     /// Creates a new superblock with default values.
     ///
     /// The catalog page IDs must be set after allocating pages.
     pub fn new() -> Self {
         Self {
-            magic: SUPERBLOCK_MAGIC,
-            version: SUPERBLOCK_VERSION,
+            magic: MAGIC,
+            version: VERSION,
             sys_tables_page: PageId::new(0),
             sys_columns_page: PageId::new(0),
             sys_sequences_page: PageId::new(0),
@@ -63,13 +64,13 @@ impl Superblock {
     ///
     /// # Panics
     ///
-    /// Panics if the buffer is smaller than `SUPERBLOCK_SIZE`.
+    /// Panics if the buffer is smaller than [`Self::SIZE`].
     pub fn read(buf: &[u8]) -> Self {
         assert!(
-            buf.len() >= SUPERBLOCK_SIZE,
+            buf.len() >= Self::SIZE,
             "buffer too small for superblock: {} < {}",
             buf.len(),
-            SUPERBLOCK_SIZE
+            Self::SIZE
         );
 
         let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -101,13 +102,13 @@ impl Superblock {
     ///
     /// # Panics
     ///
-    /// Panics if the buffer is smaller than `SUPERBLOCK_SIZE`.
+    /// Panics if the buffer is smaller than [`Self::SIZE`].
     pub fn write(&self, buf: &mut [u8]) {
         assert!(
-            buf.len() >= SUPERBLOCK_SIZE,
+            buf.len() >= Self::SIZE,
             "buffer too small for superblock: {} < {}",
             buf.len(),
-            SUPERBLOCK_SIZE
+            Self::SIZE
         );
 
         buf[0..4].copy_from_slice(&self.magic.to_le_bytes());
@@ -123,16 +124,16 @@ impl Superblock {
     /// Validates the superblock magic and version.
     ///
     /// Returns `Ok(())` if valid, otherwise returns an error describing the issue.
-    pub fn validate(&self) -> Result<(), SuperblockValidationError> {
-        if self.magic != SUPERBLOCK_MAGIC {
-            return Err(SuperblockValidationError::InvalidMagic {
-                expected: SUPERBLOCK_MAGIC,
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        if self.magic != MAGIC {
+            return Err(CatalogError::InvalidMagic {
+                expected: MAGIC,
                 found: self.magic,
             });
         }
-        if self.version != SUPERBLOCK_VERSION {
-            return Err(SuperblockValidationError::UnsupportedVersion {
-                expected: SUPERBLOCK_VERSION,
+        if self.version != VERSION {
+            return Err(CatalogError::UnsupportedVersion {
+                expected: VERSION,
                 found: self.version,
             });
         }
@@ -160,38 +161,6 @@ impl Default for Superblock {
     }
 }
 
-/// Errors that can occur during superblock validation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SuperblockValidationError {
-    /// Invalid magic number.
-    InvalidMagic { expected: u32, found: u32 },
-    /// Unsupported version.
-    UnsupportedVersion { expected: u32, found: u32 },
-}
-
-impl std::fmt::Display for SuperblockValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SuperblockValidationError::InvalidMagic { expected, found } => {
-                write!(
-                    f,
-                    "invalid superblock magic: expected 0x{:08X}, found 0x{:08X}",
-                    expected, found
-                )
-            }
-            SuperblockValidationError::UnsupportedVersion { expected, found } => {
-                write!(
-                    f,
-                    "unsupported superblock version: expected {}, found {}",
-                    expected, found
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for SuperblockValidationError {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,8 +168,8 @@ mod tests {
     #[test]
     fn test_superblock_new() {
         let sb = Superblock::new();
-        assert_eq!(sb.magic, SUPERBLOCK_MAGIC);
-        assert_eq!(sb.version, SUPERBLOCK_VERSION);
+        assert_eq!(sb.magic, MAGIC);
+        assert_eq!(sb.version, VERSION);
         assert_eq!(sb.sys_tables_page, PageId::new(0));
         assert_eq!(sb.sys_columns_page, PageId::new(0));
         assert_eq!(sb.sys_sequences_page, PageId::new(0));
@@ -217,7 +186,7 @@ mod tests {
         sb.next_table_id = 100;
         sb.next_seq_id = 50;
 
-        let mut buf = vec![0u8; SUPERBLOCK_SIZE];
+        let mut buf = vec![0u8; Superblock::SIZE];
         sb.write(&mut buf);
 
         let sb2 = Superblock::read(&buf);
@@ -233,14 +202,14 @@ mod tests {
         bad_magic.magic = 0xDEADBEEF;
         assert!(matches!(
             bad_magic.validate(),
-            Err(SuperblockValidationError::InvalidMagic { .. })
+            Err(CatalogError::InvalidMagic { .. })
         ));
 
         let mut bad_version = Superblock::new();
         bad_version.version = 99;
         assert!(matches!(
             bad_version.validate(),
-            Err(SuperblockValidationError::UnsupportedVersion { .. })
+            Err(CatalogError::UnsupportedVersion { .. })
         ));
     }
 
