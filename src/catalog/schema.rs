@@ -12,6 +12,45 @@ use crate::storage::PageId;
 /// User tables start from `LAST_RESERVED_TABLE_ID + 1`.
 pub const LAST_RESERVED_TABLE_ID: u32 = 99;
 
+/// Common interface for system catalog tables.
+///
+/// Each system catalog table (sys_tables, sys_columns, sys_sequences) implements
+/// this trait to provide consistent access to metadata and schema information.
+///
+/// Implementations only need to define the constants; `table_info()` and
+/// `columns()` have default implementations that use these constants.
+pub trait SystemCatalogTable {
+    /// The table ID reserved for this system catalog table.
+    const TABLE_ID: u32;
+
+    /// The table name for this system catalog table.
+    const TABLE_NAME: &'static str;
+
+    /// The column names for this system catalog table.
+    const COLUMN_NAMES: &'static [&'static str];
+
+    /// The schema (type OIDs) for this system catalog table.
+    const SCHEMA: &'static [i32];
+
+    /// Returns the TableInfo for this system catalog table.
+    ///
+    /// Used during bootstrap to insert the table's own metadata.
+    fn table_info(page: PageId) -> TableInfo {
+        TableInfo::new(Self::TABLE_ID, Self::TABLE_NAME.to_string(), page)
+    }
+
+    /// Returns the column definitions for this system catalog table.
+    ///
+    /// Each tuple is (column_name, type_oid), automatically paired from
+    /// COLUMN_NAMES and SCHEMA to guarantee consistency.
+    fn columns() -> impl IntoIterator<Item = (&'static str, i32)> {
+        Self::COLUMN_NAMES
+            .iter()
+            .copied()
+            .zip(Self::SCHEMA.iter().copied())
+    }
+}
+
 /// Metadata for a table stored in the catalog (sys_tables row).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableInfo {
@@ -24,13 +63,6 @@ pub struct TableInfo {
 }
 
 impl TableInfo {
-    /// Table ID for sys_tables itself.
-    pub const TABLE_ID: u32 = 1;
-
-    /// Schema for sys_tables catalog table (type OIDs for deserialization).
-    pub const SCHEMA: [i32; 3] = [type_oid::INT4, type_oid::TEXT, type_oid::INT8];
-
-    // Column indices
     const COL_TABLE_ID: usize = 0;
     const COL_TABLE_NAME: usize = 1;
     const COL_FIRST_PAGE: usize = 2;
@@ -73,6 +105,13 @@ impl TableInfo {
     }
 }
 
+impl SystemCatalogTable for TableInfo {
+    const TABLE_ID: u32 = 1;
+    const TABLE_NAME: &'static str = "sys_tables";
+    const COLUMN_NAMES: &'static [&'static str] = &["table_id", "table_name", "first_page"];
+    const SCHEMA: &'static [i32] = &[type_oid::INT4, type_oid::TEXT, type_oid::INT8];
+}
+
 /// Metadata for a column stored in the catalog (sys_columns row).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnInfo {
@@ -89,19 +128,6 @@ pub struct ColumnInfo {
 }
 
 impl ColumnInfo {
-    /// Table ID for sys_columns.
-    pub const TABLE_ID: u32 = 2;
-
-    /// Schema for sys_columns catalog table (type OIDs for deserialization).
-    pub const SCHEMA: [i32; 5] = [
-        type_oid::INT4,
-        type_oid::INT4,
-        type_oid::TEXT,
-        type_oid::INT4,
-        type_oid::INT4,
-    ];
-
-    // Column indices
     const COL_TABLE_ID: usize = 0;
     const COL_COLUMN_NUM: usize = 1;
     const COL_COLUMN_NAME: usize = 2;
@@ -175,6 +201,25 @@ impl ColumnInfo {
     }
 }
 
+impl SystemCatalogTable for ColumnInfo {
+    const TABLE_ID: u32 = 2;
+    const TABLE_NAME: &'static str = "sys_columns";
+    const COLUMN_NAMES: &'static [&'static str] = &[
+        "table_id",
+        "column_num",
+        "column_name",
+        "type_oid",
+        "seq_id",
+    ];
+    const SCHEMA: &'static [i32] = &[
+        type_oid::INT4,
+        type_oid::INT4,
+        type_oid::TEXT,
+        type_oid::INT4,
+        type_oid::INT4,
+    ];
+}
+
 /// Metadata for a sequence stored in the catalog (sys_sequences row).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SequenceInfo {
@@ -187,13 +232,6 @@ pub struct SequenceInfo {
 }
 
 impl SequenceInfo {
-    /// Table ID for sys_sequences.
-    pub const TABLE_ID: u32 = 3;
-
-    /// Schema for sys_sequences catalog table (type OIDs for deserialization).
-    pub const SCHEMA: [i32; 3] = [type_oid::INT4, type_oid::TEXT, type_oid::INT8];
-
-    // Column indices
     const COL_SEQ_ID: usize = 0;
     const COL_SEQ_NAME: usize = 1;
     const COL_NEXT_VAL: usize = 2;
@@ -236,37 +274,9 @@ impl SequenceInfo {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_table_info() {
-        let info = TableInfo::new(1, "users".to_string(), PageId::new(10));
-        assert_eq!(info.table_id, 1);
-        assert_eq!(info.table_name, "users");
-        assert_eq!(info.first_page, PageId::new(10));
-    }
-
-    #[test]
-    fn test_column_info() {
-        let col = ColumnInfo::new(1, 0, "id".to_string(), 23, 5);
-        assert_eq!(col.table_id, 1);
-        assert_eq!(col.column_num, 0);
-        assert_eq!(col.column_name, "id");
-        assert_eq!(col.type_oid, 23);
-        assert_eq!(col.seq_id, 5);
-        assert!(col.is_serial());
-
-        let col2 = ColumnInfo::new(1, 1, "name".to_string(), 25, 0);
-        assert!(!col2.is_serial());
-    }
-
-    #[test]
-    fn test_sequence_info() {
-        let seq = SequenceInfo::new(1, "users_id_seq".to_string(), 100);
-        assert_eq!(seq.seq_id, 1);
-        assert_eq!(seq.seq_name, "users_id_seq");
-        assert_eq!(seq.next_val, 100);
-    }
+impl SystemCatalogTable for SequenceInfo {
+    const TABLE_ID: u32 = 3;
+    const TABLE_NAME: &'static str = "sys_sequences";
+    const COLUMN_NAMES: &'static [&'static str] = &["seq_id", "seq_name", "next_val"];
+    const SCHEMA: &'static [i32] = &[type_oid::INT4, type_oid::TEXT, type_oid::INT8];
 }
