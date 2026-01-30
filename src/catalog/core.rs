@@ -278,8 +278,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
 
         let mut guard = self.pool.fetch_page_mut(sys_sequences_page).await?;
         let mut page = HeapPage::new(guard.data_mut());
-        page.insert(&seq.to_record(), txid, cid)
-            .map_err(|_| CatalogError::PageFull)?;
+        page.insert(&seq.to_record(), txid, cid)?;
 
         Ok(seq_id)
     }
@@ -299,9 +298,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
 
         let mut guard = self.pool.fetch_page_mut(sys_tables_page).await?;
         let mut page = HeapPage::new(guard.data_mut());
-        let slot_id = page
-            .insert(&table.to_record(), txid, cid)
-            .map_err(|_| CatalogError::PageFull)?;
+        let slot_id = page.insert(&table.to_record(), txid, cid)?;
 
         Ok(slot_id)
     }
@@ -317,9 +314,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
 
         let mut guard = self.pool.fetch_page_mut(sys_columns_page).await?;
         let mut page = HeapPage::new(guard.data_mut());
-        let slot_id = page
-            .insert(&col.to_record(), txid, cid)
-            .map_err(|_| CatalogError::PageFull)?;
+        let slot_id = page.insert(&col.to_record(), txid, cid)?;
 
         Ok(slot_id)
     }

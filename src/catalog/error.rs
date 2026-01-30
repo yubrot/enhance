@@ -1,6 +1,6 @@
 //! Catalog-specific errors.
 
-use crate::heap::{HeapError, SerializationError};
+use crate::heap::HeapError;
 use crate::storage::BufferPoolError;
 
 /// Errors that can occur during catalog operations.
@@ -15,23 +15,14 @@ pub enum CatalogError {
     /// Table already exists.
     TableAlreadyExists { name: String },
 
-    /// Table not found.
-    TableNotFound { name: String },
-
     /// Sequence not found.
     SequenceNotFound { seq_id: u32 },
 
-    /// Page is full, cannot insert more tuples.
-    PageFull,
-
-    /// Invalid data type for catalog column.
-    InvalidDataType { name: String },
-
-    /// Buffer pool error.
+    /// Internal buffer pool error.
     BufferPool(BufferPoolError),
 
-    /// Record serialization error.
-    Serialization(SerializationError),
+    /// Internal heap error.
+    Heap(HeapError),
 }
 
 impl std::fmt::Display for CatalogError {
@@ -54,20 +45,11 @@ impl std::fmt::Display for CatalogError {
             CatalogError::TableAlreadyExists { name } => {
                 write!(f, "table \"{}\" already exists", name)
             }
-            CatalogError::TableNotFound { name } => {
-                write!(f, "table \"{}\" does not exist", name)
-            }
             CatalogError::SequenceNotFound { seq_id } => {
                 write!(f, "sequence {} not found", seq_id)
             }
-            CatalogError::PageFull => {
-                write!(f, "catalog page is full")
-            }
-            CatalogError::InvalidDataType { name } => {
-                write!(f, "invalid data type: {}", name)
-            }
             CatalogError::BufferPool(e) => write!(f, "buffer pool error: {}", e),
-            CatalogError::Serialization(e) => write!(f, "serialization error: {}", e),
+            CatalogError::Heap(e) => write!(f, "heap error: {}", e),
         }
     }
 }
@@ -76,7 +58,7 @@ impl std::error::Error for CatalogError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             CatalogError::BufferPool(e) => Some(e),
-            CatalogError::Serialization(e) => Some(e),
+            CatalogError::Heap(e) => Some(e),
             _ => None,
         }
     }
@@ -88,18 +70,8 @@ impl From<BufferPoolError> for CatalogError {
     }
 }
 
-impl From<SerializationError> for CatalogError {
-    fn from(e: SerializationError) -> Self {
-        CatalogError::Serialization(e)
-    }
-}
-
 impl From<HeapError> for CatalogError {
     fn from(e: HeapError) -> Self {
-        match e {
-            HeapError::PageFull { .. } => CatalogError::PageFull,
-            HeapError::SlotNotFound(_) => CatalogError::PageFull, // Treat as page full for simplicity
-            HeapError::Serialization(se) => CatalogError::Serialization(se),
-        }
+        CatalogError::Heap(e)
     }
 }
