@@ -9,6 +9,9 @@ use std::sync::Arc;
 
 use super::Database;
 use super::error::DatabaseError;
+use crate::executor::{explain_plan, ColumnDesc, ExecutionContext, Executor, Planner};
+use crate::heap::{Record, Value};
+use crate::protocol::type_oid;
 use crate::sql::{Parser, Statement};
 use crate::storage::{Replacer, Storage};
 use crate::tx::{CommandId, TxId};
@@ -21,8 +24,13 @@ pub enum QueryResult {
         /// Command completion tag (e.g., "CREATE TABLE", "INSERT 0 1").
         tag: String,
     },
-    // NOTE: Rows variant will be added in Step 10 (Basic Executor) for SELECT results.
-    // Rows { columns: Vec<ColumnDesc>, rows: Vec<Row> }
+    /// Rows returned from a query (SELECT).
+    Rows {
+        /// Column metadata.
+        columns: Vec<ColumnDesc>,
+        /// Row data.
+        rows: Vec<Record>,
+    },
 }
 
 /// Transaction state for a session.
@@ -176,11 +184,23 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 })
                 .await
             }
-            // NOTE: Other statements are stubbed for now.
-            // They will use within_transaction when implemented in future steps.
-            Statement::Select(_) => Ok(QueryResult::Command {
-                tag: "SELECT 0".to_string(),
-            }),
+            Statement::Select(select_stmt) => {
+                self.within_transaction(|db, txid, cid| async move {
+                    let snapshot = db.tx_manager().snapshot(txid, cid);
+                    let planner = Planner::new(db.clone(), &snapshot);
+                    let plan = planner.plan_select(select_stmt).await?;
+
+                    let columns: Vec<ColumnDesc> = plan.output_columns().to_vec();
+                    let ctx = ExecutionContext::new(db.clone(), snapshot);
+                    let executor = Executor::from_plan(plan, ctx);
+                    let tuples = executor.collect().await?;
+
+                    let rows: Vec<Record> = tuples.into_iter().map(|t| t.record).collect();
+
+                    Ok(QueryResult::Rows { columns, rows })
+                })
+                .await
+            }
             Statement::Insert(_) => Ok(QueryResult::Command {
                 tag: "INSERT 0 0".to_string(),
             }),
@@ -202,9 +222,33 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::Set(_) => Ok(QueryResult::Command {
                 tag: "SET".to_string(),
             }),
-            Statement::Explain(_) => Ok(QueryResult::Command {
-                tag: "EXPLAIN".to_string(),
-            }),
+            Statement::Explain(inner_stmt) => {
+                // EXPLAIN only supports SELECT for now
+                match inner_stmt.as_ref() {
+                    Statement::Select(select_stmt) => {
+                        self.within_transaction(|db, txid, cid| async move {
+                            let snapshot = db.tx_manager().snapshot(txid, cid);
+                            let planner = Planner::new(db.clone(), &snapshot);
+                            let plan = planner.plan_select(select_stmt).await?;
+
+                            let explain_text = explain_plan(&plan);
+
+                            // Return EXPLAIN output as a single-column result
+                            let columns = vec![ColumnDesc::new("QUERY PLAN", type_oid::TEXT)];
+                            let rows: Vec<Record> = explain_text
+                                .lines()
+                                .map(|line| Record::new(vec![Value::Text(line.to_string())]))
+                                .collect();
+
+                            Ok(QueryResult::Rows { columns, rows })
+                        })
+                        .await
+                    }
+                    _ => Ok(QueryResult::Command {
+                        tag: "EXPLAIN".to_string(),
+                    }),
+                }
+            }
         }
     }
 
