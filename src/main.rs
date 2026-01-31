@@ -1,4 +1,7 @@
+use enhance::db::Database;
 use enhance::server::Server;
+use enhance::storage::MemoryStorage;
+use tokio::net::TcpListener;
 
 // NOTE: Production improvements needed:
 // - Use clap or similar for CLI argument parsing (--host, --port, --config)
@@ -7,15 +10,30 @@ use enhance::server::Server;
 // - Set up signal handlers for graceful shutdown
 // - Daemonization support for background operation
 // - PID file management for process supervision
+// - Support for FileStorage with configurable data directory
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // NOTE: Production would read from config or environment variables
     let addr = "127.0.0.1:15432";
+    let pool_size = 1000;
+
     println!("enhance: A From-Scratch RDBMS Implementation");
     println!("Starting on {}", addr);
 
-    let server = Server::bind(addr).await?;
+    // Initialize storage
+    // NOTE: For production, use FileStorage for persistence:
+    // let storage = FileStorage::open("enhance.db").await?;
+    let storage = MemoryStorage::new();
+
+    // Initialize database (bootstraps catalog if new)
+    let database = Database::open(storage, pool_size).await?;
+
+    // Bind listener
+    let listener = TcpListener::bind(addr).await?;
+
+    // Create and run server
+    let server = Server::new(listener, database);
     server.serve().await?;
 
     Ok(())

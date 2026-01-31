@@ -14,6 +14,13 @@ pub enum HeapError {
     },
     /// Slot not found or already deleted.
     SlotNotFound(u16),
+    /// Record size mismatch for in-place update.
+    RecordSizeMismatch {
+        /// Expected size (existing record).
+        expected: usize,
+        /// Actual size (new record).
+        actual: usize,
+    },
     /// Serialization error.
     Serialization(SerializationError),
 }
@@ -33,6 +40,13 @@ impl fmt::Display for HeapError {
             }
             HeapError::SlotNotFound(slot_id) => {
                 write!(f, "slot {} not found or deleted", slot_id)
+            }
+            HeapError::RecordSizeMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "record size mismatch: expected {} bytes, got {}",
+                    expected, actual
+                )
             }
             HeapError::Serialization(err) => {
                 write!(f, "serialization error: {}", err)

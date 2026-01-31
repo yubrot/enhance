@@ -66,6 +66,12 @@ impl<S: Storage, R: Replacer> PageReadGuard<'_, S, R> {
     }
 }
 
+impl<S: Storage, R: Replacer> AsRef<[u8]> for PageReadGuard<'_, S, R> {
+    fn as_ref(&self) -> &[u8] {
+        self.data()
+    }
+}
+
 impl<S: Storage, R: Replacer> Deref for PageReadGuard<'_, S, R> {
     type Target = [u8];
 
@@ -103,10 +109,9 @@ impl<S: Storage, R: Replacer> Drop for PageReadGuard<'_, S, R> {
 /// let bpm = BufferPool::new(storage, replacer, 10);
 /// let page_id = PageId::new(0);
 ///
-/// let mut guard = bpm.fetch_page_mut(page_id).await?;
+/// let mut guard = bpm.fetch_page_mut(page_id, true).await?;
 /// guard.data_mut()[0] = 42;
-/// guard.mark_dirty();
-/// // Page is unpinned (and marked dirty) when guard goes out of scope
+/// // With auto_dirty=true, page is automatically marked dirty on drop
 /// # Ok(())
 /// # }
 /// ```
@@ -149,6 +154,18 @@ impl<S: Storage, R: Replacer> PageWriteGuard<'_, S, R> {
     /// This must be called after modifying the page data.
     pub fn mark_dirty(&mut self) {
         self.is_dirty = true;
+    }
+}
+
+impl<S: Storage, R: Replacer> AsRef<[u8]> for PageWriteGuard<'_, S, R> {
+    fn as_ref(&self) -> &[u8] {
+        self.data()
+    }
+}
+
+impl<S: Storage, R: Replacer> AsMut<[u8]> for PageWriteGuard<'_, S, R> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.data_mut()
     }
 }
 

@@ -520,6 +520,44 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> HeapPage<T> {
 
         Ok(())
     }
+
+    /// Updates the record data in an existing slot in-place.
+    ///
+    /// This performs a direct overwrite of the record portion (after TupleHeader),
+    /// bypassing MVCC versioning. The new record must have exactly the same
+    /// serialized size as the existing record.
+    ///
+    /// This is used for operations that intentionally bypass MVCC, such as:
+    /// - Sequence updates (nextval) which are never rolled back
+    ///
+    /// The tuple header is NOT modified by this operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HeapError::SlotNotFound` if the slot doesn't exist or is deleted.
+    /// Returns `HeapError::RecordSizeMismatch` if the new record has a different size.
+    pub fn update_record_in_place(
+        &mut self,
+        slot_id: SlotId,
+        record: &Record,
+    ) -> Result<(), HeapError> {
+        let slot_data = self
+            .page
+            .get_mut(slot_id)
+            .ok_or(HeapError::SlotNotFound(slot_id))?;
+
+        let record_data = &mut slot_data[TUPLE_HEADER_SIZE..];
+
+        if record.serialized_size() != record_data.len() {
+            return Err(HeapError::RecordSizeMismatch {
+                expected: record_data.len(),
+                actual: record.serialized_size(),
+            });
+        }
+
+        record.serialize(record_data)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -876,5 +914,55 @@ mod tests {
             page.update_header(0, header),
             Err(HeapError::SlotNotFound(0))
         ));
+    }
+
+    #[test]
+    fn test_heap_page_update_record_in_place() {
+        use crate::heap::{Record, Value};
+        use crate::protocol::type_oid;
+        use crate::tx::{CommandId, TxId};
+
+        let mut page = create_heap_page();
+
+        // Insert initial record
+        let record = Record::new(vec![Value::Int32(1), Value::Int64(100)]);
+        let slot = page
+            .insert(&record, TxId::new(1), CommandId::FIRST)
+            .unwrap();
+
+        // Update in-place with same-size record
+        let updated = Record::new(vec![Value::Int32(1), Value::Int64(200)]);
+        page.update_record_in_place(slot, &updated).unwrap();
+
+        // Verify update
+        let schema = [type_oid::INT4, type_oid::INT8];
+        let (header, read_record) = page.get(slot, &schema).unwrap();
+
+        // Header unchanged
+        assert_eq!(header.xmin, TxId::new(1));
+        assert_eq!(header.xmax, TxId::INVALID);
+
+        // Record updated
+        assert_eq!(read_record, updated);
+    }
+
+    #[test]
+    fn test_heap_page_update_record_in_place_size_mismatch() {
+        use crate::heap::{Record, Value};
+        use crate::tx::{CommandId, TxId};
+
+        let mut page = create_heap_page();
+
+        // Insert initial record
+        let record = Record::new(vec![Value::Int32(1)]);
+        let slot = page
+            .insert(&record, TxId::new(1), CommandId::FIRST)
+            .unwrap();
+
+        // Try to update with different-size record
+        let updated = Record::new(vec![Value::Int32(1), Value::Int64(200)]);
+        let result = page.update_record_in_place(slot, &updated);
+
+        assert!(matches!(result, Err(HeapError::RecordSizeMismatch { .. })));
     }
 }

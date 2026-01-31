@@ -12,7 +12,7 @@ use std::collections::HashMap;
 /// Internal state protected by a single mutex to ensure atomicity
 /// between txid allocation and active transaction tracking.
 struct TxManagerState {
-    /// Next transaction ID to allocate (starts at 1).
+    /// Next transaction ID to allocate.
     next_txid: u64,
     /// Active (in-progress) transaction IDs for snapshot generation.
     active_txids: Vec<TxId>,
@@ -39,7 +39,7 @@ impl TransactionManager {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(TxManagerState {
-                next_txid: 1, // Start from 1 (0 is INVALID)
+                next_txid: 2, // Start from 2 (0=INVALID, 1=FROZEN are reserved)
                 active_txids: Vec::new(),
             }),
             tx_states: Mutex::new(HashMap::new()),
@@ -176,9 +176,10 @@ mod tests {
         let tx2 = manager.begin();
         let tx3 = manager.begin();
 
-        assert_eq!(tx1, TxId::new(1));
-        assert_eq!(tx2, TxId::new(2));
-        assert_eq!(tx3, TxId::new(3));
+        // Starts from 2 (0=INVALID, 1=FROZEN are reserved)
+        assert_eq!(tx1, TxId::new(2));
+        assert_eq!(tx2, TxId::new(3));
+        assert_eq!(tx3, TxId::new(4));
     }
 
     #[test]
@@ -272,16 +273,16 @@ mod tests {
     fn test_snapshot_xmin_xmax() {
         let manager = TransactionManager::new();
 
-        let tx1 = manager.begin(); // TxId 1
-        let _tx2 = manager.begin(); // TxId 2
-        let tx3 = manager.begin(); // TxId 3
+        let tx1 = manager.begin(); // TxId 2
+        let _tx2 = manager.begin(); // TxId 3
+        let tx3 = manager.begin(); // TxId 4
         manager.commit(tx3).unwrap();
 
         let snapshot = manager.snapshot(TxId::new(999), CommandId::FIRST);
 
         // xmin = oldest active = tx1
         assert_eq!(snapshot.xmin, tx1);
-        // xmax = next_txid = 4 (unaffected by commit)
-        assert_eq!(snapshot.xmax, TxId::new(4));
+        // xmax = next_txid = 5 (unaffected by commit)
+        assert_eq!(snapshot.xmax, TxId::new(5));
     }
 }

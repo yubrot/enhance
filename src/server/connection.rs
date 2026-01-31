@@ -10,15 +10,18 @@ use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
+use crate::db::{Database, QueryResult, Session};
 use crate::protocol::{
     BackendMessage, BindMessage, CloseMessage, CloseTarget, DescribeMessage, DescribeTarget,
     ErrorInfo, ExecuteMessage, FrontendMessage, ParseMessage, PostgresCodec, TransactionStatus,
     sql_state,
 };
-use crate::sql::{Parser, Statement};
-use crate::tx::TransactionManager;
+use crate::sql::Parser;
+use crate::storage::{Replacer, Storage};
 
 /// A single client connection.
+///
+/// Handles the PostgreSQL wire protocol and delegates SQL execution to [`Session`].
 ///
 /// NOTE: This is a minimal implementation suitable for learning/development.
 /// For production use, the following improvements would be necessary:
@@ -31,45 +34,25 @@ use crate::tx::TransactionManager;
 /// 2. Protocol Completeness:
 ///    - Handle all frontend message types
 ///    - Support COPY protocol for bulk data transfer
-pub struct Connection {
+pub struct Connection<S: Storage, R: Replacer> {
     framed: Framed<TcpStream, PostgresCodec>,
     pid: i32,
     state: ConnectionState,
-    tx_manager: Arc<TransactionManager>,
+    session: Session<S, R>,
 }
 
-impl Connection {
+impl<S: Storage, R: Replacer> Connection<S, R> {
+    /// Creates a new connection with the given database.
     pub fn new(
         framed: Framed<TcpStream, PostgresCodec>,
         pid: i32,
-        tx_manager: Arc<TransactionManager>,
+        database: Arc<Database<S, R>>,
     ) -> Self {
         Self {
             framed,
             pid,
             state: ConnectionState::new(),
-            tx_manager,
-        }
-    }
-
-    /// Returns the command completion tag for a statement.
-    ///
-    /// NOTE: Row counts are stubbed to 0 for now. Real execution comes in later steps.
-    fn command_tag(stmt: &Statement) -> String {
-        match stmt {
-            Statement::Select(_) => "SELECT 0".to_string(),
-            Statement::Insert(_) => "INSERT 0 0".to_string(),
-            Statement::Update(_) => "UPDATE 0".to_string(),
-            Statement::Delete(_) => "DELETE 0".to_string(),
-            Statement::CreateTable(_) => "CREATE TABLE".to_string(),
-            Statement::DropTable(_) => "DROP TABLE".to_string(),
-            Statement::CreateIndex(_) => "CREATE INDEX".to_string(),
-            Statement::DropIndex(_) => "DROP INDEX".to_string(),
-            Statement::Begin => "BEGIN".to_string(),
-            Statement::Commit => "COMMIT".to_string(),
-            Statement::Rollback => "ROLLBACK".to_string(),
-            Statement::Set(_) => "SET".to_string(),
-            Statement::Explain(_) => "EXPLAIN".to_string(),
+            session: Session::new(database),
         }
     }
 
@@ -139,62 +122,33 @@ impl Connection {
 
     /// Handle a query from the client (Simple Query Protocol).
     ///
-    /// Parses the SQL, and returns appropriate responses.
-    /// NOTE: Actual execution is stubbed - real execution comes in later steps.
+    /// Delegates SQL parsing and execution to the session.
     async fn handle_query(&mut self, query: &str) -> Result<(), ConnectionError> {
         println!("(pid={}) Query: {}", self.pid, query);
 
-        match Parser::new(query).parse() {
+        match self.session.execute_query(query).await {
             Ok(None) => {
-                // Empty query
                 self.framed.send(BackendMessage::EmptyQueryResponse).await?;
             }
-            Ok(Some(stmt)) => {
-                // Handle transaction control commands
-                match &stmt {
-                    Statement::Begin => {
-                        if self.state.transaction().is_none() {
-                            let txid = self.tx_manager.begin();
-                            self.state.begin_transaction(txid);
-                        }
-                        // If already in transaction, BEGIN is a no-op (following PostgreSQL's behavior)
-                    }
-                    Statement::Commit => {
-                        if let Some(transaction) = self.state.transaction() {
-                            self.tx_manager.commit(transaction.txid)?;
-                        }
-                        self.state.end_transaction();
-                    }
-                    Statement::Rollback => {
-                        if let Some(transaction) = self.state.transaction() {
-                            let _ = self.tx_manager.abort(transaction.txid);
-                        }
-                        self.state.end_transaction();
-                    }
-                    _ => {
-                        // For other statements, increment cid if in active transaction
-                        self.state.increment_cid();
-                    }
-                }
-
-                // Successfully parsed
-                let tag = Self::command_tag(&stmt);
-
+            Ok(Some(QueryResult::Command { tag })) => {
                 // For SELECT, send RowDescription before CommandComplete
-                if matches!(stmt, Statement::Select(_)) {
+                // NOTE: Real row data will be sent in Step 10 (Basic Executor)
+                if tag.starts_with("SELECT") {
                     self.framed
                         .send(BackendMessage::RowDescription { fields: vec![] })
                         .await?;
                 }
-
                 self.framed
                     .send(BackendMessage::CommandComplete { tag })
                     .await?;
             }
-            Err(err) => {
-                // Parse error - send error response with position
+            Err(crate::db::DatabaseError::Parse(err)) => {
                 let error = ErrorInfo::new(sql_state::SYNTAX_ERROR, &err.message)
                     .with_position(err.position());
+                self.framed.send(error.into()).await?;
+            }
+            Err(e) => {
+                let error = ErrorInfo::new(sql_state::INTERNAL_ERROR, e.to_string());
                 self.framed.send(error.into()).await?;
             }
         }
@@ -328,7 +282,9 @@ impl Connection {
             return self.send_error(error, true).await;
         };
 
-        let Some(stmt) = self.state.get_statement(&portal.statement_name) else {
+        let statement_name = portal.statement_name.clone();
+
+        let Some(stmt) = self.state.get_statement(&statement_name) else {
             let error = ErrorInfo::new(
                 sql_state::INVALID_SQL_STATEMENT_NAME,
                 "statement for portal does not exist",
@@ -336,12 +292,21 @@ impl Connection {
             return self.send_error(error, true).await;
         };
 
-        // Stub execution - use stored AST to determine response
-        // NOTE: Real execution comes in later steps
-        let tag = Self::command_tag(&stmt.ast);
-        self.framed
-            .send(BackendMessage::CommandComplete { tag })
-            .await?;
+        // Clone AST to avoid borrow issues
+        let ast = stmt.ast.clone();
+
+        // Execute the statement via Session
+        match self.session.execute_statement(&ast).await {
+            Ok(QueryResult::Command { tag }) => {
+                self.framed
+                    .send(BackendMessage::CommandComplete { tag })
+                    .await?;
+            }
+            Err(e) => {
+                let error = ErrorInfo::new(sql_state::INTERNAL_ERROR, e.to_string());
+                return self.send_error(error, true).await;
+            }
+        }
 
         Ok(())
     }
@@ -395,8 +360,11 @@ impl Connection {
     /// This is the common termination sequence for both Simple Query Protocol
     /// (after Query message) and Extended Query Protocol (after Sync message).
     async fn send_ready_for_query(&mut self) -> Result<(), ConnectionError> {
-        let status = match self.state.transaction() {
-            Some(tx) => tx.status(),
+        let status = match self.session.transaction() {
+            Some(tx) => match tx.failed {
+                true => TransactionStatus::Failed,
+                false => TransactionStatus::InTransaction,
+            },
             None => TransactionStatus::Idle,
         };
         let message = BackendMessage::ReadyForQuery { status };

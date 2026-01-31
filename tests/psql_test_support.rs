@@ -7,7 +7,9 @@ use std::process::Command;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
+use enhance::db::Database;
 use enhance::server::Server;
+use enhance::storage::MemoryStorage;
 
 /// Result of running a psql command.
 #[derive(Debug)]
@@ -53,7 +55,11 @@ impl PsqlTestServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        let server = Server::new(listener);
+        // Initialize database with in-memory storage
+        let storage = MemoryStorage::new();
+        let database = Database::open(storage, 100).await.unwrap();
+
+        let server = Server::new(listener, database);
         let handle = tokio::spawn(async move {
             let _ = server.serve().await;
         });

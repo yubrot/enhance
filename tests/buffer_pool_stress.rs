@@ -131,14 +131,12 @@ async fn perform_write(ctx: &TestContext, record: WriteRecord) {
 
     let page_ranges = compute_page_ranges(record.start_offset, record.length);
     for (page_id, offset_range) in page_ranges {
-        let mut guard = ctx.pool.fetch_page_mut(page_id).await.unwrap();
+        let mut guard = ctx.pool.fetch_page_mut(page_id, true).await.unwrap();
 
         // Write to each byte in the offset range, with random mid-write releases
         for offset in offset_range {
             guard[offset] = guard[offset].wrapping_add(record.add_value);
         }
-
-        guard.mark_dirty();
     }
 }
 

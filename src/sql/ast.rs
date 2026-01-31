@@ -3,6 +3,8 @@
 //! This module defines the data structures that represent parsed SQL statements.
 //! The AST is produced by the parser and consumed by the query planner/executor.
 
+use crate::protocol::type_oid;
+
 /// A SQL statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -273,6 +275,25 @@ impl DataType {
             DataType::Varchar(Some(n)) => format!("VARCHAR({n})"),
             DataType::Bytea => "BYTEA".to_string(),
             DataType::Serial => "SERIAL".to_string(),
+        }
+    }
+
+    /// Converts this data type to a PostgreSQL type OID for psql compatibility.
+    ///
+    /// SERIAL columns are stored as INT4 with a linked sequence.
+    pub fn to_oid(&self) -> i32 {
+        match self {
+            DataType::Boolean => type_oid::BOOL,
+            DataType::Smallint => type_oid::INT2,
+            DataType::Integer => type_oid::INT4,
+            DataType::Bigint => type_oid::INT8,
+            DataType::Real => type_oid::FLOAT4,
+            DataType::DoublePrecision => type_oid::FLOAT8,
+            DataType::Text => type_oid::TEXT,
+            DataType::Varchar(_) => type_oid::VARCHAR,
+            DataType::Bytea => type_oid::BYTEA,
+            // SERIAL is stored as INT4 internally; sequence handles auto-increment
+            DataType::Serial => type_oid::INT4,
         }
     }
 }
@@ -565,6 +586,21 @@ mod tests {
         assert_eq!(DataType::Varchar(None).display_name(), "VARCHAR");
         assert_eq!(DataType::Varchar(Some(255)).display_name(), "VARCHAR(255)");
         assert_eq!(DataType::DoublePrecision.display_name(), "DOUBLE PRECISION");
+    }
+
+    #[test]
+    fn test_data_type_to_oid() {
+        assert_eq!(DataType::Boolean.to_oid(), type_oid::BOOL);
+        assert_eq!(DataType::Smallint.to_oid(), type_oid::INT2);
+        assert_eq!(DataType::Integer.to_oid(), type_oid::INT4);
+        assert_eq!(DataType::Bigint.to_oid(), type_oid::INT8);
+        assert_eq!(DataType::Real.to_oid(), type_oid::FLOAT4);
+        assert_eq!(DataType::DoublePrecision.to_oid(), type_oid::FLOAT8);
+        assert_eq!(DataType::Text.to_oid(), type_oid::TEXT);
+        assert_eq!(DataType::Varchar(Some(255)).to_oid(), type_oid::VARCHAR);
+        assert_eq!(DataType::Bytea.to_oid(), type_oid::BYTEA);
+        // SERIAL is stored as INT4
+        assert_eq!(DataType::Serial.to_oid(), type_oid::INT4);
     }
 
     #[test]

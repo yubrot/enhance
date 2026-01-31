@@ -6,6 +6,9 @@
 mod file;
 mod memory;
 
+use std::future::Future;
+use std::sync::Arc;
+
 pub use file::FileStorage;
 pub use memory::MemoryStorage;
 
@@ -58,7 +61,7 @@ pub trait Storage: Send + Sync {
         &self,
         page_id: PageId,
         buf: &mut [u8],
-    ) -> impl std::future::Future<Output = Result<(), StorageError>> + Send;
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Writes a page from caller-provided buffer.
     ///
@@ -75,7 +78,7 @@ pub trait Storage: Send + Sync {
         &self,
         page_id: PageId,
         buf: &[u8],
-    ) -> impl std::future::Future<Output = Result<(), StorageError>> + Send;
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Allocates a new page and returns its PageId.
     ///
@@ -89,12 +92,10 @@ pub trait Storage: Send + Sync {
     /// # Errors
     ///
     /// Returns `StorageError::StorageFull` if storage limit is reached.
-    fn allocate_page(
-        &self,
-    ) -> impl std::future::Future<Output = Result<PageId, StorageError>> + Send;
+    fn allocate_page(&self) -> impl Future<Output = Result<PageId, StorageError>> + Send;
 
     /// Returns the total number of allocated pages.
-    fn page_count(&self) -> impl std::future::Future<Output = usize> + Send;
+    fn page_count(&self) -> impl Future<Output = usize> + Send;
 
     /// Syncs all pending writes to physical disk (fsync).
     ///
@@ -104,7 +105,37 @@ pub trait Storage: Send + Sync {
     /// This method makes the distinction between:
     /// - Memory → OS buffer: write (implicit)
     /// - OS buffer → physical disk: sync_all (explicit)
-    fn sync_all(&self) -> impl std::future::Future<Output = Result<(), StorageError>> + Send;
+    fn sync_all(&self) -> impl Future<Output = Result<(), StorageError>> + Send;
+}
+
+impl<T: Storage> Storage for Arc<T> {
+    fn read_page(
+        &self,
+        page_id: PageId,
+        buf: &mut [u8],
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        self.as_ref().read_page(page_id, buf)
+    }
+
+    fn write_page(
+        &self,
+        page_id: PageId,
+        buf: &[u8],
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        self.as_ref().write_page(page_id, buf)
+    }
+
+    fn allocate_page(&self) -> impl Future<Output = Result<PageId, StorageError>> + Send {
+        self.as_ref().allocate_page()
+    }
+
+    fn page_count(&self) -> impl Future<Output = usize> + Send {
+        self.as_ref().page_count()
+    }
+
+    fn sync_all(&self) -> impl Future<Output = Result<(), StorageError>> + Send {
+        self.as_ref().sync_all()
+    }
 }
 
 /// Generic test functions for Storage implementations.

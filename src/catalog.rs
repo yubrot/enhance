@@ -1,0 +1,54 @@
+//! System catalog for table and column metadata.
+//!
+//! This module manages metadata about tables, columns, and sequences
+//! in self-hosted heap tables with MVCC support.
+//!
+//! # Architecture
+//!
+//! ```text
+//! Page 0          Heap Pages
+//! +------------+  +-------------+  +---------------+  +----------------+
+//! | Superblock |  | sys_tables  |  | sys_columns   |  | sys_sequences  |
+//! +------------+  +-------------+  +---------------+  +----------------+
+//!       |               |                 |                   |
+//!       |               v                 v                   v
+//!       |         [ TableInfo ]    [ ColumnInfo ]     [ SequenceInfo ]
+//!       |
+//!       +-> Catalog Page IDs + ID Generators
+//! ```
+//!
+//! ## Catalog Tables
+//!
+//! | Table Name      | Rust Type        | Description                     |
+//! |-----------------|------------------|---------------------------------|
+//! | `sys_tables`    | [`TableInfo`]    | Table metadata (id, name, page) |
+//! | `sys_columns`   | [`ColumnInfo`]   | Column metadata per table       |
+//! | `sys_sequences` | [`SequenceInfo`] | SERIAL column sequences         |
+//!
+//! ## Components
+//!
+//! - [`Catalog`]: Main entry point for catalog operations (create table, lookups)
+//! - [`Superblock`]: Database metadata stored in page 0 (page IDs, ID generators)
+//! - [`TableInfo`], [`ColumnInfo`], [`SequenceInfo`]: Typed wrappers for catalog rows
+//!
+//! ## Bootstrap
+//!
+//! On first startup, the catalog is bootstrapped by:
+//! 1. Allocating page 0 as the superblock
+//! 2. Creating heap pages for sys_tables, sys_columns, sys_sequences
+//! 3. Inserting self-describing metadata for the catalog tables
+//!
+//! ## Usage
+//!
+//! The catalog is accessed through the [`Database`](crate::db::Database) type,
+//! which orchestrates the buffer pool, transaction manager, and catalog.
+
+mod core;
+mod error;
+mod schema;
+mod superblock;
+
+pub use core::Catalog;
+pub use error::CatalogError;
+pub use schema::{ColumnInfo, LAST_RESERVED_TABLE_ID, SequenceInfo, TableInfo};
+pub use superblock::Superblock;

@@ -8,8 +8,9 @@ This project is designed as an intensive learning journey, focusing on core data
 
 - **Minimal Dependencies**: Rely on Tokio for the async runtime and a few essential crates. Avoid large frameworks to focus on manual implementation of core logic.
 - **Wire Protocol**: Implement the PostgreSQL wire protocol manually so that standard tools like `psql` can be used for testing.
-- **Concurrency First**: Implement page-level locking and asynchronous I/O from the start to fully utilize Rust’s safety and performance.
+- **Concurrency First**: Implement page-level locking and asynchronous I/O from the start to fully utilize Rust's safety and performance.
 - **Transparency**: Every layer—from the byte-level storage to the SQL parser—is handwritten to ensure deep understanding.
+- **PostgreSQL as Reference**: When design decisions arise, we look to PostgreSQL's architecture as a primary reference. This is not about compatibility—it's about learning from a mature, well-documented system. We adopt concepts like MVCC tuple headers (xmin/xmax), the wire protocol, and page structures because understanding *why* PostgreSQL made these choices deepens our learning.
 
 ### Architectural Decisions
 
@@ -68,7 +69,7 @@ Goal: Manage variable-length records within the 8KB limit and parse SQL into AST
 Goal: Establish MVCC infrastructure with transaction visibility and self-hosted catalog.
 
 8. ✅ MVCC Core: Transaction manager (TxId allocation, active transaction tracking, commit/abort state machine), tuple header extension (xmin/xmax/cid/infomask), Snapshot structure, visibility rules (`HeapTupleSatisfiesMVCC`).
-9. System Catalog: Store table/column definitions as heap tuples with MVCC. Bootstrap reserved catalog tables (sys_tables, sys_columns - similar concepts to PostgreSQL's pg_class/pg_attribute). Implement auto-increment sequences for SERIAL columns.
+9. ✅ System Catalog: Store table/column definitions as heap tuples with MVCC. Bootstrap reserved catalog tables (sys_tables, sys_columns - similar concepts to PostgreSQL's pg_class/pg_attribute). Implement auto-increment sequences for SERIAL columns.
 
 ### Month 5: Query Execution
 
