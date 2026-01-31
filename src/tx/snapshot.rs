@@ -211,7 +211,11 @@ mod tests {
         let snapshot = manager.snapshot(tx, CommandId::FIRST);
 
         // Tuple inserted by committed tx, deleted with FROZEN -> not visible
-        let base = inserted_by(tx_insert, CommandId::FIRST, Infomask::empty().with_xmin_committed());
+        let base = inserted_by(
+            tx_insert,
+            CommandId::FIRST,
+            Infomask::empty().with_xmin_committed(),
+        );
         let header = deleted_by(base, TxId::FROZEN, CommandId::FIRST);
         assert!(!snapshot.is_tuple_visible(&header, &manager));
     }
