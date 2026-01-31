@@ -6,6 +6,40 @@
 //!
 //! The [`Session`] type provides a client session abstraction that manages
 //! transaction state and SQL execution.
+//!
+//! # Architecture
+//!
+//! ```text
+//!                    +---------------------+
+//!                    |     Connection      |  <- server module (Protocol layer)
+//!                    | (PostgreSQL wire)   |
+//!                    +----------+----------+
+//!                               | owns
+//!                               v
+//!                    +---------------------+
+//!                    |       Session       |  <- db module (Business layer)
+//!                    | (Tx lifecycle, SQL) |
+//!                    +----------+----------+
+//!                               | Arc<Database>
+//!                               v
+//! +------------------------------------------------------------------+
+//! |                         Database                                 |
+//! |  (Orchestrates core infrastructure components)                   |
+//! |                                                                  |
+//! |  +-----------------+  +--------------------+  +---------------+  |
+//! |  | Arc<BufferPool> |  | Arc<TxManager>     |  |    Catalog    |  |
+//! |  | (Page I/O,      |  | (TxId allocation,  |  | (Table/column |  |
+//! |  |  LRU eviction)  |  |  commit/abort)     |  |  metadata)    |  |
+//! |  +--------+--------+  +--------------------+  +-------+-------+  |
+//! |           |                                           |          |
+//! +-----------+-------------------------------------------+----------+
+//!             |                                           |
+//!             v                                           | uses
+//!       +---------------------+                           |
+//!       |  storage::Storage   |<--------------------------+
+//!       | (Memory / File)     |
+//!       +---------------------+
+//! ```
 
 mod database;
 mod error;
