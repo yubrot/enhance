@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 
 use super::error::CatalogError;
 use super::schema::{ColumnInfo, SequenceInfo, SystemCatalogTable, TableInfo};
@@ -31,7 +31,7 @@ pub(super) struct Catalog<S: Storage, R: Replacer> {
     /// Transaction manager for MVCC.
     tx_manager: Arc<TransactionManager>,
     /// Superblock with catalog metadata (protected for updates).
-    superblock: Mutex<Superblock>,
+    superblock: RwLock<Superblock>,
 }
 
 impl<S: Storage, R: Replacer> Catalog<S, R> {
@@ -47,7 +47,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         Self {
             pool,
             tx_manager,
-            superblock: Mutex::new(superblock),
+            superblock: RwLock::new(superblock),
         }
     }
 
@@ -92,8 +92,10 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         superblock.write(sb_guard.data_mut());
         drop(sb_guard);
 
-        // Begin bootstrap transaction
-        let txid = tx_manager.begin();
+        // Bootstrap uses TxId::FROZEN so tuples are immediately visible without
+        // requiring a transaction commit. This is safe because bootstrap runs
+        // exclusively at database initialization time.
+        let txid = TxId::FROZEN;
         let cid = CommandId::FIRST;
 
         // Insert catalog table metadata into sys_tables
@@ -136,11 +138,6 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
 
         pool.flush_all().await?;
 
-        // NOTE: Using expect() here panics if commit fails. Production code should
-        // return an error. However, bootstrap commit should never fail in practice
-        // since there are no conflicts and no integrity constraints to violate.
-        tx_manager.commit(txid).expect("bootstrap commit failed");
-
         Ok(Self::new(pool, tx_manager, superblock))
     }
 
@@ -163,7 +160,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
 
     /// Returns the superblock.
     pub(super) fn superblock(&self) -> Superblock {
-        *self.superblock.lock()
+        *self.superblock.read()
     }
 
     /// Flushes the superblock to persistent storage with immediate fsync.
@@ -171,7 +168,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
     /// The superblock is outside the WAL system (it contains WAL metadata itself),
     /// so we must ensure durability through immediate fsync.
     async fn flush_superblock(&self) -> Result<(), CatalogError> {
-        let sb = *self.superblock.lock();
+        let sb = self.superblock();
         let mut guard = self.pool.fetch_page_mut(PageId::new(0)).await?;
         sb.write(guard.data_mut());
         drop(guard);
@@ -191,7 +188,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         snapshot: &Snapshot,
         name: &str,
     ) -> Result<Option<TableInfo>, CatalogError> {
-        let sys_tables_page = self.superblock.lock().sys_tables_page;
+        let sys_tables_page = self.superblock.read().sys_tables_page;
         let page = HeapPage::new(self.pool.fetch_page(sys_tables_page).await?);
 
         for (_slot_id, header, record) in page.scan(TableInfo::SCHEMA) {
@@ -225,7 +222,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         snapshot: &Snapshot,
         table_id: u32,
     ) -> Result<Vec<ColumnInfo>, CatalogError> {
-        let sys_columns_page = self.superblock.lock().sys_columns_page;
+        let sys_columns_page = self.superblock.read().sys_columns_page;
         let page = HeapPage::new(self.pool.fetch_page(sys_columns_page).await?);
 
         let mut columns = Vec::new();
@@ -261,7 +258,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         name: &str,
         first_page: PageId,
     ) -> Result<(), CatalogError> {
-        let sys_tables_page = self.superblock.lock().sys_tables_page;
+        let sys_tables_page = self.superblock.read().sys_tables_page;
         HeapPage::new(self.pool.fetch_page_mut(sys_tables_page).await?).insert(
             &TableInfo::new(table_id, name.to_string(), first_page).to_record(),
             txid,
@@ -277,7 +274,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         cid: CommandId,
         col: &ColumnInfo,
     ) -> Result<(), CatalogError> {
-        let sys_columns_page = self.superblock.lock().sys_columns_page;
+        let sys_columns_page = self.superblock.read().sys_columns_page;
         HeapPage::new(self.pool.fetch_page_mut(sys_columns_page).await?).insert(
             &col.to_record(),
             txid,
@@ -325,10 +322,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
 
         // Allocate table ID and persist immediately to ensure uniqueness
         // even if the transaction aborts or crashes occur later.
-        let table_id = {
-            let mut sb = self.superblock.lock();
-            sb.allocate_table_id()
-        };
+        let table_id = self.superblock.write().allocate_table_id();
         self.flush_superblock().await?;
 
         let first_page = {
@@ -372,57 +366,6 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         Ok(table_id)
     }
 
-    /// Gets the next value from a sequence.
-    ///
-    /// Sequences are NOT rolled back on transaction abort (following PostgreSQL's behavior).
-    /// Each call increments the sequence permanently, independent of transaction state.
-    ///
-    /// NOTE: Uses TxId::FROZEN for sequence updates to ensure:
-    /// - Updates are immediately visible to all transactions (no MVCC isolation)
-    /// - Updates are never rolled back (sequence guarantees monotonic increment)
-    ///
-    /// This matches PostgreSQL's sequence behavior where nextval() is transactional
-    /// in terms of returning unique values, but the increment itself is permanent.
-    ///
-    /// Production systems typically use:
-    /// - In-place updates bypassing MVCC entirely
-    /// - Separate sequence storage outside heap tables
-    /// - Sequence caching and lock-free algorithms for high concurrency
-    pub(super) async fn nextval(&self, seq_id: u32) -> Result<i64, CatalogError> {
-        let sys_sequences_page = self.superblock.lock().sys_sequences_page;
-        let mut page = HeapPage::new(self.pool.fetch_page_mut(sys_sequences_page).await?);
-
-        // Find and update the sequence
-        for (slot_id, header, record) in page.scan(SequenceInfo::SCHEMA).collect::<Vec<_>>() {
-            let Some(seq) = SequenceInfo::from_record(&record) else {
-                continue;
-            };
-
-            if seq.seq_id != seq_id {
-                continue;
-            }
-
-            let current_val = seq.next_val;
-
-            // Create updated record with incremented value
-            let updated_seq = SequenceInfo::new(seq.seq_id, seq.seq_name, current_val + 1);
-
-            // Mark old tuple as deleted and insert new one using FROZEN transaction
-            // This ensures the update is immediately visible and never rolled back
-            let mut new_header = header;
-            new_header.xmax = TxId::FROZEN;
-            new_header.cmax = CommandId::FIRST;
-            page.update_header(slot_id, new_header)?;
-
-            // Insert new tuple with FROZEN so it's visible to all transactions
-            page.insert(&updated_seq.to_record(), TxId::FROZEN, CommandId::FIRST)?;
-
-            return Ok(current_val);
-        }
-
-        Err(CatalogError::SequenceNotFound { seq_id })
-    }
-
     /// Creates a new sequence.
     async fn create_sequence(
         &self,
@@ -431,17 +374,46 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         name: &str,
     ) -> Result<u32, CatalogError> {
         // Allocate sequence ID and persist immediately to ensure uniqueness
-        let seq_id = self.superblock.lock().allocate_seq_id();
+        let seq_id = self.superblock.write().allocate_seq_id();
         self.flush_superblock().await?;
-
-        let sys_sequences_page = self.superblock.lock().sys_sequences_page;
 
         let seq = SequenceInfo::new(seq_id, name.to_string(), 1); // Start at 1
 
-        let mut page = HeapPage::new(self.pool.fetch_page_mut(sys_sequences_page).await?);
-        page.insert(&seq.to_record(), txid, cid)?;
-
+        let sys_sequences_page = self.superblock.read().sys_sequences_page;
+        HeapPage::new(self.pool.fetch_page_mut(sys_sequences_page).await?).insert(
+            &seq.to_record(),
+            txid,
+            cid,
+        )?;
         Ok(seq_id)
+    }
+
+    /// Gets the next value from a sequence.
+    ///
+    /// Sequences are NOT rolled back on transaction abort (following PostgreSQL's behavior).
+    /// Each call increments the sequence permanently, independent of transaction state.
+    pub(super) async fn nextval(&self, seq_id: u32) -> Result<i64, CatalogError> {
+        // The page latch is held during the entire operation to ensure atomicity.
+        let sys_sequences_page = self.superblock.read().sys_sequences_page;
+        let mut page = HeapPage::new(self.pool.fetch_page_mut(sys_sequences_page).await?);
+
+        // Find the sequence
+        let (slot_id, mut seq) = page
+            .scan(SequenceInfo::SCHEMA)
+            .find_map(|(slot_id, _header, record)| {
+                let seq = SequenceInfo::from_record(&record)?;
+                (seq.seq_id == seq_id).then_some((slot_id, seq))
+            })
+            .ok_or(CatalogError::SequenceNotFound { seq_id })?;
+
+        let current_val = seq.next_val;
+        seq.next_val += 1;
+
+        // Update record in-place, bypassing MVCC
+        // The record size is unchanged (same seq_name, only next_val differs)
+        page.update_record_in_place(slot_id, &seq.to_record())?;
+
+        Ok(current_val)
     }
 }
 

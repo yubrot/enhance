@@ -80,10 +80,16 @@ impl Snapshot {
     /// Returns true if the inserting transaction (xmin) is visible.
     ///
     /// **Visibility rules** - Tuple is inserted if:
+    /// - xmin is FROZEN (always visible, never rolled back), OR
     /// - xmin is the current transaction AND cmin < current_cid (self-visibility), OR
     /// - xmin committed before snapshot
     fn is_inserted(&self, header: &TupleHeader, tx_manager: &TransactionManager) -> bool {
         let xmin = header.xmin;
+
+        // FROZEN tuples are always visible (inserted long ago, never rolled back)
+        if xmin == TxId::FROZEN {
+            return true;
+        }
 
         // Self-visibility: tuple inserted by current transaction
         if xmin == self.current_txid {
@@ -115,6 +121,7 @@ impl Snapshot {
     /// Returns true if the deleting transaction (xmax) is visible.
     ///
     /// **Visibility rules** - Tuple is deleted if:
+    /// - xmax is FROZEN (permanently deleted, never rolled back), OR
     /// - xmax is the current transaction AND cmax < current_cid (self-deletion), OR
     /// - xmax committed before snapshot
     fn is_deleted(&self, header: &TupleHeader, tx_manager: &TransactionManager) -> bool {
@@ -123,6 +130,11 @@ impl Snapshot {
         // Not deleted
         if xmax == TxId::INVALID {
             return false;
+        }
+
+        // FROZEN deletion is always visible (permanently deleted)
+        if xmax == TxId::FROZEN {
+            return true;
         }
 
         // Self-deletion: tuple deleted by current transaction
@@ -174,6 +186,47 @@ mod tests {
             cmax,
             ..header
         }
+    }
+
+    // Tests for FROZEN visibility (special transaction ID)
+
+    #[test]
+    fn test_frozen_xmin_always_visible() {
+        let manager = TransactionManager::new();
+        let tx = manager.begin();
+        let snapshot = manager.snapshot(tx, CommandId::FIRST);
+
+        // FROZEN tuples are always visible regardless of snapshot
+        let header = inserted_by(TxId::FROZEN, CommandId::FIRST, Infomask::empty());
+        assert!(snapshot.is_tuple_visible(&header, &manager));
+    }
+
+    #[test]
+    fn test_frozen_xmax_always_deleted() {
+        let manager = TransactionManager::new();
+        let tx_insert = manager.begin();
+        manager.commit(tx_insert).unwrap();
+
+        let tx = manager.begin();
+        let snapshot = manager.snapshot(tx, CommandId::FIRST);
+
+        // Tuple inserted by committed tx, deleted with FROZEN -> not visible
+        let base = inserted_by(tx_insert, CommandId::FIRST, Infomask::empty().with_xmin_committed());
+        let header = deleted_by(base, TxId::FROZEN, CommandId::FIRST);
+        assert!(!snapshot.is_tuple_visible(&header, &manager));
+    }
+
+    #[test]
+    fn test_frozen_insert_and_delete() {
+        let manager = TransactionManager::new();
+        let tx = manager.begin();
+        let snapshot = manager.snapshot(tx, CommandId::FIRST);
+
+        // Tuple inserted and deleted with FROZEN (old version after sequence update)
+        let base = inserted_by(TxId::FROZEN, CommandId::FIRST, Infomask::empty());
+        let header = deleted_by(base, TxId::FROZEN, CommandId::FIRST);
+        // Insert visible (FROZEN), delete visible (FROZEN) -> not visible
+        assert!(!snapshot.is_tuple_visible(&header, &manager));
     }
 
     // Tests for xmin visibility (insertion visibility)
