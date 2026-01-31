@@ -3,9 +3,14 @@
 //! The [`Database`] type is the main entry point for database operations.
 //! It initializes or opens an existing database and provides access to
 //! the core components.
+//!
+//! The [`Session`] type provides a client session abstraction that manages
+//! transaction state and SQL execution.
 
 mod database;
 mod error;
+mod session;
 
 pub use database::Database;
 pub use error::DatabaseError;
+pub use session::{QueryResult, Session, TransactionState};

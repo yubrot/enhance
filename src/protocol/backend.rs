@@ -185,7 +185,7 @@ impl Encoder<BackendMessage> for PostgresCodec {
 }
 
 /// Transaction status indicator for ReadyForQuery message.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionStatus {
     /// 'I' - Idle (not in a transaction block)
     Idle,
