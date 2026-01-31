@@ -11,10 +11,11 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::{Database, QueryResult, Session};
+use crate::heap::{Record, Value};
 use crate::protocol::{
-    BackendMessage, BindMessage, CloseMessage, CloseTarget, DescribeMessage, DescribeTarget,
-    ErrorInfo, ExecuteMessage, FrontendMessage, ParseMessage, PostgresCodec, TransactionStatus,
-    sql_state,
+    BackendMessage, BindMessage, CloseMessage, CloseTarget, DataValue, DescribeMessage,
+    DescribeTarget, ErrorInfo, ExecuteMessage, FieldDescription, FormatCode, FrontendMessage,
+    ParseMessage, PostgresCodec, TransactionStatus, sql_state,
 };
 use crate::sql::Parser;
 use crate::storage::{Replacer, Storage};
@@ -131,16 +132,30 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
                 self.framed.send(BackendMessage::EmptyQueryResponse).await?;
             }
             Ok(Some(QueryResult::Command { tag })) => {
-                // For SELECT, send RowDescription before CommandComplete
-                // NOTE: Real row data will be sent in Step 10 (Basic Executor)
-                if tag.starts_with("SELECT") {
-                    self.framed
-                        .send(BackendMessage::RowDescription { fields: vec![] })
-                        .await?;
-                }
                 self.framed
                     .send(BackendMessage::CommandComplete { tag })
                     .await?;
+            }
+            Ok(Some(QueryResult::Rows { columns, rows })) => {
+                // Send RowDescription
+                let fields: Vec<FieldDescription> = columns
+                    .iter()
+                    .map(|col| FieldDescription {
+                        name: col.name.clone(),
+                        table_oid: 0,
+                        column_id: 0,
+                        type_oid: col.type_oid,
+                        type_size: -1,
+                        type_modifier: -1,
+                        format_code: FormatCode::Text,
+                    })
+                    .collect();
+                self.framed
+                    .send(BackendMessage::RowDescription { fields })
+                    .await?;
+
+                // Send DataRows and CommandComplete
+                self.send_select_result(&rows).await?;
             }
             Err(crate::db::DatabaseError::Parse(err)) => {
                 let error = ErrorInfo::new(sql_state::SYNTAX_ERROR, &err.message)
@@ -302,6 +317,10 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
                     .send(BackendMessage::CommandComplete { tag })
                     .await?;
             }
+            Ok(QueryResult::Rows { columns: _, rows }) => {
+                // Note: RowDescription should have been sent in Describe
+                self.send_select_result(&rows).await?;
+            }
             Err(e) => {
                 let error = ErrorInfo::new(sql_state::INTERNAL_ERROR, e.to_string());
                 return self.send_error(error, true).await;
@@ -355,6 +374,24 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
         Ok(())
     }
 
+    /// Sends DataRow messages for each row and a CommandComplete message.
+    ///
+    /// This is a shared helper for both Simple Query Protocol and Extended Query Protocol
+    /// to send query result rows after the RowDescription has been sent.
+    async fn send_select_result(&mut self, rows: &[Record]) -> Result<(), ConnectionError> {
+        for row in rows {
+            let values: Vec<DataValue> = row.values.iter().map(value_to_data_value).collect();
+            self.framed
+                .send(BackendMessage::DataRow { values })
+                .await?;
+        }
+        let tag = format!("SELECT {}", rows.len());
+        self.framed
+            .send(BackendMessage::CommandComplete { tag })
+            .await?;
+        Ok(())
+    }
+
     /// Send ReadyForQuery and flush the connection.
     ///
     /// This is the common termination sequence for both Simple Query Protocol
@@ -371,5 +408,31 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
         self.framed.send(message).await?;
         self.framed.flush().await?;
         Ok(())
+    }
+}
+
+/// Converts a heap [`Value`] to a wire protocol [`DataValue`].
+///
+/// All values are formatted as text strings and wrapped in `DataValue::Binary`,
+/// which is the PostgreSQL text format encoding. Despite the name "Binary",
+/// this represents the text wire format (format code 0), not binary format.
+fn value_to_data_value(value: &Value) -> DataValue {
+    match value {
+        Value::Null => DataValue::Null,
+        Value::Boolean(b) => {
+            let text = if *b { "t" } else { "f" };
+            DataValue::Binary(text.as_bytes().to_vec())
+        }
+        Value::Int16(n) => DataValue::Binary(n.to_string().into_bytes()),
+        Value::Int32(n) => DataValue::Binary(n.to_string().into_bytes()),
+        Value::Int64(n) => DataValue::Binary(n.to_string().into_bytes()),
+        Value::Float32(f) => DataValue::Binary(f.to_string().into_bytes()),
+        Value::Float64(f) => DataValue::Binary(f.to_string().into_bytes()),
+        Value::Text(s) => DataValue::Binary(s.as_bytes().to_vec()),
+        Value::Bytea(b) => {
+            // Encode as PostgreSQL hex format: \x followed by hex digits
+            let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
+            DataValue::Binary(format!("\\x{}", hex).into_bytes())
+        }
     }
 }
