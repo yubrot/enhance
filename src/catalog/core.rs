@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use super::error::CatalogError;
 use super::schema::{ColumnInfo, SequenceInfo, SystemCatalogTable, TableInfo};
 use super::superblock::Superblock;
-use crate::heap::{HeapPage, SlotId};
+use crate::heap::HeapPage;
 use crate::sql::{CreateTableStmt, DataType};
 use crate::storage::{BufferPool, PageId, Replacer, Storage};
 use crate::tx::{CommandId, Snapshot, TransactionManager, TxId};
@@ -25,7 +25,7 @@ use crate::tx::{CommandId, Snapshot, TransactionManager, TxId};
 ///
 /// Each catalog table uses a single page for simplicity. Multi-page
 /// support will be added in Step 15 with FSM.
-pub(crate) struct Catalog<S: Storage, R: Replacer> {
+pub(super) struct Catalog<S: Storage, R: Replacer> {
     /// Buffer pool for page access.
     pool: Arc<BufferPool<S, R>>,
     /// Transaction manager for MVCC.
@@ -55,29 +55,31 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
     ///
     /// This creates the initial catalog pages and inserts metadata
     /// for the catalog tables themselves.
-    pub(crate) async fn bootstrap(
+    ///
+    /// NOTE: Without WAL (Step 13), crash during bootstrap leaves the
+    /// database in an inconsistent state that cannot be recovered.
+    pub(super) async fn bootstrap(
         pool: Arc<BufferPool<S, R>>,
         tx_manager: Arc<TransactionManager>,
     ) -> Result<Self, CatalogError> {
         let mut sb_guard = pool.new_page().await?;
+        // NOTE: Using assert_eq! here panics instead of returning an error.
+        // Production code should return CatalogError::InvalidSuperblock or similar.
         assert_eq!(sb_guard.page_id(), PageId::new(0), "First page must be 0");
         sb_guard.data_mut().fill(0);
         drop(sb_guard);
 
-        let mut sys_tables_guard = pool.new_page().await?;
+        let sys_tables_guard = pool.new_page().await?;
         let sys_tables_page = sys_tables_guard.page_id();
-        HeapPage::new(sys_tables_guard.data_mut()).init();
-        drop(sys_tables_guard);
+        HeapPage::new(sys_tables_guard).init();
 
-        let mut sys_columns_guard = pool.new_page().await?;
+        let sys_columns_guard = pool.new_page().await?;
         let sys_columns_page = sys_columns_guard.page_id();
-        HeapPage::new(sys_columns_guard.data_mut()).init();
-        drop(sys_columns_guard);
+        HeapPage::new(sys_columns_guard).init();
 
-        let mut sys_sequences_guard = pool.new_page().await?;
+        let sys_sequences_guard = pool.new_page().await?;
         let sys_sequences_page = sys_sequences_guard.page_id();
-        HeapPage::new(sys_sequences_guard.data_mut()).init();
-        drop(sys_sequences_guard);
+        HeapPage::new(sys_sequences_guard).init();
 
         let mut superblock = Superblock::new();
         superblock.sys_tables_page = sys_tables_page;
@@ -96,8 +98,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
 
         // Insert catalog table metadata into sys_tables
         {
-            let mut guard = pool.fetch_page_mut(sys_tables_page).await?;
-            let mut page = HeapPage::new(guard.data_mut());
+            let mut page = HeapPage::new(pool.fetch_page_mut(sys_tables_page).await?);
 
             // sys_tables entry
             let table_info = TableInfo::table_info(sys_tables_page);
@@ -114,8 +115,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
 
         // Insert column metadata into sys_columns
         {
-            let mut guard = pool.fetch_page_mut(sys_columns_page).await?;
-            let mut page = HeapPage::new(guard.data_mut());
+            let mut page = HeapPage::new(pool.fetch_page_mut(sys_columns_page).await?);
 
             for (i, (name, oid)) in TableInfo::columns().into_iter().enumerate() {
                 let col = ColumnInfo::new(TableInfo::TABLE_ID, i as u32, name.to_string(), oid, 0);
@@ -134,15 +134,18 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
             }
         }
 
-        tx_manager.commit(txid).expect("bootstrap commit failed");
-
         pool.flush_all().await?;
+
+        // NOTE: Using expect() here panics if commit fails. Production code should
+        // return an error. However, bootstrap commit should never fail in practice
+        // since there are no conflicts and no integrity constraints to violate.
+        tx_manager.commit(txid).expect("bootstrap commit failed");
 
         Ok(Self::new(pool, tx_manager, superblock))
     }
 
     /// Opens an existing catalog from storage.
-    pub(crate) async fn open(
+    pub(super) async fn open(
         pool: Arc<BufferPool<S, R>>,
         tx_manager: Arc<TransactionManager>,
     ) -> Result<Self, CatalogError> {
@@ -158,9 +161,129 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         Ok(Self::new(pool, tx_manager, superblock))
     }
 
-    /// Returns the superblock page IDs.
-    pub(crate) fn superblock(&self) -> Superblock {
+    /// Returns the superblock.
+    pub(super) fn superblock(&self) -> Superblock {
         *self.superblock.lock()
+    }
+
+    /// Flushes the superblock to persistent storage with immediate fsync.
+    ///
+    /// The superblock is outside the WAL system (it contains WAL metadata itself),
+    /// so we must ensure durability through immediate fsync.
+    async fn flush_superblock(&self) -> Result<(), CatalogError> {
+        let sb = *self.superblock.lock();
+        let mut guard = self.pool.fetch_page_mut(PageId::new(0)).await?;
+        sb.write(guard.data_mut());
+        drop(guard);
+
+        // Flush and fsync the superblock page
+        self.pool.flush_page(PageId::new(0)).await?;
+        self.pool.storage().sync_all().await?;
+
+        Ok(())
+    }
+
+    /// Looks up a table by name.
+    ///
+    /// Scans sys_tables to find the table metadata.
+    pub(super) async fn get_table(
+        &self,
+        snapshot: &Snapshot,
+        name: &str,
+    ) -> Result<Option<TableInfo>, CatalogError> {
+        let sys_tables_page = self.superblock.lock().sys_tables_page;
+        let page = HeapPage::new(self.pool.fetch_page(sys_tables_page).await?);
+
+        for (_slot_id, header, record) in page.scan(TableInfo::SCHEMA) {
+            if !snapshot.is_tuple_visible(&header, &self.tx_manager) {
+                continue;
+            }
+
+            let Some(info) = TableInfo::from_record(&record) else {
+                // NOTE: from_record() returns None when deserialization fails, indicating
+                // possible data corruption. For learning purposes, we silently skip.
+                // Production systems should either:
+                // - Log corruption warnings and attempt recovery
+                // - Return CatalogError::CorruptedMetadata to fail fast
+                // - Use checksums (Step 13) to detect corruption earlier
+                continue;
+            };
+
+            if info.table_name == name {
+                return Ok(Some(info));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Gets columns for a table.
+    ///
+    /// Scans sys_columns to find the column metadata.
+    pub(super) async fn get_columns(
+        &self,
+        snapshot: &Snapshot,
+        table_id: u32,
+    ) -> Result<Vec<ColumnInfo>, CatalogError> {
+        let sys_columns_page = self.superblock.lock().sys_columns_page;
+        let page = HeapPage::new(self.pool.fetch_page(sys_columns_page).await?);
+
+        let mut columns = Vec::new();
+        for (_slot_id, header, record) in page.scan(ColumnInfo::SCHEMA) {
+            if !snapshot.is_tuple_visible(&header, &self.tx_manager) {
+                continue;
+            }
+
+            let Some(col) = ColumnInfo::from_record(&record) else {
+                // NOTE: Silently skipping corrupted records. See get_table() for details.
+                continue;
+            };
+
+            if col.table_id != table_id {
+                continue;
+            }
+
+            columns.push(col);
+        }
+
+        // Sort by column_num
+        columns.sort_by_key(|c| c.column_num);
+
+        Ok(columns)
+    }
+
+    /// Inserts a table record into sys_tables.
+    async fn insert_table(
+        &self,
+        txid: TxId,
+        cid: CommandId,
+        table_id: u32,
+        name: &str,
+        first_page: PageId,
+    ) -> Result<(), CatalogError> {
+        let sys_tables_page = self.superblock.lock().sys_tables_page;
+        HeapPage::new(self.pool.fetch_page_mut(sys_tables_page).await?).insert(
+            &TableInfo::new(table_id, name.to_string(), first_page).to_record(),
+            txid,
+            cid,
+        )?;
+        Ok(())
+    }
+
+    /// Inserts a column record into sys_columns.
+    async fn insert_column(
+        &self,
+        txid: TxId,
+        cid: CommandId,
+        col: &ColumnInfo,
+    ) -> Result<(), CatalogError> {
+        let sys_columns_page = self.superblock.lock().sys_columns_page;
+        HeapPage::new(self.pool.fetch_page_mut(sys_columns_page).await?).insert(
+            &col.to_record(),
+            txid,
+            cid,
+        )?;
+        Ok(())
     }
 
     /// Creates a new table from a CREATE TABLE statement.
@@ -175,13 +298,20 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
     /// # Errors
     ///
     /// Returns `CatalogError::TableAlreadyExists` if the table exists.
-    pub(crate) async fn create_table(
+    ///
+    /// NOTE: Table IDs are allocated eagerly and persisted immediately (step 2)
+    /// to ensure uniqueness even across transaction aborts. If the transaction
+    /// aborts after ID allocation, the ID is permanently consumed by design.
+    /// This matches PostgreSQL's behavior for OID allocation.
+    pub(super) async fn create_table(
         &self,
         txid: TxId,
         cid: CommandId,
         stmt: &CreateTableStmt,
     ) -> Result<u32, CatalogError> {
         // Check if table already exists
+        // NOTE: This check-then-insert pattern is not atomic without proper locking
+        // or unique constraints.
         let snapshot = self.tx_manager.snapshot(txid, cid);
         if self.get_table(&snapshot, &stmt.name).await?.is_some() {
             if stmt.if_not_exists {
@@ -202,9 +332,9 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         self.flush_superblock().await?;
 
         let first_page = {
-            let mut page_guard = self.pool.new_page().await?;
+            let page_guard = self.pool.new_page().await?;
             let page_id = page_guard.page_id();
-            HeapPage::new(page_guard.data_mut()).init();
+            HeapPage::new(page_guard).init();
             page_id
         };
 
@@ -242,86 +372,28 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         Ok(table_id)
     }
 
-    /// Looks up a table by name.
-    ///
-    /// Scans sys_tables to find the table metadata.
-    pub(crate) async fn get_table(
-        &self,
-        snapshot: &Snapshot,
-        name: &str,
-    ) -> Result<Option<TableInfo>, CatalogError> {
-        // Scan sys_tables
-        let sys_tables_page = { self.superblock.lock().sys_tables_page };
-
-        let guard = self.pool.fetch_page(sys_tables_page).await?;
-        let page = HeapPage::new(guard.data());
-
-        for (_slot_id, header, record) in page.scan(&TableInfo::SCHEMA) {
-            if !snapshot.is_tuple_visible(&header, &self.tx_manager) {
-                continue;
-            }
-
-            let Some(info) = TableInfo::from_record(&record) else {
-                continue;
-            };
-
-            if info.table_name == name {
-                return Ok(Some(info));
-            }
-        }
-
-        Ok(None)
-    }
-
-    /// Gets columns for a table.
-    ///
-    /// Scans sys_columns to find the column metadata.
-    pub(crate) async fn get_columns(
-        &self,
-        snapshot: &Snapshot,
-        table_id: u32,
-    ) -> Result<Vec<ColumnInfo>, CatalogError> {
-        // Scan sys_columns
-        let sys_columns_page = { self.superblock.lock().sys_columns_page };
-
-        let guard = self.pool.fetch_page(sys_columns_page).await?;
-        let page = HeapPage::new(guard.data());
-
-        let mut columns = Vec::new();
-        for (_slot_id, header, record) in page.scan(&ColumnInfo::SCHEMA) {
-            if !snapshot.is_tuple_visible(&header, &self.tx_manager) {
-                continue;
-            }
-
-            let Some(col) = ColumnInfo::from_record(&record) else {
-                continue;
-            };
-
-            if col.table_id != table_id {
-                continue;
-            }
-
-            columns.push(col);
-        }
-
-        // Sort by column_num
-        columns.sort_by_key(|c| c.column_num);
-
-        Ok(columns)
-    }
-
     /// Gets the next value from a sequence.
     ///
     /// Sequences are NOT rolled back on transaction abort (following PostgreSQL's behavior).
-    /// Each call increments the sequence permanently.
-    pub(crate) async fn nextval(&self, seq_id: u32) -> Result<i64, CatalogError> {
-        let sys_sequences_page = { self.superblock.lock().sys_sequences_page };
-
-        let mut guard = self.pool.fetch_page_mut(sys_sequences_page).await?;
-        let mut page = HeapPage::new(guard.data_mut());
+    /// Each call increments the sequence permanently, independent of transaction state.
+    ///
+    /// NOTE: Uses TxId::FROZEN for sequence updates to ensure:
+    /// - Updates are immediately visible to all transactions (no MVCC isolation)
+    /// - Updates are never rolled back (sequence guarantees monotonic increment)
+    ///
+    /// This matches PostgreSQL's sequence behavior where nextval() is transactional
+    /// in terms of returning unique values, but the increment itself is permanent.
+    ///
+    /// Production systems typically use:
+    /// - In-place updates bypassing MVCC entirely
+    /// - Separate sequence storage outside heap tables
+    /// - Sequence caching and lock-free algorithms for high concurrency
+    pub(super) async fn nextval(&self, seq_id: u32) -> Result<i64, CatalogError> {
+        let sys_sequences_page = self.superblock.lock().sys_sequences_page;
+        let mut page = HeapPage::new(self.pool.fetch_page_mut(sys_sequences_page).await?);
 
         // Find and update the sequence
-        for (slot_id, header, record) in page.scan(&SequenceInfo::SCHEMA).collect::<Vec<_>>() {
+        for (slot_id, header, record) in page.scan(SequenceInfo::SCHEMA).collect::<Vec<_>>() {
             let Some(seq) = SequenceInfo::from_record(&record) else {
                 continue;
             };
@@ -335,16 +407,15 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
             // Create updated record with incremented value
             let updated_seq = SequenceInfo::new(seq.seq_id, seq.seq_name, current_val + 1);
 
-            // Mark old tuple as deleted and insert new one
-            // For now, we just update the header's xmax and insert a new tuple
-            // This is a simplified approach - full MVCC update would be more complex
+            // Mark old tuple as deleted and insert new one using FROZEN transaction
+            // This ensures the update is immediately visible and never rolled back
             let mut new_header = header;
-            new_header.xmax = TxId::new(1); // Mark as deleted by a dummy transaction
+            new_header.xmax = TxId::FROZEN;
             new_header.cmax = CommandId::FIRST;
             page.update_header(slot_id, new_header)?;
 
-            // Insert new tuple
-            page.insert(&updated_seq.to_record(), TxId::new(1), CommandId::FIRST)?;
+            // Insert new tuple with FROZEN so it's visible to all transactions
+            page.insert(&updated_seq.to_record(), TxId::FROZEN, CommandId::FIRST)?;
 
             return Ok(current_val);
         }
@@ -360,65 +431,17 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         name: &str,
     ) -> Result<u32, CatalogError> {
         // Allocate sequence ID and persist immediately to ensure uniqueness
-        let seq_id = {
-            let mut sb = self.superblock.lock();
-            sb.allocate_seq_id()
-        };
+        let seq_id = self.superblock.lock().allocate_seq_id();
         self.flush_superblock().await?;
 
-        let sys_sequences_page = { self.superblock.lock().sys_sequences_page };
+        let sys_sequences_page = self.superblock.lock().sys_sequences_page;
 
         let seq = SequenceInfo::new(seq_id, name.to_string(), 1); // Start at 1
 
-        let mut guard = self.pool.fetch_page_mut(sys_sequences_page).await?;
-        let mut page = HeapPage::new(guard.data_mut());
+        let mut page = HeapPage::new(self.pool.fetch_page_mut(sys_sequences_page).await?);
         page.insert(&seq.to_record(), txid, cid)?;
 
         Ok(seq_id)
-    }
-
-    /// Inserts a table record into sys_tables.
-    async fn insert_table(
-        &self,
-        txid: TxId,
-        cid: CommandId,
-        table_id: u32,
-        name: &str,
-        first_page: PageId,
-    ) -> Result<SlotId, CatalogError> {
-        let sys_tables_page = { self.superblock.lock().sys_tables_page };
-
-        let table = TableInfo::new(table_id, name.to_string(), first_page);
-
-        let mut guard = self.pool.fetch_page_mut(sys_tables_page).await?;
-        let mut page = HeapPage::new(guard.data_mut());
-        let slot_id = page.insert(&table.to_record(), txid, cid)?;
-
-        Ok(slot_id)
-    }
-
-    /// Inserts a column record into sys_columns.
-    async fn insert_column(
-        &self,
-        txid: TxId,
-        cid: CommandId,
-        col: &ColumnInfo,
-    ) -> Result<SlotId, CatalogError> {
-        let sys_columns_page = { self.superblock.lock().sys_columns_page };
-
-        let mut guard = self.pool.fetch_page_mut(sys_columns_page).await?;
-        let mut page = HeapPage::new(guard.data_mut());
-        let slot_id = page.insert(&col.to_record(), txid, cid)?;
-
-        Ok(slot_id)
-    }
-
-    /// Flushes the superblock to page 0.
-    async fn flush_superblock(&self) -> Result<(), CatalogError> {
-        let sb = { *self.superblock.lock() };
-        let mut guard = self.pool.fetch_page_mut(PageId::new(0)).await?;
-        sb.write(guard.data_mut());
-        Ok(())
     }
 }
 

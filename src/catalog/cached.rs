@@ -116,7 +116,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
     /// Gets the next value from a sequence.
     ///
     /// Sequences are NOT rolled back on transaction abort (following PostgreSQL's behavior).
-    /// Each call increments the sequence permanently.
+    /// Each call increments the sequence permanently, independent of transaction state.
     pub async fn nextval(&self, seq_id: u32) -> Result<i64, CatalogError> {
         self.inner.nextval(seq_id).await
     }

@@ -305,9 +305,11 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
         Ok(())
     }
 
-    /// Returns a reference to the underlying storage for testing purposes.
-    #[cfg(test)]
-    pub(super) fn storage(&self) -> &S {
+    /// Returns a reference to the underlying storage.
+    ///
+    /// This is primarily used for operations that need direct storage access,
+    /// such as fsync for critical metadata (e.g., superblock).
+    pub fn storage(&self) -> &S {
         &self.inner.storage
     }
 }

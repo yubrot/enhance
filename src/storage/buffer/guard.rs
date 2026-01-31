@@ -66,6 +66,12 @@ impl<S: Storage, R: Replacer> PageReadGuard<'_, S, R> {
     }
 }
 
+impl<S: Storage, R: Replacer> AsRef<[u8]> for PageReadGuard<'_, S, R> {
+    fn as_ref(&self) -> &[u8] {
+        self.data()
+    }
+}
+
 impl<S: Storage, R: Replacer> Deref for PageReadGuard<'_, S, R> {
     type Target = [u8];
 
@@ -149,6 +155,18 @@ impl<S: Storage, R: Replacer> PageWriteGuard<'_, S, R> {
     /// This must be called after modifying the page data.
     pub fn mark_dirty(&mut self) {
         self.is_dirty = true;
+    }
+}
+
+impl<S: Storage, R: Replacer> AsRef<[u8]> for PageWriteGuard<'_, S, R> {
+    fn as_ref(&self) -> &[u8] {
+        self.data()
+    }
+}
+
+impl<S: Storage, R: Replacer> AsMut<[u8]> for PageWriteGuard<'_, S, R> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.data_mut()
     }
 }
 

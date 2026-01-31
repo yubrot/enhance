@@ -13,6 +13,16 @@ impl TxId {
     /// Invalid transaction ID (0).
     pub const INVALID: Self = Self(0);
 
+    /// Frozen transaction ID (1).
+    ///
+    /// This special transaction ID is always considered committed and visible
+    /// to all snapshots. Used for:
+    /// - Sequence tuple updates (nextval) which are not transactional
+    /// - Catalog tuples that should be visible immediately after bootstrap
+    ///
+    /// Following PostgreSQL's FrozenTransactionId semantics.
+    pub const FROZEN: Self = Self(1);
+
     /// Create a new transaction ID.
     pub const fn new(id: u64) -> Self {
         Self(id)
@@ -198,7 +208,8 @@ mod tests {
 
     #[test]
     fn test_infomask() {
-        let flags: [(fn(&Infomask) -> bool, fn(Infomask) -> Infomask); 4] = [
+        type FlagPair = (fn(&Infomask) -> bool, fn(Infomask) -> Infomask);
+        let flags: [FlagPair; 4] = [
             (Infomask::xmin_committed, Infomask::with_xmin_committed),
             (Infomask::xmin_aborted, Infomask::with_xmin_aborted),
             (Infomask::xmax_committed, Infomask::with_xmax_committed),

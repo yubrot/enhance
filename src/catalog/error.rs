@@ -1,7 +1,7 @@
 //! Catalog-specific errors.
 
 use crate::heap::HeapError;
-use crate::storage::BufferPoolError;
+use crate::storage::{BufferPoolError, StorageError};
 
 /// Errors that can occur during catalog operations.
 #[derive(Debug)]
@@ -73,5 +73,11 @@ impl From<BufferPoolError> for CatalogError {
 impl From<HeapError> for CatalogError {
     fn from(e: HeapError) -> Self {
         CatalogError::Heap(e)
+    }
+}
+
+impl From<StorageError> for CatalogError {
+    fn from(e: StorageError) -> Self {
+        CatalogError::BufferPool(BufferPoolError::from(e))
     }
 }
