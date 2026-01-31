@@ -25,7 +25,7 @@ use crate::tx::{CommandId, Snapshot, TransactionManager, TxId};
 ///
 /// Each catalog table uses a single page for simplicity. Multi-page
 /// support will be added in Step 15 with FSM.
-pub(super) struct Catalog<S: Storage, R: Replacer> {
+pub struct Catalog<S: Storage, R: Replacer> {
     /// Buffer pool for page access.
     pool: Arc<BufferPool<S, R>>,
     /// Transaction manager for MVCC.
@@ -58,7 +58,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
     ///
     /// NOTE: Without WAL (Step 13), crash during bootstrap leaves the
     /// database in an inconsistent state that cannot be recovered.
-    pub(super) async fn bootstrap(
+    pub async fn bootstrap(
         pool: Arc<BufferPool<S, R>>,
         tx_manager: Arc<TransactionManager>,
     ) -> Result<Self, CatalogError> {
@@ -142,7 +142,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
     }
 
     /// Opens an existing catalog from storage.
-    pub(super) async fn open(
+    pub async fn open(
         pool: Arc<BufferPool<S, R>>,
         tx_manager: Arc<TransactionManager>,
     ) -> Result<Self, CatalogError> {
@@ -159,7 +159,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
     }
 
     /// Returns the superblock.
-    pub(super) fn superblock(&self) -> Superblock {
+    pub fn superblock(&self) -> Superblock {
         *self.superblock.read()
     }
 
@@ -183,7 +183,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
     /// Looks up a table by name.
     ///
     /// Scans sys_tables to find the table metadata.
-    pub(super) async fn get_table(
+    pub async fn get_table(
         &self,
         snapshot: &Snapshot,
         name: &str,
@@ -217,7 +217,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
     /// Gets columns for a table.
     ///
     /// Scans sys_columns to find the column metadata.
-    pub(super) async fn get_columns(
+    pub async fn get_columns(
         &self,
         snapshot: &Snapshot,
         table_id: u32,
@@ -295,12 +295,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
     /// # Errors
     ///
     /// Returns `CatalogError::TableAlreadyExists` if the table exists.
-    ///
-    /// NOTE: Table IDs are allocated eagerly and persisted immediately (step 2)
-    /// to ensure uniqueness even across transaction aborts. If the transaction
-    /// aborts after ID allocation, the ID is permanently consumed by design.
-    /// This matches PostgreSQL's behavior for OID allocation.
-    pub(super) async fn create_table(
+    pub async fn create_table(
         &self,
         txid: TxId,
         cid: CommandId,
@@ -310,10 +305,9 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         // NOTE: This check-then-insert pattern is not atomic without proper locking
         // or unique constraints.
         let snapshot = self.tx_manager.snapshot(txid, cid);
-        if self.get_table(&snapshot, &stmt.name).await?.is_some() {
+        if let Some(table) = self.get_table(&snapshot, &stmt.name).await? {
             if stmt.if_not_exists {
-                // Return 0 to indicate no new table was created
-                return Ok(0);
+                return Ok(table.table_id);
             }
             return Err(CatalogError::TableAlreadyExists {
                 name: stmt.name.clone(),
@@ -335,21 +329,19 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         // Process columns and create sequences for SERIAL columns
         let mut columns = Vec::with_capacity(stmt.columns.len());
         for (col_num, col_def) in stmt.columns.iter().enumerate() {
-            let type_oid = col_def.data_type.to_oid();
-
-            let seq_id = if col_def.data_type == DataType::Serial {
-                // Create sequence for SERIAL column
-                let seq_name = format!("{}_{}_seq", stmt.name, col_def.name);
-                self.create_sequence(txid, cid, &seq_name).await?
-            } else {
-                0 // No sequence
+            let seq_id = match col_def.data_type {
+                DataType::Serial => {
+                    let seq_name = format!("{}_{}_seq", stmt.name, col_def.name);
+                    self.create_sequence(txid, cid, &seq_name).await?
+                }
+                _ => 0,
             };
 
             columns.push(ColumnInfo::new(
                 table_id,
                 col_num as u32,
                 col_def.name.clone(),
-                type_oid,
+                col_def.data_type.to_oid(),
                 seq_id,
             ));
         }
@@ -392,7 +384,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
     ///
     /// Sequences are NOT rolled back on transaction abort (following PostgreSQL's behavior).
     /// Each call increments the sequence permanently, independent of transaction state.
-    pub(super) async fn nextval(&self, seq_id: u32) -> Result<i64, CatalogError> {
+    pub async fn nextval(&self, seq_id: u32) -> Result<i64, CatalogError> {
         // The page latch is held during the entire operation to ensure atomicity.
         let sys_sequences_page = self.superblock.read().sys_sequences_page;
         let mut page = HeapPage::new(self.pool.fetch_page_mut(sys_sequences_page).await?);
@@ -422,7 +414,7 @@ mod tests {
     use super::*;
     use crate::catalog::LAST_RESERVED_TABLE_ID;
     use crate::catalog::schema::SystemCatalogTable;
-    use crate::sql::{ColumnDef, DataType};
+    use crate::sql::{Parser, Statement};
     use crate::storage::{LruReplacer, MemoryStorage, PageId};
 
     struct TestCatalog {
@@ -435,7 +427,6 @@ mod tests {
         let replacer = LruReplacer::new(100);
         let pool = Arc::new(BufferPool::new(storage, replacer, 100));
         let tx_manager = Arc::new(TransactionManager::new());
-
         let catalog = Catalog::bootstrap(pool, tx_manager.clone()).await.unwrap();
 
         TestCatalog {
@@ -484,8 +475,6 @@ mod tests {
             .await
             .unwrap();
         assert!(table.is_none());
-
-        tc.tx_manager.commit(txid).unwrap();
     }
 
     #[tokio::test]
@@ -505,8 +494,6 @@ mod tests {
         assert_eq!(columns[0].column_name, "table_id");
         assert_eq!(columns[1].column_name, "table_name");
         assert_eq!(columns[2].column_name, "first_page");
-
-        tc.tx_manager.commit(txid).unwrap();
     }
 
     #[tokio::test]
@@ -515,22 +502,10 @@ mod tests {
         let txid = tc.tx_manager.begin();
         let cid = CommandId::FIRST;
 
-        let stmt = CreateTableStmt {
-            name: "users".to_string(),
-            columns: vec![
-                ColumnDef {
-                    name: "id".to_string(),
-                    data_type: DataType::Serial,
-                    constraints: vec![],
-                },
-                ColumnDef {
-                    name: "name".to_string(),
-                    data_type: DataType::Text,
-                    constraints: vec![],
-                },
-            ],
-            constraints: vec![],
-            if_not_exists: false,
+        let Ok(Some(Statement::CreateTable(stmt))) =
+            Parser::new("CREATE TABLE users (id SERIAL, name TEXT)").parse()
+        else {
+            panic!("expected CreateTable");
         };
 
         let table_id = tc.catalog.create_table(txid, cid, &stmt).await.unwrap();
@@ -542,9 +517,10 @@ mod tests {
         let txid2 = tc.tx_manager.begin();
         let snapshot = tc.tx_manager.snapshot(txid2, CommandId::FIRST);
 
-        let table = tc.catalog.get_table(&snapshot, "users").await.unwrap();
-        assert!(table.is_some());
-        let table = table.unwrap();
+        let Some(table) = tc.catalog.get_table(&snapshot, "users").await.unwrap() else {
+            panic!("expected table exists");
+        };
+        assert_eq!(table.table_name, "users");
         assert_eq!(table.table_id, LAST_RESERVED_TABLE_ID + 1);
 
         // Verify columns
@@ -558,8 +534,6 @@ mod tests {
         assert!(columns[0].is_serial());
         assert_eq!(columns[1].column_name, "name");
         assert!(!columns[1].is_serial());
-
-        tc.tx_manager.commit(txid2).unwrap();
     }
 
     #[tokio::test]
@@ -568,15 +542,10 @@ mod tests {
         let txid = tc.tx_manager.begin();
         let cid = CommandId::FIRST;
 
-        let stmt = CreateTableStmt {
-            name: "test".to_string(),
-            columns: vec![ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Integer,
-                constraints: vec![],
-            }],
-            constraints: vec![],
-            if_not_exists: false,
+        let Ok(Some(Statement::CreateTable(stmt))) =
+            Parser::new("CREATE TABLE test (id INTEGER)").parse()
+        else {
+            panic!("expected CreateTable");
         };
 
         tc.catalog.create_table(txid, cid, &stmt).await.unwrap();
@@ -589,7 +558,6 @@ mod tests {
             result,
             Err(CatalogError::TableAlreadyExists { .. })
         ));
-        tc.tx_manager.abort(txid2).unwrap();
     }
 
     #[tokio::test]
@@ -598,15 +566,10 @@ mod tests {
         let txid = tc.tx_manager.begin();
         let cid = CommandId::FIRST;
 
-        let stmt = CreateTableStmt {
-            name: "test".to_string(),
-            columns: vec![ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Integer,
-                constraints: vec![],
-            }],
-            constraints: vec![],
-            if_not_exists: true,
+        let Ok(Some(Statement::CreateTable(stmt))) =
+            Parser::new("CREATE TABLE IF NOT EXISTS test (id INTEGER)").parse()
+        else {
+            panic!("expected CreateTable");
         };
 
         let table_id = tc.catalog.create_table(txid, cid, &stmt).await.unwrap();
@@ -616,7 +579,6 @@ mod tests {
         // Try to create again with IF NOT EXISTS
         let txid2 = tc.tx_manager.begin();
         let table_id2 = tc.catalog.create_table(txid2, cid, &stmt).await.unwrap();
-        assert_eq!(table_id2, 0); // Returns 0 when table already exists
-        tc.tx_manager.commit(txid2).unwrap();
+        assert_eq!(table_id2, table_id);
     }
 }

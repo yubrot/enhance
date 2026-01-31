@@ -43,13 +43,12 @@
 //! The catalog is accessed through the [`Database`](crate::db::Database) type,
 //! which orchestrates the buffer pool, transaction manager, and catalog.
 
-mod cached;
 mod core;
 mod error;
 mod schema;
 mod superblock;
 
-pub use self::cached::Catalog;
+pub use core::Catalog;
 pub use error::CatalogError;
 pub use schema::{ColumnInfo, LAST_RESERVED_TABLE_ID, SequenceInfo, TableInfo};
 pub use superblock::Superblock;
