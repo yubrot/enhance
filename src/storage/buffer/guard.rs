@@ -109,10 +109,9 @@ impl<S: Storage, R: Replacer> Drop for PageReadGuard<'_, S, R> {
 /// let bpm = BufferPool::new(storage, replacer, 10);
 /// let page_id = PageId::new(0);
 ///
-/// let mut guard = bpm.fetch_page_mut(page_id).await?;
+/// let mut guard = bpm.fetch_page_mut(page_id, true).await?;
 /// guard.data_mut()[0] = 42;
-/// guard.mark_dirty();
-/// // Page is unpinned (and marked dirty) when guard goes out of scope
+/// // With auto_dirty=true, page is automatically marked dirty on drop
 /// # Ok(())
 /// # }
 /// ```

@@ -233,7 +233,11 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
 
     /// Fetches a page for writing.
     ///
-    /// Returns a mutable guard. Call `mark_dirty()` after modifications.
+    /// # Arguments
+    ///
+    /// * `page_id` - The page to fetch
+    /// * `auto_dirty` - If true, the page is automatically marked dirty on drop.
+    ///   If false, the caller must explicitly call [`mark_dirty`](PageWriteGuard::mark_dirty).
     ///
     /// # Errors
     ///
@@ -242,6 +246,7 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
     pub async fn fetch_page_mut(
         &self,
         page_id: PageId,
+        auto_dirty: bool,
     ) -> Result<PageWriteGuard<'_, S, R>, BufferPoolError> {
         let frame_id = self.inner.acquire(page_id).await?;
         let data_guard = self.inner.frames[frame_id].write().await;
@@ -251,7 +256,7 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
             frame_id,
             page_id,
             data_guard,
-            is_dirty: false,
+            is_dirty: auto_dirty,
         })
     }
 
@@ -263,7 +268,7 @@ impl<S: Storage, R: Replacer> BufferPool<S, R> {
     /// - `BufferPoolError::Storage` if storage allocation fails
     pub async fn new_page(&self) -> Result<PageWriteGuard<'_, S, R>, BufferPoolError> {
         let page_id = self.inner.storage.allocate_page().await?;
-        self.fetch_page_mut(page_id).await
+        self.fetch_page_mut(page_id, true).await
     }
 
     /// Flushes a specific page to storage if dirty.
@@ -640,9 +645,8 @@ mod tests {
 
         // Fetch once
         {
-            let mut guard1 = pool.fetch_page_mut(page_id).await.unwrap();
+            let mut guard1 = pool.fetch_page_mut(page_id, true).await.unwrap();
             guard1[0] = 111;
-            guard1.mark_dirty();
         }
 
         // Fetch again - should hit buffer pool
@@ -658,9 +662,8 @@ mod tests {
 
         // Create and modify page
         {
-            let mut guard = pool.fetch_page_mut(page_id).await.unwrap();
+            let mut guard = pool.fetch_page_mut(page_id, true).await.unwrap();
             guard.data_mut()[0] = 42;
-            guard.mark_dirty();
         }
 
         // Flush to storage
@@ -676,7 +679,7 @@ mod tests {
         let pool = create_pool(3, 5).await;
 
         for i in 0..5 {
-            let mut guard = pool.fetch_page_mut(PageId::new(i)).await.unwrap();
+            let mut guard = pool.fetch_page_mut(PageId::new(i), true).await.unwrap();
             guard[0] = (i * 10) as u8;
             guard.mark_dirty();
         }
@@ -692,21 +695,21 @@ mod tests {
 
         // Write to page 0
         {
-            let mut guard = pool.fetch_page_mut(PageId::new(0)).await.unwrap();
+            let mut guard = pool.fetch_page_mut(PageId::new(0), true).await.unwrap();
             guard.data_mut()[0] = 99;
             guard.mark_dirty();
         }
 
         // Write to page 1
         {
-            let mut guard = pool.fetch_page_mut(PageId::new(1)).await.unwrap();
+            let mut guard = pool.fetch_page_mut(PageId::new(1), true).await.unwrap();
             guard.data_mut()[0] = 88;
             guard.mark_dirty();
         }
 
         // Write to page 2, forcing eviction of page 0
         {
-            let mut guard = pool.fetch_page_mut(PageId::new(2)).await.unwrap();
+            let mut guard = pool.fetch_page_mut(PageId::new(2), true).await.unwrap();
             guard.data_mut()[0] = 77;
             guard.mark_dirty();
         }
@@ -826,10 +829,9 @@ mod tests {
 
         // Write again
         {
-            let mut guard = pool.fetch_page_mut(page_id).await.unwrap();
+            let mut guard = pool.fetch_page_mut(page_id, true).await.unwrap();
             assert_eq!(guard.data()[0], 1);
             guard.data_mut()[1] = 2;
-            guard.mark_dirty();
         }
 
         // Verify
@@ -1015,9 +1017,8 @@ mod tests {
 
         // Make page_0 dirty
         {
-            let mut guard = pool.fetch_page_mut(page_0).await.unwrap();
+            let mut guard = pool.fetch_page_mut(page_0, true).await.unwrap();
             guard[0] = 42;
-            guard.mark_dirty();
         }
 
         // Fetch page_1 → eviction starts, write_back begins

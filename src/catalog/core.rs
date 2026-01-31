@@ -88,7 +88,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         superblock.next_table_id = super::schema::LAST_RESERVED_TABLE_ID + 1;
         superblock.next_seq_id = 1;
 
-        let mut sb_guard = pool.fetch_page_mut(PageId::new(0)).await?;
+        let mut sb_guard = pool.fetch_page_mut(PageId::new(0), true).await?;
         superblock.write(sb_guard.data_mut());
         drop(sb_guard);
 
@@ -100,7 +100,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
 
         // Insert catalog table metadata into sys_tables
         {
-            let mut page = HeapPage::new(pool.fetch_page_mut(sys_tables_page).await?);
+            let mut page = HeapPage::new(pool.fetch_page_mut(sys_tables_page, true).await?);
 
             // sys_tables entry
             let table_info = TableInfo::table_info(sys_tables_page);
@@ -117,7 +117,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
 
         // Insert column metadata into sys_columns
         {
-            let mut page = HeapPage::new(pool.fetch_page_mut(sys_columns_page).await?);
+            let mut page = HeapPage::new(pool.fetch_page_mut(sys_columns_page, true).await?);
 
             for (i, (name, oid)) in TableInfo::columns().into_iter().enumerate() {
                 let col = ColumnInfo::new(TableInfo::TABLE_ID, i as u32, name.to_string(), oid, 0);
@@ -169,7 +169,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
     /// so we must ensure durability through immediate fsync.
     async fn flush_superblock(&self) -> Result<(), CatalogError> {
         let sb = self.superblock();
-        let mut guard = self.pool.fetch_page_mut(PageId::new(0)).await?;
+        let mut guard = self.pool.fetch_page_mut(PageId::new(0), true).await?;
         sb.write(guard.data_mut());
         drop(guard);
 
@@ -259,7 +259,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         first_page: PageId,
     ) -> Result<(), CatalogError> {
         let sys_tables_page = self.superblock.read().sys_tables_page;
-        HeapPage::new(self.pool.fetch_page_mut(sys_tables_page).await?).insert(
+        HeapPage::new(self.pool.fetch_page_mut(sys_tables_page, true).await?).insert(
             &TableInfo::new(table_id, name.to_string(), first_page).to_record(),
             txid,
             cid,
@@ -275,7 +275,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         col: &ColumnInfo,
     ) -> Result<(), CatalogError> {
         let sys_columns_page = self.superblock.read().sys_columns_page;
-        HeapPage::new(self.pool.fetch_page_mut(sys_columns_page).await?).insert(
+        HeapPage::new(self.pool.fetch_page_mut(sys_columns_page, true).await?).insert(
             &col.to_record(),
             txid,
             cid,
@@ -372,7 +372,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         let seq = SequenceInfo::new(seq_id, name.to_string(), 1); // Start at 1
 
         let sys_sequences_page = self.superblock.read().sys_sequences_page;
-        HeapPage::new(self.pool.fetch_page_mut(sys_sequences_page).await?).insert(
+        HeapPage::new(self.pool.fetch_page_mut(sys_sequences_page, true).await?).insert(
             &seq.to_record(),
             txid,
             cid,
@@ -387,7 +387,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
     pub async fn nextval(&self, seq_id: u32) -> Result<i64, CatalogError> {
         // The page latch is held during the entire operation to ensure atomicity.
         let sys_sequences_page = self.superblock.read().sys_sequences_page;
-        let mut page = HeapPage::new(self.pool.fetch_page_mut(sys_sequences_page).await?);
+        let mut page = HeapPage::new(self.pool.fetch_page_mut(sys_sequences_page, true).await?);
 
         // Find the sequence
         let (slot_id, mut seq) = page
