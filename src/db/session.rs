@@ -231,9 +231,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                         let explain_text = plan.explain();
                         let columns = vec![ColumnDesc {
                             name: "QUERY PLAN".to_string(),
-                            table_name: None,
-                            table_oid: 0,
-                            column_id: 0,
+                            source: None,
                             data_type: crate::datum::Type::Text,
                         }];
                         let rows: Vec<Record> = explain_text

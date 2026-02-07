@@ -389,10 +389,14 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
             .iter()
             .map(|col| {
                 let type_size = col.data_type.fixed_size().map(|s| s as i16).unwrap_or(-1);
+                let (table_oid, column_id) = col
+                    .source
+                    .as_ref()
+                    .map_or((0, 0), |s| (s.table_oid, s.column_id));
                 FieldDescription {
                     name: col.name.clone(),
-                    table_oid: col.table_oid,
-                    column_id: col.column_id,
+                    table_oid,
+                    column_id,
                     type_oid: col.data_type.oid(),
                     type_size,
                     type_modifier: -1,

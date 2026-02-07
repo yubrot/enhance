@@ -119,9 +119,7 @@ mod tests {
     fn int_col(name: &str) -> ColumnDesc {
         ColumnDesc {
             name: name.to_string(),
-            table_name: None,
-            table_oid: 0,
-            column_id: 0,
+            source: None,
             data_type: Type::Int8,
         }
     }

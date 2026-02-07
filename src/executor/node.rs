@@ -304,9 +304,7 @@ mod tests {
     fn int_col(name: &str) -> ColumnDesc {
         ColumnDesc {
             name: name.to_string(),
-            table_name: None,
-            table_oid: 0,
-            column_id: 0,
+            source: None,
             data_type: Type::Int8,
         }
     }
@@ -401,9 +399,7 @@ mod tests {
                 int_col("id"),
                 ColumnDesc {
                     name: "name".to_string(),
-                    table_name: None,
-                    table_oid: 0,
-                    column_id: 0,
+                    source: None,
                     data_type: Type::Text,
                 },
             ],
@@ -419,9 +415,7 @@ mod tests {
         }];
         let out_cols = vec![ColumnDesc {
             name: "name".to_string(),
-            table_name: None,
-            table_oid: 0,
-            column_id: 0,
+            source: None,
             data_type: Type::Text,
         }];
         let mut node = ExecutorNode::Projection(Projection::new(scan, exprs, out_cols));
@@ -518,9 +512,7 @@ mod tests {
                     int_col("id"),
                     ColumnDesc {
                         name: "name".to_string(),
-                        table_name: None,
-                        table_oid: 0,
-                        column_id: 0,
+                        source: None,
                         data_type: Type::Text,
                     },
                 ],
@@ -531,9 +523,7 @@ mod tests {
             }],
             columns: vec![ColumnDesc {
                 name: "name".to_string(),
-                table_name: None,
-                table_oid: 0,
-                column_id: 0,
+                source: None,
                 data_type: Type::Text,
             }],
         };

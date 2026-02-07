@@ -322,8 +322,8 @@ pub(super) fn resolve_column_index(
 
         // Qualified reference: table must match
         if let Some(t) = table {
-            if let Some(ref table_name) = desc.table_name
-                && table_name.eq_ignore_ascii_case(t)
+            if let Some(ref source) = desc.source
+                && source.table_name.eq_ignore_ascii_case(t)
             {
                 return Ok(i); // Early return: exact match found
             }
@@ -357,33 +357,42 @@ mod tests {
     }
 
     fn make_columns() -> Vec<ColumnDesc> {
+        use crate::executor::ColumnSource;
         vec![
             ColumnDesc {
                 name: "id".to_string(),
-                table_name: Some("users".to_string()),
-                table_oid: 1,
-                column_id: 1,
+                source: Some(ColumnSource {
+                    table_name: "users".to_string(),
+                    table_oid: 1,
+                    column_id: 1,
+                }),
                 data_type: Type::Int8,
             },
             ColumnDesc {
                 name: "name".to_string(),
-                table_name: Some("users".to_string()),
-                table_oid: 1,
-                column_id: 2,
+                source: Some(ColumnSource {
+                    table_name: "users".to_string(),
+                    table_oid: 1,
+                    column_id: 2,
+                }),
                 data_type: Type::Text,
             },
             ColumnDesc {
                 name: "id".to_string(),
-                table_name: Some("orders".to_string()),
-                table_oid: 2,
-                column_id: 1,
+                source: Some(ColumnSource {
+                    table_name: "orders".to_string(),
+                    table_oid: 2,
+                    column_id: 1,
+                }),
                 data_type: Type::Int8,
             },
             ColumnDesc {
                 name: "user_id".to_string(),
-                table_name: Some("orders".to_string()),
-                table_oid: 2,
-                column_id: 2,
+                source: Some(ColumnSource {
+                    table_name: "orders".to_string(),
+                    table_oid: 2,
+                    column_id: 2,
+                }),
                 data_type: Type::Int8,
             },
         ]

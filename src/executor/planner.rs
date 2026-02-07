@@ -10,7 +10,7 @@ use crate::sql::{Expr, FromClause, SelectItem, SelectStmt, TableRef};
 use crate::storage::{Replacer, Storage};
 use crate::tx::Snapshot;
 
-use super::ColumnDesc;
+use super::{ColumnDesc, ColumnSource};
 use super::error::ExecutorError;
 use super::expr::{BoundExpr, resolve_column_index};
 use super::plan::Plan;
@@ -157,9 +157,11 @@ fn build_column_descs(
         .enumerate()
         .map(|(i, col)| ColumnDesc {
             name: col.column_name.clone(),
-            table_name: Some(table_name.to_string()),
-            table_oid: table_id as i32,
-            column_id: (i + 1) as i16,
+            source: Some(ColumnSource {
+                table_name: table_name.to_string(),
+                table_oid: table_id as i32,
+                column_id: (i + 1) as i16,
+            }),
             data_type: col.data_type,
         })
         .collect()
@@ -241,32 +243,24 @@ fn infer_column_desc(expr: &Expr, alias: Option<&str>, input_columns: &[ColumnDe
                 Ok(i) => input_columns[i].clone(),
                 Err(_) => ColumnDesc {
                     name: column.clone(),
-                    table_name: None,
-                    table_oid: 0,
-                    column_id: 0,
+                    source: None,
                     data_type: Type::Text,
                 },
             }
         }
         Expr::Function { name, .. } => ColumnDesc {
             name: name.clone(),
-            table_name: None,
-            table_oid: 0,
-            column_id: 0,
+            source: None,
             data_type: infer_data_type(expr, input_columns),
         },
         Expr::Cast { data_type, .. } => ColumnDesc {
             name: data_type.display_name().to_lowercase(),
-            table_name: None,
-            table_oid: 0,
-            column_id: 0,
+            source: None,
             data_type: infer_data_type(expr, input_columns),
         },
         _ => ColumnDesc {
             name: "?column?".to_string(),
-            table_name: None,
-            table_oid: 0,
-            column_id: 0,
+            source: None,
             data_type: infer_data_type(expr, input_columns),
         },
     };
@@ -463,9 +457,10 @@ mod tests {
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "table_name");
         // ColumnRef inherits source table metadata from input
-        assert_eq!(plan.columns()[0].table_name.as_deref(), Some("sys_tables"));
-        assert_ne!(plan.columns()[0].table_oid, 0);
-        assert_ne!(plan.columns()[0].column_id, 0);
+        let source = plan.columns()[0].source.as_ref().expect("should have source");
+        assert_eq!(source.table_name, "sys_tables");
+        assert_ne!(source.table_oid, 0);
+        assert_ne!(source.column_id, 0);
     }
 
     #[tokio::test]
@@ -506,9 +501,7 @@ mod tests {
         // Computed expressions have no source table info
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "?column?");
-        assert_eq!(plan.columns()[0].table_name, None);
-        assert_eq!(plan.columns()[0].table_oid, 0);
-        assert_eq!(plan.columns()[0].column_id, 0);
+        assert!(plan.columns()[0].source.is_none());
     }
 
     #[tokio::test]
@@ -545,8 +538,9 @@ mod tests {
         // Qualified ColumnRef resolves with full source table metadata
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "table_name");
-        assert_eq!(plan.columns()[0].table_name.as_deref(), Some("sys_tables"));
-        assert_ne!(plan.columns()[0].table_oid, 0);
-        assert_ne!(plan.columns()[0].column_id, 0);
+        let source = plan.columns()[0].source.as_ref().expect("should have source");
+        assert_eq!(source.table_name, "sys_tables");
+        assert_ne!(source.table_oid, 0);
+        assert_ne!(source.column_id, 0);
     }
 }

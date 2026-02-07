@@ -52,17 +52,24 @@ pub use plan::Plan;
 pub use planner::plan_select;
 pub use row::Row;
 
+/// Source table metadata for columns originating from a table scan.
+#[derive(Debug, Clone)]
+pub struct ColumnSource {
+    /// Source table name (for qualified column resolution).
+    pub table_name: String,
+    /// OID of the source table.
+    pub table_oid: i32,
+    /// Column attribute number within the source table (1-indexed).
+    pub column_id: i16,
+}
+
 /// Metadata describing a result column.
 #[derive(Debug, Clone)]
 pub struct ColumnDesc {
     /// Column name (or alias).
     pub name: String,
-    /// Source table name (if from a table, for qualified column resolution).
-    pub table_name: Option<String>,
-    /// OID of the source table (0 if not from a table).
-    pub table_oid: i32,
-    /// Column attribute number within the source table (0 if not from a table).
-    pub column_id: i16,
+    /// Source table info. `None` for computed/expression columns.
+    pub source: Option<ColumnSource>,
     /// Data type.
     pub data_type: Type,
 }
@@ -70,11 +77,11 @@ pub struct ColumnDesc {
 impl ColumnDesc {
     /// Returns the display name for this column.
     ///
-    /// If the column has a source table name, returns `table.column`,
+    /// If the column has a source table, returns `table.column`,
     /// otherwise returns just the column name.
     pub fn display_name(&self) -> String {
-        match &self.table_name {
-            Some(t) => format!("{}.{}", t, self.name),
+        match &self.source {
+            Some(s) => format!("{}.{}", s.table_name, self.name),
             None => self.name.clone(),
         }
     }
