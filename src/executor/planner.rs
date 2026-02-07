@@ -13,6 +13,7 @@ use crate::storage::{Replacer, Storage};
 use crate::tx::Snapshot;
 
 use super::error::ExecutorError;
+use super::eval::{bind_expr, BoundExpr};
 use super::node::{ExecutorNode, Filter, Projection, SeqScan, ValuesScan};
 use super::types::ColumnDesc;
 
@@ -66,9 +67,11 @@ pub async fn plan_select<S: Storage, R: Replacer>(
         None => ExecutorNode::ValuesScan(ValuesScan::new()),
     };
 
-    // Step 2: WHERE clause -> Filter
+    // Step 2: WHERE clause -> Filter (bind column names to indices)
     if let Some(where_clause) = &select.where_clause {
-        node = ExecutorNode::Filter(Filter::new(node, where_clause.clone()));
+        let child_columns = node.columns().to_vec();
+        let bound_predicate = bind_expr(where_clause, &child_columns)?;
+        node = ExecutorNode::Filter(Filter::new(node, bound_predicate));
     }
 
     // Step 3: SELECT list -> Projection
@@ -182,6 +185,9 @@ async fn scan_visible_tuples<S: Storage, R: Replacer>(
 }
 
 /// Builds a Projection node from the SELECT list.
+///
+/// Column names and types are inferred from the AST expression *before* binding,
+/// then the expression is bound to positional indices for efficient evaluation.
 fn build_projection(
     child: ExecutorNode,
     select_items: &[SelectItem],
@@ -193,12 +199,9 @@ fn build_projection(
     for item in select_items {
         match item {
             SelectItem::Wildcard => {
-                // Expand to all child columns
-                for col in &child_columns {
-                    exprs.push(Expr::ColumnRef {
-                        table: None,
-                        column: col.name.clone(),
-                    });
+                // Expand to all child columns using positional indices
+                for (i, col) in child_columns.iter().enumerate() {
+                    exprs.push(BoundExpr::Column(i));
                     out_columns.push(ColumnDesc {
                         name: col.name.clone(),
                         table_oid: col.table_oid,
@@ -210,17 +213,14 @@ fn build_projection(
             SelectItem::QualifiedWildcard(table_name) => {
                 // Expand to all columns from the specified table
                 let mut found = false;
-                for col in &child_columns {
+                for (i, col) in child_columns.iter().enumerate() {
                     // For single-table queries, we match by checking if the child is a
                     // SeqScan with the matching table name. Since we only support
                     // single-table queries now, all columns belong to the table.
                     // A more sophisticated check would be needed for JOINs.
                     let _ = table_name;
                     found = true;
-                    exprs.push(Expr::ColumnRef {
-                        table: None,
-                        column: col.name.clone(),
-                    });
+                    exprs.push(BoundExpr::Column(i));
                     out_columns.push(ColumnDesc {
                         name: col.name.clone(),
                         table_oid: col.table_oid,
@@ -235,11 +235,14 @@ fn build_projection(
                 }
             }
             SelectItem::Expr { expr, alias } => {
-                // Determine output column name and type
+                // Infer name and type from AST before binding
                 let col_name = alias.clone().unwrap_or_else(|| infer_column_name(expr));
                 let col_data_type = infer_data_type(expr, &child_columns);
 
-                exprs.push(expr.clone());
+                // Bind column names to positional indices
+                let bound = bind_expr(expr, &child_columns)?;
+
+                exprs.push(bound);
                 out_columns.push(ColumnDesc {
                     name: col_name,
                     table_oid: 0,

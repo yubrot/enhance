@@ -24,6 +24,9 @@ pub enum ExecutorError {
     /// Invalid type cast.
     InvalidCast { from: String, to: String },
 
+    /// Column index exceeds the number of columns in the record.
+    ColumnIndexOutOfBounds { index: usize, len: usize },
+
     /// Unsupported operation or feature.
     Unsupported(String),
 
@@ -48,6 +51,13 @@ impl std::fmt::Display for ExecutorError {
             }
             ExecutorError::TypeMismatch { expected, found } => {
                 write!(f, "type mismatch: expected {}, found {}", expected, found)
+            }
+            ExecutorError::ColumnIndexOutOfBounds { index, len } => {
+                write!(
+                    f,
+                    "column index {} out of bounds for record with {} columns",
+                    index, len
+                )
             }
             ExecutorError::DivisionByZero => write!(f, "division by zero"),
             ExecutorError::InvalidCast { from, to } => {

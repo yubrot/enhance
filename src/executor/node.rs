@@ -5,10 +5,10 @@
 //! where each parent pulls rows from its child.
 
 use crate::datum::Value;
-use crate::sql::Expr;
+use crate::heap::Record;
 
 use super::error::ExecutorError;
-use super::eval::{eval_expr, format_expr};
+use super::eval::{format_bound_expr_with_columns, BoundExpr};
 use super::types::{ColumnDesc, Row};
 
 /// A query executor node.
@@ -59,12 +59,19 @@ impl ExecutorNode {
                 format!("{}SeqScan on {} ({} rows)", prefix, n.table_name, n.rows.len())
             }
             ExecutorNode::Filter(n) => {
-                let filter_str = format_expr(&n.predicate);
+                let child_columns = n.child.columns();
+                let filter_str =
+                    format_bound_expr_with_columns(&n.predicate, child_columns);
                 let child_str = n.child.explain(indent + 1);
                 format!("{}Filter: {}\n{}", prefix, filter_str, child_str)
             }
             ExecutorNode::Projection(n) => {
-                let cols: Vec<String> = n.exprs.iter().map(format_expr).collect();
+                let child_columns = n.child.columns();
+                let cols: Vec<String> = n
+                    .exprs
+                    .iter()
+                    .map(|e| format_bound_expr_with_columns(e, child_columns))
+                    .collect();
                 let child_str = n.child.explain(indent + 1);
                 format!("{}Projection: {}\n{}", prefix, cols.join(", "), child_str)
             }
@@ -117,13 +124,13 @@ impl SeqScan {
 pub struct Filter {
     /// Child node to pull rows from.
     child: Box<ExecutorNode>,
-    /// Predicate expression (must evaluate to boolean).
-    predicate: Expr,
+    /// Bound predicate expression (must evaluate to boolean).
+    predicate: BoundExpr,
 }
 
 impl Filter {
     /// Creates a new Filter node.
-    pub fn new(child: ExecutorNode, predicate: Expr) -> Self {
+    pub fn new(child: ExecutorNode, predicate: BoundExpr) -> Self {
         Self {
             child: Box::new(child),
             predicate,
@@ -132,11 +139,10 @@ impl Filter {
 
     /// Returns the next row that satisfies the predicate.
     fn next(&mut self) -> Result<Option<Row>, ExecutorError> {
-        let columns = self.child.columns().to_vec();
         loop {
             match self.child.next()? {
                 Some(row) => {
-                    let result = eval_expr(&self.predicate, &row, &columns)?;
+                    let result = self.predicate.evaluate(&Record::new(row.clone()))?;
                     if matches!(result, Value::Boolean(true)) {
                         return Ok(Some(row));
                     }
@@ -148,19 +154,19 @@ impl Filter {
     }
 }
 
-/// Projection node that evaluates expressions to produce output columns.
+/// Projection node that evaluates bound expressions to produce output columns.
 pub struct Projection {
     /// Child node to pull rows from.
     child: Box<ExecutorNode>,
-    /// Expressions to evaluate for each output column.
-    exprs: Vec<Expr>,
+    /// Bound expressions to evaluate for each output column.
+    exprs: Vec<BoundExpr>,
     /// Output column descriptors.
     columns: Vec<ColumnDesc>,
 }
 
 impl Projection {
     /// Creates a new Projection node.
-    pub fn new(child: ExecutorNode, exprs: Vec<Expr>, columns: Vec<ColumnDesc>) -> Self {
+    pub fn new(child: ExecutorNode, exprs: Vec<BoundExpr>, columns: Vec<ColumnDesc>) -> Self {
         Self {
             child: Box::new(child),
             exprs,
@@ -170,12 +176,12 @@ impl Projection {
 
     /// Returns the next projected row.
     fn next(&mut self) -> Result<Option<Row>, ExecutorError> {
-        let child_columns = self.child.columns().to_vec();
         match self.child.next()? {
             Some(row) => {
+                let record = Record::new(row);
                 let mut result = Vec::with_capacity(self.exprs.len());
                 for expr in &self.exprs {
-                    result.push(eval_expr(expr, &row, &child_columns)?);
+                    result.push(expr.evaluate(&record)?);
                 }
                 Ok(Some(result))
             }
@@ -264,14 +270,11 @@ mod tests {
             rows,
         ));
 
-        // Filter: id > 2
-        let predicate = Expr::BinaryOp {
-            left: Box::new(Expr::ColumnRef {
-                table: None,
-                column: "id".to_string(),
-            }),
+        // Filter: $col0 > 2
+        let predicate = BoundExpr::BinaryOp {
+            left: Box::new(BoundExpr::Column(0)),
             op: BinaryOperator::Gt,
-            right: Box::new(Expr::Integer(2)),
+            right: Box::new(BoundExpr::Integer(2)),
         };
         let mut node = ExecutorNode::Filter(Filter::new(scan, predicate));
 
@@ -300,11 +303,8 @@ mod tests {
             rows,
         ));
 
-        // Project: just the name column
-        let exprs = vec![Expr::ColumnRef {
-            table: None,
-            column: "name".to_string(),
-        }];
+        // Project: just the name column (index 1)
+        let exprs = vec![BoundExpr::Column(1)];
         let out_cols = vec![ColumnDesc {
             name: "name".to_string(),
             table_oid: 0,
@@ -341,13 +341,10 @@ mod tests {
 
         let filter = ExecutorNode::Filter(Filter::new(
             scan,
-            Expr::BinaryOp {
-                left: Box::new(Expr::ColumnRef {
-                    table: None,
-                    column: "id".to_string(),
-                }),
+            BoundExpr::BinaryOp {
+                left: Box::new(BoundExpr::Column(0)),
                 op: BinaryOperator::Gt,
-                right: Box::new(Expr::Integer(1)),
+                right: Box::new(BoundExpr::Integer(1)),
             },
         ));
 

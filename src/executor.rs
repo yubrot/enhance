@@ -31,6 +31,7 @@ mod planner;
 mod types;
 
 pub use error::ExecutorError;
+pub use eval::{bind_expr, format_bound_expr, BoundExpr};
 pub use node::ExecutorNode;
 pub use planner::plan_select;
 pub use types::{ColumnDesc, Row};
