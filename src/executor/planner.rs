@@ -16,11 +16,13 @@ use crate::sql::{Expr, FromClause, SelectItem, SelectStmt, TableRef};
 use crate::storage::{PageId, Replacer, Storage};
 use crate::tx::Snapshot;
 
+use crate::heap::{Tuple, TupleId};
+
 use super::error::ExecutorError;
-use super::eval::{bind_expr, BoundExpr};
+use super::eval::{BoundExpr, bind_expr};
 use super::node::{ExecutorNode, Filter, Projection, SeqScan, ValuesScan};
 use super::plan::Plan;
-use super::types::{ColumnDesc, Tuple, TupleId};
+use super::ColumnDesc;
 
 /// Plans a SELECT statement into a logical [`Plan`] tree.
 ///
@@ -114,8 +116,7 @@ pub fn build_executor<'a, S: Storage, R: Replacer>(
                 columns,
                 ..
             } => {
-                let tuples =
-                    scan_visible_tuples(database, snapshot, first_page, &schema).await?;
+                let tuples = scan_visible_tuples(database, snapshot, first_page, &schema).await?;
                 Ok(ExecutorNode::SeqScan(SeqScan::new(
                     table_name, columns, tuples,
                 )))
@@ -160,9 +161,7 @@ async fn build_table_ref_plan<S: Storage, R: Replacer>(
     snapshot: &Snapshot,
 ) -> Result<Plan, ExecutorError> {
     match table_ref {
-        TableRef::Table { name, alias: _ } => {
-            build_seq_scan_plan(name, database, snapshot).await
-        }
+        TableRef::Table { name, alias: _ } => build_seq_scan_plan(name, database, snapshot).await,
         TableRef::Join { .. } => Err(ExecutorError::Unsupported("JOIN".to_string())),
         TableRef::Subquery { .. } => {
             Err(ExecutorError::Unsupported("subquery in FROM".to_string()))
@@ -237,10 +236,7 @@ async fn scan_visible_tuples<S: Storage, R: Replacer>(
         if !snapshot.is_tuple_visible(&header, database.tx_manager()) {
             continue;
         }
-        let tid = TupleId {
-            page_id,
-            slot_id,
-        };
+        let tid = TupleId { page_id, slot_id };
         tuples.push(Tuple::from_heap(tid, record));
     }
 
@@ -251,10 +247,7 @@ async fn scan_visible_tuples<S: Storage, R: Replacer>(
 ///
 /// Column names and types are inferred from the AST expression *before* binding,
 /// then the expression is bound to positional indices for efficient evaluation.
-fn build_projection_plan(
-    input: Plan,
-    select_items: &[SelectItem],
-) -> Result<Plan, ExecutorError> {
+fn build_projection_plan(input: Plan, select_items: &[SelectItem]) -> Result<Plan, ExecutorError> {
     let input_columns = input.columns().to_vec();
     let mut exprs = Vec::new();
     let mut out_columns = Vec::new();
@@ -384,8 +377,10 @@ mod tests {
     use crate::storage::MemoryStorage;
     use crate::tx::CommandId;
 
-    async fn setup_test_db() -> (Arc<Database<MemoryStorage, crate::storage::LruReplacer>>, Snapshot)
-    {
+    async fn setup_test_db() -> (
+        Arc<Database<MemoryStorage, crate::storage::LruReplacer>>,
+        Snapshot,
+    ) {
         let storage = MemoryStorage::new();
         let db = Arc::new(Database::open(storage, 100).await.unwrap());
         let txid = db.tx_manager().begin();
@@ -429,7 +424,11 @@ mod tests {
         while node.next().await.unwrap().is_some() {
             count += 1;
         }
-        assert!(count >= 3, "expected at least 3 catalog tables, got {}", count);
+        assert!(
+            count >= 3,
+            "expected at least 3 catalog tables, got {}",
+            count
+        );
     }
 
     #[tokio::test]

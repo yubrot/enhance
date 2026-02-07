@@ -7,9 +7,11 @@
 use crate::datum::Value;
 use crate::heap::Record;
 
+use crate::heap::Tuple;
+
 use super::error::ExecutorError;
 use super::eval::BoundExpr;
-use super::types::{ColumnDesc, Tuple};
+use super::ColumnDesc;
 
 /// A query executor node.
 ///

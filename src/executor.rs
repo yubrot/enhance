@@ -32,7 +32,6 @@
 //! - [`explain::explain_plan`]: EXPLAIN output from logical Plan
 //! - [`eval::BoundExpr`]: Bound expression tree with compile-time column resolution
 //! - [`ColumnDesc`]: Output column metadata
-//! - [`Tuple`]: A single result tuple with optional physical location
 
 mod error;
 mod eval;
@@ -40,7 +39,8 @@ mod explain;
 mod node;
 mod plan;
 mod planner;
-mod types;
+
+use crate::datum::Type;
 
 pub use error::ExecutorError;
 pub use eval::{bind_expr, format_bound_expr, BoundExpr};
@@ -48,4 +48,16 @@ pub use explain::explain_plan;
 pub use node::ExecutorNode;
 pub use plan::Plan;
 pub use planner::{build_executor, plan_select};
-pub use types::{ColumnDesc, Tuple, TupleId};
+
+/// Metadata describing a result column.
+#[derive(Debug, Clone)]
+pub struct ColumnDesc {
+    /// Column name (or alias).
+    pub name: String,
+    /// OID of the source table (0 if not from a table).
+    pub table_oid: i32,
+    /// Column attribute number within the source table (0 if not from a table).
+    pub column_id: i16,
+    /// Data type.
+    pub data_type: Type,
+}

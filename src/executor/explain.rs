@@ -68,8 +68,8 @@ fn format_plan(plan: &Plan, indent: usize) -> String {
 mod tests {
     use super::*;
     use crate::executor::eval::BoundExpr;
-    use crate::executor::types::ColumnDesc;
     use crate::datum::Type;
+    use crate::executor::ColumnDesc;
     use crate::sql::BinaryOperator;
     use crate::storage::PageId;
 

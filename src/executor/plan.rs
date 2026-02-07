@@ -8,7 +8,7 @@ use crate::datum::Type;
 use crate::storage::PageId;
 
 use super::eval::BoundExpr;
-use super::types::ColumnDesc;
+use super::ColumnDesc;
 
 /// A logical query plan node.
 ///

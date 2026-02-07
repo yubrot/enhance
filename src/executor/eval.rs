@@ -9,7 +9,7 @@ use crate::heap::Record;
 use crate::sql::{BinaryOperator, DataType, Expr, UnaryOperator};
 
 use super::error::ExecutorError;
-use super::types::ColumnDesc;
+use super::ColumnDesc;
 
 // ---------------------------------------------------------------------------
 // BoundExpr: compile-time resolved expression tree
