@@ -1,24 +1,24 @@
 //! Executor nodes implementing the Volcano iterator model.
 //!
-//! Each node produces rows one at a time via [`ExecutorNode::next()`].
+//! Each node produces tuples one at a time via [`ExecutorNode::next()`].
 //! Nodes are composed into a tree (e.g., Projection -> Filter -> SeqScan)
-//! where each parent pulls rows from its child.
+//! where each parent pulls tuples from its child.
 
 use crate::datum::Value;
 use crate::heap::Record;
 
 use super::error::ExecutorError;
 use super::eval::{format_bound_expr_with_columns, BoundExpr};
-use super::types::{ColumnDesc, Row};
+use super::types::{ColumnDesc, Tuple};
 
 /// A query executor node.
 ///
 /// Uses enum dispatch instead of `dyn Trait` to avoid boxing async methods.
 /// This is sufficient since the number of node types is small and fixed.
 pub enum ExecutorNode {
-    /// Sequential heap scan with pre-loaded rows.
+    /// Sequential heap scan with pre-loaded tuples.
     SeqScan(SeqScan),
-    /// Row filter (WHERE clause).
+    /// Tuple filter (WHERE clause).
     Filter(Filter),
     /// Column projection (SELECT list).
     Projection(Projection),
@@ -27,12 +27,12 @@ pub enum ExecutorNode {
 }
 
 impl ExecutorNode {
-    /// Returns the next row, or `None` if exhausted.
+    /// Returns the next tuple, or `None` if exhausted.
     ///
     /// This method follows the Volcano iterator model naming convention,
     /// not `std::iter::Iterator`, because it returns `Result<Option<_>>`.
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Result<Option<Row>, ExecutorError> {
+    pub fn next(&mut self) -> Result<Option<Tuple>, ExecutorError> {
         match self {
             ExecutorNode::SeqScan(n) => n.next(),
             ExecutorNode::Filter(n) => n.next(),
@@ -56,12 +56,16 @@ impl ExecutorNode {
         let prefix = "  ".repeat(indent);
         match self {
             ExecutorNode::SeqScan(n) => {
-                format!("{}SeqScan on {} ({} rows)", prefix, n.table_name, n.rows.len())
+                format!(
+                    "{}SeqScan on {} ({} rows)",
+                    prefix,
+                    n.table_name,
+                    n.tuples.len()
+                )
             }
             ExecutorNode::Filter(n) => {
                 let child_columns = n.child.columns();
-                let filter_str =
-                    format_bound_expr_with_columns(&n.predicate, child_columns);
+                let filter_str = format_bound_expr_with_columns(&n.predicate, child_columns);
                 let child_str = n.child.explain(indent + 1);
                 format!("{}Filter: {}\n{}", prefix, filter_str, child_str)
             }
@@ -91,38 +95,38 @@ pub struct SeqScan {
     pub table_name: String,
     /// Column descriptors for the output.
     pub columns: Vec<ColumnDesc>,
-    /// Pre-loaded visible rows.
-    pub rows: Vec<Row>,
+    /// Pre-loaded visible tuples.
+    pub tuples: Vec<Tuple>,
     /// Current cursor position.
     cursor: usize,
 }
 
 impl SeqScan {
-    /// Creates a new SeqScan with pre-loaded rows.
-    pub fn new(table_name: String, columns: Vec<ColumnDesc>, rows: Vec<Row>) -> Self {
+    /// Creates a new SeqScan with pre-loaded tuples.
+    pub fn new(table_name: String, columns: Vec<ColumnDesc>, tuples: Vec<Tuple>) -> Self {
         Self {
             table_name,
             columns,
-            rows,
+            tuples,
             cursor: 0,
         }
     }
 
-    /// Returns the next row.
-    fn next(&mut self) -> Result<Option<Row>, ExecutorError> {
-        if self.cursor < self.rows.len() {
-            let row = self.rows[self.cursor].clone();
+    /// Returns the next tuple.
+    fn next(&mut self) -> Result<Option<Tuple>, ExecutorError> {
+        if self.cursor < self.tuples.len() {
+            let tuple = self.tuples[self.cursor].clone();
             self.cursor += 1;
-            Ok(Some(row))
+            Ok(Some(tuple))
         } else {
             Ok(None)
         }
     }
 }
 
-/// Filter node that applies a predicate to each row from its child.
+/// Filter node that applies a predicate to each tuple from its child.
 pub struct Filter {
-    /// Child node to pull rows from.
+    /// Child node to pull tuples from.
     child: Box<ExecutorNode>,
     /// Bound predicate expression (must evaluate to boolean).
     predicate: BoundExpr,
@@ -137,16 +141,16 @@ impl Filter {
         }
     }
 
-    /// Returns the next row that satisfies the predicate.
-    fn next(&mut self) -> Result<Option<Row>, ExecutorError> {
+    /// Returns the next tuple that satisfies the predicate.
+    fn next(&mut self) -> Result<Option<Tuple>, ExecutorError> {
         loop {
             match self.child.next()? {
-                Some(row) => {
-                    let result = self.predicate.evaluate(&Record::new(row.clone()))?;
+                Some(tuple) => {
+                    let result = self.predicate.evaluate(&tuple.record)?;
                     if matches!(result, Value::Boolean(true)) {
-                        return Ok(Some(row));
+                        return Ok(Some(tuple));
                     }
-                    // NULL and false both skip the row
+                    // NULL and false both skip the tuple
                 }
                 None => return Ok(None),
             }
@@ -156,7 +160,7 @@ impl Filter {
 
 /// Projection node that evaluates bound expressions to produce output columns.
 pub struct Projection {
-    /// Child node to pull rows from.
+    /// Child node to pull tuples from.
     child: Box<ExecutorNode>,
     /// Bound expressions to evaluate for each output column.
     exprs: Vec<BoundExpr>,
@@ -174,16 +178,15 @@ impl Projection {
         }
     }
 
-    /// Returns the next projected row.
-    fn next(&mut self) -> Result<Option<Row>, ExecutorError> {
+    /// Returns the next projected tuple.
+    fn next(&mut self) -> Result<Option<Tuple>, ExecutorError> {
         match self.child.next()? {
-            Some(row) => {
-                let record = Record::new(row);
-                let mut result = Vec::with_capacity(self.exprs.len());
+            Some(tuple) => {
+                let mut values = Vec::with_capacity(self.exprs.len());
                 for expr in &self.exprs {
-                    result.push(expr.evaluate(&record)?);
+                    values.push(expr.evaluate(&tuple.record)?);
                 }
-                Ok(Some(result))
+                Ok(Some(Tuple::computed(Record::new(values))))
             }
             None => Ok(None),
         }
@@ -210,13 +213,13 @@ impl ValuesScan {
         }
     }
 
-    /// Returns the single empty row, then `None`.
-    fn next(&mut self) -> Result<Option<Row>, ExecutorError> {
+    /// Returns the single empty tuple, then `None`.
+    fn next(&mut self) -> Result<Option<Tuple>, ExecutorError> {
         if self.done {
             Ok(None)
         } else {
             self.done = true;
-            Ok(Some(vec![]))
+            Ok(Some(Tuple::computed(Record::new(vec![]))))
         }
     }
 }
@@ -236,38 +239,53 @@ mod tests {
         }
     }
 
+    fn make_tuples(rows: Vec<Vec<Value>>) -> Vec<Tuple> {
+        rows.into_iter()
+            .map(|values| Tuple::computed(Record::new(values)))
+            .collect()
+    }
+
     #[test]
     fn test_seq_scan_cursor() {
-        let rows = vec![
+        let tuples = make_tuples(vec![
             vec![Value::Int64(1)],
             vec![Value::Int64(2)],
             vec![Value::Int64(3)],
-        ];
+        ]);
         let mut node = ExecutorNode::SeqScan(SeqScan::new(
             "test".to_string(),
             vec![int_col("id")],
-            rows,
+            tuples,
         ));
 
-        assert_eq!(node.next().unwrap(), Some(vec![Value::Int64(1)]));
-        assert_eq!(node.next().unwrap(), Some(vec![Value::Int64(2)]));
-        assert_eq!(node.next().unwrap(), Some(vec![Value::Int64(3)]));
-        assert_eq!(node.next().unwrap(), None);
-        assert_eq!(node.next().unwrap(), None); // Idempotent
+        assert_eq!(
+            node.next().unwrap().unwrap().record.values,
+            vec![Value::Int64(1)]
+        );
+        assert_eq!(
+            node.next().unwrap().unwrap().record.values,
+            vec![Value::Int64(2)]
+        );
+        assert_eq!(
+            node.next().unwrap().unwrap().record.values,
+            vec![Value::Int64(3)]
+        );
+        assert!(node.next().unwrap().is_none());
+        assert!(node.next().unwrap().is_none()); // Idempotent
     }
 
     #[test]
     fn test_filter_predicate() {
-        let rows = vec![
+        let tuples = make_tuples(vec![
             vec![Value::Int64(1)],
             vec![Value::Int64(2)],
             vec![Value::Int64(3)],
             vec![Value::Int64(4)],
-        ];
+        ]);
         let scan = ExecutorNode::SeqScan(SeqScan::new(
             "test".to_string(),
             vec![int_col("id")],
-            rows,
+            tuples,
         ));
 
         // Filter: $col0 > 2
@@ -278,17 +296,23 @@ mod tests {
         };
         let mut node = ExecutorNode::Filter(Filter::new(scan, predicate));
 
-        assert_eq!(node.next().unwrap(), Some(vec![Value::Int64(3)]));
-        assert_eq!(node.next().unwrap(), Some(vec![Value::Int64(4)]));
-        assert_eq!(node.next().unwrap(), None);
+        assert_eq!(
+            node.next().unwrap().unwrap().record.values,
+            vec![Value::Int64(3)]
+        );
+        assert_eq!(
+            node.next().unwrap().unwrap().record.values,
+            vec![Value::Int64(4)]
+        );
+        assert!(node.next().unwrap().is_none());
     }
 
     #[test]
     fn test_projection() {
-        let rows = vec![
+        let tuples = make_tuples(vec![
             vec![Value::Int64(1), Value::Text("alice".into())],
             vec![Value::Int64(2), Value::Text("bob".into())],
-        ];
+        ]);
         let scan = ExecutorNode::SeqScan(SeqScan::new(
             "test".to_string(),
             vec![
@@ -300,7 +324,7 @@ mod tests {
                     data_type: Type::Text,
                 },
             ],
-            rows,
+            tuples,
         ));
 
         // Project: just the name column (index 1)
@@ -314,29 +338,32 @@ mod tests {
         let mut node = ExecutorNode::Projection(Projection::new(scan, exprs, out_cols));
 
         assert_eq!(
-            node.next().unwrap(),
-            Some(vec![Value::Text("alice".into())])
+            node.next().unwrap().unwrap().record.values,
+            vec![Value::Text("alice".into())]
         );
         assert_eq!(
-            node.next().unwrap(),
-            Some(vec![Value::Text("bob".into())])
+            node.next().unwrap().unwrap().record.values,
+            vec![Value::Text("bob".into())]
         );
-        assert_eq!(node.next().unwrap(), None);
+        assert!(node.next().unwrap().is_none());
     }
 
     #[test]
     fn test_values_scan() {
         let mut node = ExecutorNode::ValuesScan(ValuesScan::new());
-        assert_eq!(node.next().unwrap(), Some(vec![]));
-        assert_eq!(node.next().unwrap(), None);
+        let tuple = node.next().unwrap().unwrap();
+        assert!(tuple.record.values.is_empty());
+        assert!(tuple.tid.is_none());
+        assert!(node.next().unwrap().is_none());
     }
 
     #[test]
     fn test_explain_output() {
+        let tuples = make_tuples(vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]);
         let scan = ExecutorNode::SeqScan(SeqScan::new(
             "users".to_string(),
             vec![int_col("id")],
-            vec![vec![Value::Int64(1)], vec![Value::Int64(2)]],
+            tuples,
         ));
 
         let filter = ExecutorNode::Filter(Filter::new(

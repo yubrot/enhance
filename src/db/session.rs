@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use super::Database;
 use super::error::DatabaseError;
-use crate::executor::{self, ColumnDesc, Row};
+use crate::executor::{self, ColumnDesc};
+use crate::heap::Record;
 use crate::sql::{Parser, Statement};
 use crate::storage::{Replacer, Storage};
 use crate::tx::{CommandId, TxId};
@@ -26,8 +27,8 @@ pub enum QueryResult {
     Rows {
         /// Column metadata for the result set.
         columns: Vec<ColumnDesc>,
-        /// Result rows.
-        rows: Vec<Row>,
+        /// Result rows as records.
+        rows: Vec<Record>,
     },
 }
 
@@ -188,8 +189,8 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                     let mut node = executor::plan_select(select_stmt, &db, &snapshot).await?;
                     let columns = node.columns().to_vec();
                     let mut rows = Vec::new();
-                    while let Some(row) = node.next()? {
-                        rows.push(row);
+                    while let Some(tuple) = node.next()? {
+                        rows.push(tuple.record);
                     }
                     Ok(QueryResult::Rows { columns, rows })
                 })
@@ -229,9 +230,11 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                             column_id: 0,
                             data_type: crate::datum::Type::Text,
                         }];
-                        let rows: Vec<Row> = explain_text
+                        let rows: Vec<Record> = explain_text
                             .lines()
-                            .map(|line| vec![crate::datum::Value::Text(line.to_string())])
+                            .map(|line| {
+                                Record::new(vec![crate::datum::Value::Text(line.to_string())])
+                            })
                             .collect();
                         Ok(QueryResult::Rows { columns, rows })
                     })
@@ -452,7 +455,7 @@ mod tests {
                 assert_eq!(columns[0].name, "table_name");
                 assert_eq!(rows.len(), 1);
                 assert_eq!(
-                    rows[0][0],
+                    rows[0].values[0],
                     crate::datum::Value::Text("sys_tables".to_string())
                 );
             }
@@ -499,7 +502,7 @@ mod tests {
             QueryResult::Rows { columns, rows } => {
                 assert_eq!(columns.len(), 1);
                 assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0][0], crate::datum::Value::Int64(2));
+                assert_eq!(rows[0].values[0], crate::datum::Value::Int64(2));
             }
             _ => panic!("expected Rows result"),
         }
@@ -519,7 +522,7 @@ mod tests {
             .unwrap();
         match result {
             QueryResult::Rows { rows, .. } => {
-                assert_eq!(rows[0][0], crate::datum::Value::Int64(7));
+                assert_eq!(rows[0].values[0], crate::datum::Value::Int64(7));
             }
             _ => panic!("expected Rows result"),
         }
@@ -533,7 +536,7 @@ mod tests {
         match result {
             QueryResult::Rows { rows, .. } => {
                 assert_eq!(
-                    rows[0][0],
+                    rows[0].values[0],
                     crate::datum::Value::Text("hello world".to_string())
                 );
             }
@@ -561,7 +564,7 @@ mod tests {
                 // Should contain at least a Projection and SeqScan
                 let plan_text: String = rows
                     .iter()
-                    .map(|r| match &r[0] {
+                    .map(|r| match &r.values[0] {
                         crate::datum::Value::Text(s) => s.as_str(),
                         _ => "",
                     })

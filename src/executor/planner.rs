@@ -15,7 +15,7 @@ use crate::tx::Snapshot;
 use super::error::ExecutorError;
 use super::eval::{bind_expr, BoundExpr};
 use super::node::{ExecutorNode, Filter, Projection, SeqScan, ValuesScan};
-use super::types::ColumnDesc;
+use super::types::{ColumnDesc, Tuple, TupleId};
 
 /// Plans a SELECT statement into an executor node tree.
 ///
@@ -140,12 +140,13 @@ async fn build_seq_scan<S: Storage, R: Replacer>(
     let columns = build_column_descs(&column_infos, table_info.table_id);
 
     // Scan heap page for visible tuples
-    let rows = scan_visible_tuples(database, snapshot, table_info.first_page, &schema).await?;
+    let tuples =
+        scan_visible_tuples(database, snapshot, table_info.first_page, &schema).await?;
 
     Ok(ExecutorNode::SeqScan(SeqScan::new(
         table_name.to_string(),
         columns,
-        rows,
+        tuples,
     )))
 }
 
@@ -163,25 +164,29 @@ fn build_column_descs(column_infos: &[ColumnInfo], table_id: u32) -> Vec<ColumnD
         .collect()
 }
 
-/// Scans a heap page and returns all visible tuples as rows.
+/// Scans a heap page and returns all visible tuples.
 async fn scan_visible_tuples<S: Storage, R: Replacer>(
     database: &Database<S, R>,
     snapshot: &Snapshot,
     page_id: crate::storage::PageId,
     schema: &[Type],
-) -> Result<Vec<Vec<crate::datum::Value>>, ExecutorError> {
+) -> Result<Vec<Tuple>, ExecutorError> {
     let page_guard = database.pool().fetch_page(page_id).await?;
     let page = HeapPage::new(page_guard);
 
-    let mut rows = Vec::new();
-    for (_slot_id, header, record) in page.scan(schema) {
+    let mut tuples = Vec::new();
+    for (slot_id, header, record) in page.scan(schema) {
         if !snapshot.is_tuple_visible(&header, database.tx_manager()) {
             continue;
         }
-        rows.push(record.values);
+        let tid = TupleId {
+            page_id,
+            slot_id,
+        };
+        tuples.push(Tuple::from_heap(tid, record));
     }
 
-    Ok(rows)
+    Ok(tuples)
 }
 
 /// Builds a Projection node from the SELECT list.
@@ -390,9 +395,9 @@ mod tests {
 
         let mut node = plan_select(&select, &db, &snapshot).await.unwrap();
 
-        let row = node.next().unwrap().unwrap();
-        assert_eq!(row.len(), 1);
-        assert_eq!(row[0], crate::datum::Value::Int64(42));
+        let tuple = node.next().unwrap().unwrap();
+        assert_eq!(tuple.record.values.len(), 1);
+        assert_eq!(tuple.record.values[0], crate::datum::Value::Int64(42));
         assert!(node.next().unwrap().is_none());
     }
 
@@ -460,9 +465,12 @@ mod tests {
 
         let mut node = plan_select(&select, &db, &snapshot).await.unwrap();
 
-        let row = node.next().unwrap().unwrap();
-        assert_eq!(row.len(), 1);
-        assert_eq!(row[0], crate::datum::Value::Text("sys_tables".to_string()));
+        let tuple = node.next().unwrap().unwrap();
+        assert_eq!(tuple.record.values.len(), 1);
+        assert_eq!(
+            tuple.record.values[0],
+            crate::datum::Value::Text("sys_tables".to_string())
+        );
         assert!(node.next().unwrap().is_none());
     }
 }

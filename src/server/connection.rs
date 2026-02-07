@@ -382,7 +382,7 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
     async fn send_rows(
         &mut self,
         columns: &[crate::db::ColumnDesc],
-        rows: &[crate::db::Row],
+        rows: &[crate::heap::Record],
     ) -> Result<(), ConnectionError> {
         // Send RowDescription
         let fields: Vec<FieldDescription> = columns
@@ -411,6 +411,7 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
         // Send DataRow for each row
         for row in rows {
             let values: Vec<DataValue> = row
+                .values
                 .iter()
                 .map(|v| match v {
                     Value::Null => DataValue::Null,

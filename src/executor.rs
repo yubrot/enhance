@@ -20,9 +20,9 @@
 //!
 //! - [`planner::plan_select`]: Transforms a SELECT AST into an executor node tree
 //! - [`ExecutorNode`]: Enum-dispatched executor nodes (SeqScan, Filter, Projection, ValuesScan)
-//! - [`eval::eval_expr`]: Expression evaluator for WHERE/SELECT expressions
+//! - [`eval::BoundExpr`]: Bound expression tree with compile-time column resolution
 //! - [`ColumnDesc`]: Output column metadata
-//! - [`Row`]: A single result row
+//! - [`Tuple`]: A single result tuple with optional physical location
 
 mod error;
 mod eval;
@@ -34,4 +34,4 @@ pub use error::ExecutorError;
 pub use eval::{bind_expr, format_bound_expr, BoundExpr};
 pub use node::ExecutorNode;
 pub use planner::plan_select;
-pub use types::{ColumnDesc, Row};
+pub use types::{ColumnDesc, Tuple, TupleId};

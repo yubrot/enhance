@@ -9,7 +9,11 @@ use crate::heap::Record;
 use crate::sql::{BinaryOperator, DataType, Expr, UnaryOperator};
 
 use super::error::ExecutorError;
-use super::types::{ColumnDesc, Row};
+use super::types::ColumnDesc;
+
+/// Legacy row type alias for backward compatibility with `eval_expr`.
+/// Removed in Step 3 along with `eval_expr`.
+type Row = Vec<Value>;
 
 // ---------------------------------------------------------------------------
 // BoundExpr: compile-time resolved expression tree
