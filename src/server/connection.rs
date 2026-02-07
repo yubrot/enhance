@@ -11,7 +11,7 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
 use crate::datum::Value;
-use crate::db::{Database, QueryResult, Session};
+use crate::db::{Database, DatabaseError, QueryResult, Session};
 use crate::executor::ExecutorError;
 use crate::protocol::{
     BackendMessage, BindMessage, CloseMessage, CloseTarget, DataValue, DescribeMessage,
@@ -140,23 +140,8 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
                 self.send_command_complete(format!("SELECT {}", rows.len()))
                     .await?;
             }
-            Err(crate::db::DatabaseError::Parse(err)) => {
-                let error = ErrorInfo::new(sql_state::SYNTAX_ERROR, &err.message)
-                    .with_position(err.position());
-                self.framed.send(error.into()).await?;
-            }
-            Err(crate::db::DatabaseError::Executor(ref exec_err)) => {
-                let sql_code = match exec_err {
-                    ExecutorError::TableNotFound { .. } => sql_state::UNDEFINED_TABLE,
-                    ExecutorError::ColumnNotFound { .. } => sql_state::UNDEFINED_COLUMN,
-                    _ => sql_state::INTERNAL_ERROR,
-                };
-                let error = ErrorInfo::new(sql_code, exec_err.to_string());
-                self.framed.send(error.into()).await?;
-            }
             Err(e) => {
-                let error = ErrorInfo::new(sql_state::INTERNAL_ERROR, e.to_string());
-                self.framed.send(error.into()).await?;
+                self.framed.send(Self::map_database_error(&e).into()).await?;
             }
         }
 
@@ -259,24 +244,9 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
                 self.describe_and_send(&ast).await?;
             }
             DescribeTarget::Portal => {
-                let ast = {
-                    let Some(portal) = self.state.get_portal(&msg.name) else {
-                        let error = ErrorInfo::new(
-                            sql_state::INVALID_CURSOR_NAME,
-                            format!("portal \"{}\" does not exist", msg.name),
-                        );
-                        return self.send_error(error, true).await;
-                    };
-                    let statement_name = portal.statement_name.clone();
-
-                    let Some(stmt) = self.state.get_statement(&statement_name) else {
-                        let error = ErrorInfo::new(
-                            sql_state::INVALID_SQL_STATEMENT_NAME,
-                            "statement for portal does not exist",
-                        );
-                        return self.send_error(error, true).await;
-                    };
-                    stmt.ast.clone()
+                let ast = match self.resolve_portal_ast(&msg.name) {
+                    Ok(ast) => ast,
+                    Err(error) => return self.send_error(error, true).await,
                 };
 
                 // Send RowDescription for row-returning statements, NoData otherwise
@@ -284,6 +254,29 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
             }
         }
         Ok(())
+    }
+
+    /// Resolves a portal name to the AST of its backing prepared statement.
+    fn resolve_portal_ast(
+        &self,
+        portal_name: &str,
+    ) -> Result<crate::sql::Statement, ErrorInfo> {
+        let portal = self.state.get_portal(portal_name).ok_or_else(|| {
+            ErrorInfo::new(
+                sql_state::INVALID_CURSOR_NAME,
+                format!("portal \"{}\" does not exist", portal_name),
+            )
+        })?;
+        let stmt = self
+            .state
+            .get_statement(&portal.statement_name)
+            .ok_or_else(|| {
+                ErrorInfo::new(
+                    sql_state::INVALID_SQL_STATEMENT_NAME,
+                    "statement for portal does not exist",
+                )
+            })?;
+        Ok(stmt.ast.clone())
     }
 
     /// Describes a statement and sends RowDescription or NoData.
@@ -297,10 +290,7 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
                 self.framed.send(BackendMessage::NoData).await?;
                 Ok(())
             }
-            Err(e) => {
-                let error = ErrorInfo::new(sql_state::INTERNAL_ERROR, e.to_string());
-                self.send_error(error, true).await
-            }
+            Err(e) => self.send_error(Self::map_database_error(&e), true).await,
         }
     }
 
@@ -311,26 +301,10 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
             self.pid, msg.portal_name, msg.max_rows
         );
 
-        let Some(portal) = self.state.get_portal(&msg.portal_name) else {
-            let error = ErrorInfo::new(
-                sql_state::INVALID_CURSOR_NAME,
-                format!("portal \"{}\" does not exist", msg.portal_name),
-            );
-            return self.send_error(error, true).await;
+        let ast = match self.resolve_portal_ast(&msg.portal_name) {
+            Ok(ast) => ast,
+            Err(error) => return self.send_error(error, true).await,
         };
-
-        let statement_name = portal.statement_name.clone();
-
-        let Some(stmt) = self.state.get_statement(&statement_name) else {
-            let error = ErrorInfo::new(
-                sql_state::INVALID_SQL_STATEMENT_NAME,
-                "statement for portal does not exist",
-            );
-            return self.send_error(error, true).await;
-        };
-
-        // Clone AST to avoid borrow issues
-        let ast = stmt.ast.clone();
 
         // Execute the statement via Session.
         // In the Extended Query Protocol, RowDescription is sent by Describe,
@@ -345,8 +319,7 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
                     .await?;
             }
             Err(e) => {
-                let error = ErrorInfo::new(sql_state::INTERNAL_ERROR, e.to_string());
-                return self.send_error(error, true).await;
+                return self.send_error(Self::map_database_error(&e), true).await;
             }
         }
 
@@ -433,7 +406,7 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
     async fn send_rows(
         &mut self,
         columns: &[crate::executor::ColumnDesc],
-        rows: &[crate::heap::Record],
+        rows: &[crate::executor::Row],
     ) -> Result<(), ConnectionError> {
         self.send_row_description(columns).await?;
         self.send_data_rows(rows).await
@@ -445,10 +418,11 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
     /// separately by Describe, and Execute only sends DataRow messages.
     async fn send_data_rows(
         &mut self,
-        rows: &[crate::heap::Record],
+        rows: &[crate::executor::Row],
     ) -> Result<(), ConnectionError> {
         for row in rows {
             let values: Vec<DataValue> = row
+                .record
                 .values
                 .iter()
                 .map(|v| match v {
@@ -485,5 +459,27 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
         self.framed.send(message).await?;
         self.framed.flush().await?;
         Ok(())
+    }
+
+    /// Converts a [`DatabaseError`] into a protocol [`ErrorInfo`] with an appropriate SQL state code.
+    fn map_database_error(err: &DatabaseError) -> ErrorInfo {
+        match err {
+            DatabaseError::Parse(e) => {
+                ErrorInfo::new(sql_state::SYNTAX_ERROR, &e.message).with_position(e.position())
+            }
+            DatabaseError::Executor(exec_err) => {
+                let code = match exec_err {
+                    ExecutorError::TableNotFound { .. } => sql_state::UNDEFINED_TABLE,
+                    ExecutorError::ColumnNotFound { .. } => sql_state::UNDEFINED_COLUMN,
+                    _ => sql_state::INTERNAL_ERROR,
+                };
+                ErrorInfo::new(code, exec_err.to_string())
+            }
+            DatabaseError::TransactionAborted => ErrorInfo::new(
+                sql_state::IN_FAILED_SQL_TRANSACTION,
+                err.to_string(),
+            ),
+            _ => ErrorInfo::new(sql_state::INTERNAL_ERROR, err.to_string()),
+        }
     }
 }

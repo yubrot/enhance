@@ -9,8 +9,7 @@ use std::sync::Arc;
 
 use super::Database;
 use super::error::DatabaseError;
-use crate::executor::{self, ColumnDesc};
-use crate::heap::Record;
+use crate::executor::{self, ColumnDesc, Row};
 use crate::sql::{Parser, Statement};
 use crate::storage::{Replacer, Storage};
 use crate::tx::{CommandId, TxId};
@@ -27,9 +26,15 @@ pub enum QueryResult {
     Rows {
         /// Column metadata for the result set.
         columns: Vec<ColumnDesc>,
-        /// Result rows as records.
-        rows: Vec<Record>,
+        /// Result rows.
+        rows: Vec<Row>,
     },
+}
+
+impl QueryResult {
+    fn command(tag: impl Into<String>) -> Self {
+        Self::Command { tag: tag.into() }
+    }
 }
 
 /// Transaction state for a session.
@@ -155,34 +160,18 @@ impl<S: Storage, R: Replacer> Session<S, R> {
         stmt: &Statement,
     ) -> Result<Option<Vec<ColumnDesc>>, DatabaseError> {
         match stmt {
+            Statement::Select(select_stmt) => {
+                self.within_transaction_ro(|db, txid, cid| async move {
+                    let snapshot = db.tx_manager().snapshot(txid, cid);
+                    let plan = executor::plan_select(select_stmt, &db, &snapshot).await?;
+                    Ok(Some(plan.columns().to_vec()))
+                })
+                .await
+            }
             Statement::Explain(inner) => match inner.as_ref() {
-                Statement::Select(_) => Ok(Some(vec![ColumnDesc {
-                    name: "QUERY PLAN".to_string(),
-                    source: None,
-                    data_type: crate::datum::Type::Text,
-                }])),
+                Statement::Select(_) => Ok(Some(vec![ColumnDesc::explain()])),
                 _ => Ok(None),
             },
-            Statement::Select(select_stmt) => {
-                // Create a temporary snapshot for planning without modifying session state.
-                // NOTE: A production implementation would cache the plan from Describe
-                // and reuse it in Execute to avoid redundant planning.
-                let (txid, cid, need_abort) = match self.transaction {
-                    Some(tx) if !tx.failed => (tx.txid, tx.cid, false),
-                    _ => (
-                        self.database.tx_manager().begin(),
-                        CommandId::FIRST,
-                        true,
-                    ),
-                };
-                let snapshot = self.database.tx_manager().snapshot(txid, cid);
-                let result =
-                    executor::plan_select(select_stmt, &self.database, &snapshot).await;
-                if need_abort {
-                    let _ = self.database.tx_manager().abort(txid);
-                }
-                Ok(Some(result?.columns().to_vec()))
-            }
             _ => Ok(None),
         }
     }
@@ -203,21 +192,15 @@ impl<S: Storage, R: Replacer> Session<S, R> {
         match stmt {
             Statement::Begin => {
                 self.begin();
-                Ok(QueryResult::Command {
-                    tag: "BEGIN".to_string(),
-                })
+                Ok(QueryResult::command("BEGIN"))
             }
             Statement::Commit => {
                 self.commit()?;
-                Ok(QueryResult::Command {
-                    tag: "COMMIT".to_string(),
-                })
+                Ok(QueryResult::command("COMMIT"))
             }
             Statement::Rollback => {
                 self.rollback();
-                Ok(QueryResult::Command {
-                    tag: "ROLLBACK".to_string(),
-                })
+                Ok(QueryResult::command("ROLLBACK"))
             }
             Statement::CreateTable(create_stmt) => {
                 self.within_transaction(|db, txid, cid| async move {
@@ -225,9 +208,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                         .create_table(txid, cid, create_stmt)
                         .await
                         .map_err(DatabaseError::Catalog)?;
-                    Ok(QueryResult::Command {
-                        tag: "CREATE TABLE".to_string(),
-                    })
+                    Ok(QueryResult::command("CREATE TABLE"))
                 })
                 .await
             }
@@ -239,52 +220,29 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                     let ctx = db.exec_context(snapshot);
                     let mut node = executor::ExecutorNode::build(plan, &ctx);
                     let mut rows = Vec::new();
-                    while let Some(tuple) = node.next().await? {
-                        rows.push(tuple.record);
+                    while let Some(row) = node.next().await? {
+                        rows.push(row);
                     }
                     Ok(QueryResult::Rows { columns, rows })
                 })
                 .await
             }
-            Statement::Insert(_) => Ok(QueryResult::Command {
-                tag: "INSERT 0 0".to_string(),
-            }),
-            Statement::Update(_) => Ok(QueryResult::Command {
-                tag: "UPDATE 0".to_string(),
-            }),
-            Statement::Delete(_) => Ok(QueryResult::Command {
-                tag: "DELETE 0".to_string(),
-            }),
-            Statement::DropTable(_) => Ok(QueryResult::Command {
-                tag: "DROP TABLE".to_string(),
-            }),
-            Statement::CreateIndex(_) => Ok(QueryResult::Command {
-                tag: "CREATE INDEX".to_string(),
-            }),
-            Statement::DropIndex(_) => Ok(QueryResult::Command {
-                tag: "DROP INDEX".to_string(),
-            }),
-            Statement::Set(_) => Ok(QueryResult::Command {
-                tag: "SET".to_string(),
-            }),
+            Statement::Insert(_) => Ok(QueryResult::command("INSERT0 0")),
+            Statement::Update(_) => Ok(QueryResult::command("UPDATE 0")),
+            Statement::Delete(_) => Ok(QueryResult::command("DELETE 0")),
+            Statement::DropTable(_) => Ok(QueryResult::command("DROP TABLE")),
+            Statement::CreateIndex(_) => Ok(QueryResult::command("CREATE INDEX")),
+            Statement::DropIndex(_) => Ok(QueryResult::command("DROP INDEX")),
+            Statement::Set(_) => Ok(QueryResult::command("SET")),
             Statement::Explain(inner_stmt) => match inner_stmt.as_ref() {
                 Statement::Select(select_stmt) => {
                     self.within_transaction(|db, txid, cid| async move {
                         let snapshot = db.tx_manager().snapshot(txid, cid);
                         let plan = executor::plan_select(select_stmt, &db, &snapshot).await?;
-                        let explain_text = plan.explain();
-                        let columns = vec![ColumnDesc {
-                            name: "QUERY PLAN".to_string(),
-                            source: None,
-                            data_type: crate::datum::Type::Text,
-                        }];
-                        let rows: Vec<Record> = explain_text
-                            .lines()
-                            .map(|line| {
-                                Record::new(vec![crate::datum::Value::Text(line.to_string())])
-                            })
-                            .collect();
-                        Ok(QueryResult::Rows { columns, rows })
+                        Ok(QueryResult::Rows {
+                            columns: vec![ColumnDesc::explain()],
+                            rows: plan.explain().lines().map(Row::explain_line).collect(),
+                        })
                     })
                     .await
                 }
@@ -315,11 +273,8 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 tx.cid = tx.cid.next();
                 (tx.txid, tx.cid, false)
             }
-            Some(tx) => (tx.txid, tx.cid, false),
-            None => {
-                let txid = self.database.tx_manager().begin();
-                (txid, CommandId::FIRST, true)
-            }
+            Some(_) => return Err(DatabaseError::TransactionAborted),
+            None => (self.database.tx_manager().begin(), CommandId::FIRST, true),
         };
 
         match f(Arc::clone(&self.database), txid, cid).await {
@@ -338,6 +293,23 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 Err(e)
             }
         }
+    }
+
+    /// Executes a function within a readonly transaction context.
+    async fn within_transaction_ro<T, F, Fut>(&self, f: F) -> Result<T, DatabaseError>
+    where
+        F: FnOnce(Arc<Database<S, R>>, TxId, CommandId) -> Fut,
+        Fut: Future<Output = Result<T, DatabaseError>>,
+    {
+        let (txid, cid, need_abort) = match self.transaction {
+            Some(tx) if !tx.failed => (tx.txid, tx.cid, false),
+            _ => (self.database.tx_manager().begin(), CommandId::FIRST, true),
+        };
+        let result = f(Arc::clone(&self.database), txid, cid).await;
+        if need_abort {
+            let _ = self.database.tx_manager().abort(txid);
+        }
+        result
     }
 }
 
@@ -502,7 +474,7 @@ mod tests {
         assert_eq!(columns[0].name, "table_name");
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].values[0],
+            rows[0].record.values[0],
             crate::datum::Value::Text("sys_tables".to_string())
         );
     }
@@ -545,7 +517,7 @@ mod tests {
         };
         assert_eq!(columns.len(), 1);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values[0], crate::datum::Value::Int64(2));
+        assert_eq!(rows[0].record.values[0], crate::datum::Value::Int64(2));
     }
 
     #[tokio::test]
@@ -563,7 +535,7 @@ mod tests {
         let QueryResult::Rows { rows, .. } = result else {
             panic!("expected Rows result");
         };
-        assert_eq!(rows[0].values[0], crate::datum::Value::Int64(7));
+        assert_eq!(rows[0].record.values[0], crate::datum::Value::Int64(7));
 
         // String concatenation
         let result = session
@@ -575,7 +547,7 @@ mod tests {
             panic!("expected Rows result");
         };
         assert_eq!(
-            rows[0].values[0],
+            rows[0].record.values[0],
             crate::datum::Value::Text("hello world".to_string())
         );
     }
@@ -601,7 +573,7 @@ mod tests {
         // Should contain at least a Projection and SeqScan
         let plan_text: String = rows
             .iter()
-            .map(|r| match &r.values[0] {
+            .map(|r| match &r.record.values[0] {
                 crate::datum::Value::Text(s) => s.as_str(),
                 _ => "",
             })
