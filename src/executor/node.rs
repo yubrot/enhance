@@ -3,13 +3,17 @@
 //! Each node produces tuples one at a time via [`ExecutorNode::next()`].
 //! Nodes are composed into a tree (e.g., Projection -> Filter -> SeqScan)
 //! where each parent pulls tuples from its child.
+//!
+//! All nodes are generic over [`ExecContext`], which provides storage
+//! operations. This keeps executor logic decoupled from concrete storage types.
 
-use crate::datum::Value;
+use crate::datum::{Type, Value};
 use crate::heap::Record;
-
 use crate::heap::Tuple;
+use crate::storage::PageId;
 
 use super::ColumnDesc;
+use super::context::ExecContext;
 use super::error::ExecutorError;
 use super::expr::BoundExpr;
 
@@ -17,24 +21,24 @@ use super::expr::BoundExpr;
 ///
 /// Uses enum dispatch instead of `dyn Trait` to avoid boxing async methods.
 /// This is sufficient since the number of node types is small and fixed.
-pub enum ExecutorNode {
-    /// Sequential heap scan with pre-loaded tuples.
-    SeqScan(SeqScan),
+///
+/// Generic over [`ExecContext`] to decouple from concrete storage types.
+pub enum ExecutorNode<C: ExecContext> {
+    /// Sequential heap scan with lazy page loading.
+    SeqScan(SeqScan<C>),
     /// Tuple filter (WHERE clause).
-    Filter(Filter),
+    Filter(Filter<C>),
     /// Column projection (SELECT list).
-    Projection(Projection),
+    Projection(Projection<C>),
     /// Single-row scan for queries without FROM (e.g., `SELECT 1+1`).
     ValuesScan(ValuesScan),
 }
 
-impl ExecutorNode {
+impl<C: ExecContext> ExecutorNode<C> {
     /// Returns the next tuple, or `None` if exhausted.
     ///
     /// This method follows the Volcano iterator model naming convention,
     /// not `std::iter::Iterator`, because it returns `Result<Option<_>>`.
-    /// The async signature prepares for future page-level streaming where
-    /// SeqScan would fetch pages lazily.
     ///
     /// Uses `Pin<Box<...>>` to break the recursive future cycle
     /// (ExecutorNode -> Filter -> ExecutorNode).
@@ -65,58 +69,76 @@ impl ExecutorNode {
     }
 }
 
-/// Sequential scan node that pre-loads all visible tuples from a heap page.
+/// Sequential scan node that lazily loads visible tuples page-by-page.
 ///
-/// Pre-loading avoids holding page latches across `next()` calls and
-/// sidesteps lifetime issues with page guards.
+/// Tuples are loaded one page at a time via [`ExecContext::scan_heap_page`],
+/// avoiding holding page latches across `next()` calls and keeping memory
+/// usage proportional to a single page rather than the entire table.
 ///
-/// NOTE: For future streaming, this node would accept a `HeapScanner`
-/// instead of a pre-loaded `Vec`, fetching pages lazily via `next().await`.
-pub struct SeqScan {
+/// NOTE: Multi-page support will read next_page from the page header here.
+/// Currently only the first page is scanned.
+pub struct SeqScan<C: ExecContext> {
     /// Table name (for identification).
     pub table_name: String,
     /// Column descriptors for the output.
     pub columns: Vec<ColumnDesc>,
-    /// Pre-loaded visible tuples.
-    pub tuples: Vec<Tuple>,
-    /// Current cursor position.
-    cursor: usize,
+    /// Execution context for page I/O.
+    ctx: C,
+    /// Column data types for record deserialization.
+    schema: Vec<Type>,
+    /// Next page to scan, or `None` if exhausted.
+    next_page_id: Option<PageId>,
+    /// Buffer of tuples from the current page (ownership-based, no clone).
+    buffer: std::vec::IntoIter<Tuple>,
 }
 
-impl SeqScan {
-    /// Creates a new SeqScan with pre-loaded tuples.
-    pub fn new(table_name: String, columns: Vec<ColumnDesc>, tuples: Vec<Tuple>) -> Self {
+impl<C: ExecContext> SeqScan<C> {
+    /// Creates a new SeqScan targeting a specific first page.
+    pub fn new(
+        table_name: String,
+        columns: Vec<ColumnDesc>,
+        ctx: C,
+        schema: Vec<Type>,
+        first_page: PageId,
+    ) -> Self {
         Self {
             table_name,
             columns,
-            tuples,
-            cursor: 0,
+            ctx,
+            schema,
+            next_page_id: Some(first_page),
+            buffer: Vec::new().into_iter(),
         }
     }
 
-    /// Returns the next tuple.
+    /// Returns the next visible tuple, loading pages lazily as needed.
     async fn next(&mut self) -> Result<Option<Tuple>, ExecutorError> {
-        if self.cursor < self.tuples.len() {
-            let tuple = self.tuples[self.cursor].clone();
-            self.cursor += 1;
-            Ok(Some(tuple))
-        } else {
-            Ok(None)
+        loop {
+            if let Some(tuple) = self.buffer.next() {
+                return Ok(Some(tuple));
+            }
+            let page_id = match self.next_page_id.take() {
+                Some(id) => id,
+                None => return Ok(None),
+            };
+            let tuples = self.ctx.scan_heap_page(page_id, &self.schema).await?;
+            // NOTE: Multi-page support will read next_page from page header here.
+            self.buffer = tuples.into_iter();
         }
     }
 }
 
 /// Filter node that applies a predicate to each tuple from its child.
-pub struct Filter {
+pub struct Filter<C: ExecContext> {
     /// Child node to pull tuples from.
-    child: Box<ExecutorNode>,
+    child: Box<ExecutorNode<C>>,
     /// Bound predicate expression (must evaluate to boolean).
     predicate: BoundExpr,
 }
 
-impl Filter {
+impl<C: ExecContext> Filter<C> {
     /// Creates a new Filter node.
-    pub fn new(child: ExecutorNode, predicate: BoundExpr) -> Self {
+    pub fn new(child: ExecutorNode<C>, predicate: BoundExpr) -> Self {
         Self {
             child: Box::new(child),
             predicate,
@@ -141,18 +163,18 @@ impl Filter {
 }
 
 /// Projection node that evaluates bound expressions to produce output columns.
-pub struct Projection {
+pub struct Projection<C: ExecContext> {
     /// Child node to pull tuples from.
-    child: Box<ExecutorNode>,
+    child: Box<ExecutorNode<C>>,
     /// Bound expressions to evaluate for each output column.
     exprs: Vec<BoundExpr>,
     /// Output column descriptors.
     columns: Vec<ColumnDesc>,
 }
 
-impl Projection {
+impl<C: ExecContext> Projection<C> {
     /// Creates a new Projection node.
-    pub fn new(child: ExecutorNode, exprs: Vec<BoundExpr>, columns: Vec<ColumnDesc>) -> Self {
+    pub fn new(child: ExecutorNode<C>, exprs: Vec<BoundExpr>, columns: Vec<ColumnDesc>) -> Self {
         Self {
             child: Box::new(child),
             exprs,
@@ -209,7 +231,7 @@ impl ValuesScan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datum::Type;
+    use crate::executor::context::MockContext;
     use crate::sql::BinaryOperator;
 
     fn int_col(name: &str) -> ColumnDesc {
@@ -229,16 +251,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_seq_scan_cursor() {
+    async fn test_seq_scan_lazy_loading() {
         let tuples = make_tuples(vec![
             vec![Value::Int64(1)],
             vec![Value::Int64(2)],
             vec![Value::Int64(3)],
         ]);
+        let ctx = MockContext::single_page(tuples);
         let mut node = ExecutorNode::SeqScan(SeqScan::new(
             "test".to_string(),
             vec![int_col("id")],
-            tuples,
+            ctx,
+            vec![Type::Int8],
+            PageId::new(0),
         ));
 
         assert_eq!(
@@ -265,10 +290,13 @@ mod tests {
             vec![Value::Int64(3)],
             vec![Value::Int64(4)],
         ]);
+        let ctx = MockContext::single_page(tuples);
         let scan = ExecutorNode::SeqScan(SeqScan::new(
             "test".to_string(),
             vec![int_col("id")],
-            tuples,
+            ctx,
+            vec![Type::Int8],
+            PageId::new(0),
         ));
 
         // Filter: $col0 > 2
@@ -299,6 +327,7 @@ mod tests {
             vec![Value::Int64(1), Value::Text("alice".into())],
             vec![Value::Int64(2), Value::Text("bob".into())],
         ]);
+        let ctx = MockContext::single_page(tuples);
         let scan = ExecutorNode::SeqScan(SeqScan::new(
             "test".to_string(),
             vec![
@@ -311,7 +340,9 @@ mod tests {
                     data_type: Type::Text,
                 },
             ],
-            tuples,
+            ctx,
+            vec![Type::Int8, Type::Text],
+            PageId::new(0),
         ));
 
         // Project: just the name column (index 1)
@@ -341,7 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_values_scan() {
-        let mut node = ExecutorNode::ValuesScan(ValuesScan::new());
+        let mut node: ExecutorNode<MockContext> = ExecutorNode::ValuesScan(ValuesScan::new());
         let tuple = node.next().await.unwrap().unwrap();
         assert!(tuple.record.values.is_empty());
         assert!(tuple.tid.is_none());

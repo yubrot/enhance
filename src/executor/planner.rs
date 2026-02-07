@@ -5,20 +5,15 @@
 //! The plan is then materialized into an [`ExecutorNode`] tree by
 //! [`build_executor`].
 
-use std::future::Future;
-use std::pin::Pin;
-
 use crate::catalog::ColumnInfo;
 use crate::datum::Type;
 use crate::db::Database;
-use crate::heap::HeapPage;
 use crate::sql::{Expr, FromClause, SelectItem, SelectStmt, TableRef};
-use crate::storage::{PageId, Replacer, Storage};
+use crate::storage::{Replacer, Storage};
 use crate::tx::Snapshot;
 
-use crate::heap::{Tuple, TupleId};
-
 use super::ColumnDesc;
+use super::context::ExecContext;
 use super::error::ExecutorError;
 use super::expr::BoundExpr;
 use super::node::{ExecutorNode, Filter, Projection, SeqScan, ValuesScan};
@@ -92,52 +87,37 @@ pub async fn plan_select<S: Storage, R: Replacer>(
 
 /// Materializes a logical [`Plan`] into a physical [`ExecutorNode`] tree.
 ///
-/// Currently pre-loads all tuples from heap pages into memory. For future
-/// streaming support:
-///
-/// 1. Define a `HeapScanner` trait or `Pin<Box<dyn Stream<Item = ...>>>`
-/// 2. Inject a scanner into SeqScan instead of pre-loaded `Vec`
-/// 3. `SeqScan::next().await` fetches pages lazily via the scanner
-/// 4. Plan, explain, and all other nodes remain unchanged
-///
-/// The async `next()` introduced here is the prerequisite that makes
-/// this transition non-breaking.
-pub fn build_executor<'a, S: Storage, R: Replacer>(
-    plan: Plan,
-    database: &'a Database<S, R>,
-    snapshot: &'a Snapshot,
-) -> Pin<Box<dyn Future<Output = Result<ExecutorNode, ExecutorError>> + Send + 'a>> {
-    Box::pin(async move {
-        match plan {
-            Plan::SeqScan {
-                table_name,
-                first_page,
-                schema,
-                columns,
-                ..
-            } => {
-                let tuples = scan_visible_tuples(database, snapshot, first_page, &schema).await?;
-                Ok(ExecutorNode::SeqScan(SeqScan::new(
-                    table_name, columns, tuples,
-                )))
-            }
-            Plan::Filter { input, predicate } => {
-                let child = build_executor(*input, database, snapshot).await?;
-                Ok(ExecutorNode::Filter(Filter::new(child, predicate)))
-            }
-            Plan::Projection {
-                input,
-                exprs,
-                columns,
-            } => {
-                let child = build_executor(*input, database, snapshot).await?;
-                Ok(ExecutorNode::Projection(Projection::new(
-                    child, exprs, columns,
-                )))
-            }
-            Plan::ValuesScan => Ok(ExecutorNode::ValuesScan(ValuesScan::new())),
+/// This is a synchronous function — no I/O happens here. All storage access
+/// is deferred to [`ExecutorNode::next()`] via the [`ExecContext`].
+pub fn build_executor<C: ExecContext>(plan: Plan, ctx: &C) -> ExecutorNode<C> {
+    match plan {
+        Plan::SeqScan {
+            table_name,
+            first_page,
+            schema,
+            columns,
+            ..
+        } => ExecutorNode::SeqScan(SeqScan::new(
+            table_name,
+            columns,
+            ctx.clone(),
+            schema,
+            first_page,
+        )),
+        Plan::Filter { input, predicate } => {
+            let child = build_executor(*input, ctx);
+            ExecutorNode::Filter(Filter::new(child, predicate))
         }
-    })
+        Plan::Projection {
+            input,
+            exprs,
+            columns,
+        } => {
+            let child = build_executor(*input, ctx);
+            ExecutorNode::Projection(Projection::new(child, exprs, columns))
+        }
+        Plan::ValuesScan => ExecutorNode::ValuesScan(ValuesScan::new()),
+    }
 }
 
 /// Builds a plan from a FROM clause.
@@ -224,28 +204,6 @@ fn build_column_descs(
             data_type: col.data_type,
         })
         .collect()
-}
-
-/// Scans a heap page and returns all visible tuples.
-async fn scan_visible_tuples<S: Storage, R: Replacer>(
-    database: &Database<S, R>,
-    snapshot: &Snapshot,
-    page_id: PageId,
-    schema: &[Type],
-) -> Result<Vec<Tuple>, ExecutorError> {
-    let page_guard = database.pool().fetch_page(page_id).await?;
-    let page = HeapPage::new(page_guard);
-
-    let mut tuples = Vec::new();
-    for (slot_id, header, record) in page.scan(schema) {
-        if !snapshot.is_tuple_visible(&header, database.tx_manager()) {
-            continue;
-        }
-        let tid = TupleId { page_id, slot_id };
-        tuples.push(Tuple::from_heap(tid, record));
-    }
-
-    Ok(tuples)
 }
 
 /// Builds a Projection plan from the SELECT list.
@@ -388,6 +346,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::db::Database;
+    use crate::executor::ExecContextImpl;
     use crate::storage::MemoryStorage;
     use crate::tx::CommandId;
 
@@ -433,7 +392,9 @@ mod tests {
         assert_eq!(plan.columns()[2].name, "first_page");
 
         // Materialize and verify rows
-        let mut node = build_executor(plan, &db, &snapshot).await.unwrap();
+        let ctx =
+            ExecContextImpl::new(Arc::clone(db.pool()), Arc::clone(db.tx_manager()), snapshot);
+        let mut node = build_executor(plan, &ctx);
         let mut count = 0;
         while node.next().await.unwrap().is_some() {
             count += 1;
@@ -466,7 +427,9 @@ mod tests {
         };
 
         let plan = plan_select(&select, &db, &snapshot).await.unwrap();
-        let mut node = build_executor(plan, &db, &snapshot).await.unwrap();
+        let ctx =
+            ExecContextImpl::new(Arc::clone(db.pool()), Arc::clone(db.tx_manager()), snapshot);
+        let mut node = build_executor(plan, &ctx);
 
         let tuple = node.next().await.unwrap().unwrap();
         assert_eq!(tuple.record.values.len(), 1);
@@ -537,7 +500,9 @@ mod tests {
         };
 
         let plan = plan_select(&select, &db, &snapshot).await.unwrap();
-        let mut node = build_executor(plan, &db, &snapshot).await.unwrap();
+        let ctx =
+            ExecContextImpl::new(Arc::clone(db.pool()), Arc::clone(db.tx_manager()), snapshot);
+        let mut node = build_executor(plan, &ctx);
 
         let tuple = node.next().await.unwrap().unwrap();
         assert_eq!(tuple.record.values.len(), 1);

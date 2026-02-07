@@ -20,7 +20,7 @@
 //! ExecutorNode tree (with data):
 //!   Projection
 //!     └── Filter
-//!           └── SeqScan (pre-loads visible tuples from heap page)
+//!           └── SeqScan (lazily loads visible tuples page-by-page)
 //! ```
 //!
 //! # Components
@@ -33,6 +33,7 @@
 //! - [`expr::BoundExpr`]: Bound expression tree with compile-time column resolution
 //! - [`ColumnDesc`]: Output column metadata
 
+mod context;
 mod error;
 mod eval;
 mod expr;
@@ -42,6 +43,7 @@ mod planner;
 
 use crate::datum::Type;
 
+pub use context::{ExecContext, ExecContextImpl};
 pub use error::ExecutorError;
 pub use expr::BoundExpr;
 pub use node::ExecutorNode;

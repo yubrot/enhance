@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use super::Database;
 use super::error::DatabaseError;
-use crate::executor::{self, ColumnDesc};
+use crate::executor::{self, ColumnDesc, ExecContextImpl};
 use crate::heap::Record;
 use crate::sql::{Parser, Statement};
 use crate::storage::{Replacer, Storage};
@@ -188,7 +188,12 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                     let snapshot = db.tx_manager().snapshot(txid, cid);
                     let plan = executor::plan_select(select_stmt, &db, &snapshot).await?;
                     let columns = plan.columns().to_vec();
-                    let mut node = executor::build_executor(plan, &db, &snapshot).await?;
+                    let ctx = ExecContextImpl::new(
+                        Arc::clone(db.pool()),
+                        Arc::clone(db.tx_manager()),
+                        snapshot,
+                    );
+                    let mut node = executor::build_executor(plan, &ctx);
                     let mut rows = Vec::new();
                     while let Some(tuple) = node.next().await? {
                         rows.push(tuple.record);
