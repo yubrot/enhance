@@ -19,6 +19,8 @@ pub enum DatabaseError {
     Transaction(TxError),
     /// Executor error.
     Executor(ExecutorError),
+    /// The current transaction is aborted; commands are ignored until ROLLBACK.
+    TransactionAborted,
 }
 
 impl std::fmt::Display for DatabaseError {
@@ -29,6 +31,10 @@ impl std::fmt::Display for DatabaseError {
             DatabaseError::BufferPool(e) => write!(f, "buffer pool error: {}", e),
             DatabaseError::Transaction(e) => write!(f, "transaction error: {}", e),
             DatabaseError::Executor(e) => write!(f, "{}", e),
+            DatabaseError::TransactionAborted => write!(
+                f,
+                "current transaction is aborted, commands ignored until end of transaction block"
+            ),
         }
     }
 }
@@ -41,6 +47,7 @@ impl std::error::Error for DatabaseError {
             DatabaseError::BufferPool(e) => Some(e),
             DatabaseError::Transaction(e) => Some(e),
             DatabaseError::Executor(e) => Some(e),
+            DatabaseError::TransactionAborted => None,
         }
     }
 }

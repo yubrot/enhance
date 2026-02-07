@@ -22,6 +22,10 @@ pub mod sql_state {
     /// Invalid cursor name (e.g., portal/cursor does not exist)
     pub const INVALID_CURSOR_NAME: &str = "34000";
 
+    // Class 25 - Invalid Transaction State
+    /// Current transaction is aborted, commands ignored until end of transaction block
+    pub const IN_FAILED_SQL_TRANSACTION: &str = "25P02";
+
     // Class 42 - Syntax Error or Access Rule Violation
     /// Syntax error
     pub const SYNTAX_ERROR: &str = "42601";
