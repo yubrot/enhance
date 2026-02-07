@@ -1,7 +1,7 @@
 //! Logical query plan representation.
 //!
 //! A [`Plan`] describes *what* to execute without loading any data.
-//! It is produced by the planner and then materialized into an
+//! It is produced by the planner and then converted into an
 //! [`ExecutorNode`](super::node::ExecutorNode) by [`ExecutorNode::build`](super::node::ExecutorNode::build).
 
 use crate::datum::Type;

@@ -6,31 +6,31 @@
 //! # Architecture
 //!
 //! ```text
-//! AST (SelectStmt)
-//!       |
-//! [Planner] -- resolves tables via Catalog, produces logical Plan
-//!       |
-//! Plan tree (no data):
-//!   Projection
-//!     └── Filter
-//!           └── SeqScan
-//!       |
-//! [ExecutorNode::build] -- materializes Plan into ExecutorNode
-//!       |
-//! ExecutorNode tree (with data):
-//!   Projection
-//!     └── Filter
-//!           └── SeqScan (lazily loads visible tuples page-by-page)
+//! +------------------------+
+//! |    AST (SelectStmt)    |  <- Expr: column names as strings
+//! +-----------+------------+
+//!             | plan_select (resolves tables, binds Expr to BoundExpr)
+//!             v
+//! +------------------------+
+//! |          Plan          |  <- BoundExpr: column names resolved to indices
+//! |  Projection            |
+//! |    └── Filter          |
+//! |          └── SeqScan   |
+//! +-----------+------------+
+//!             | ExecutorNode::build (converts Plan into ExecutorNode)
+//!             v
+//! +------------------------+
+//! |      ExecutorNode      |  <- Physical tree (lazy page I/O via next())
+//! |  Projection            |
+//! |    └── Filter          |
+//! |          └── SeqScan   |
+//! +------------------------+
 //! ```
 //!
 //! # Components
 //!
-//! - [`planner::plan_select`]: Transforms a SELECT AST into a logical Plan
-//! - [`ExecutorNode::build`]: Materializes a Plan into an ExecutorNode tree
 //! - [`Plan`]: Logical query plan (no data)
 //! - [`ExecutorNode`]: Physical executor nodes with async `next()` (Volcano model)
-//! - [`Plan::explain`]: EXPLAIN output from logical Plan
-//! - [`expr::BoundExpr`]: Bound expression tree with compile-time column resolution
 //! - [`ColumnDesc`]: Output column metadata
 
 mod context;

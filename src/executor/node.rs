@@ -36,7 +36,7 @@ pub enum ExecutorNode<C: ExecContext> {
 }
 
 impl<C: ExecContext> ExecutorNode<C> {
-    /// Materializes a logical [`Plan`] into a physical `ExecutorNode` tree.
+    /// Converts a logical [`Plan`] into a physical `ExecutorNode` tree.
     ///
     /// This is a synchronous function — no I/O happens here. All storage access
     /// is deferred to [`ExecutorNode::next()`] via the [`ExecContext`].
