@@ -40,4 +40,5 @@ mise run psql
 - Prefer `Result` over panicking for recoverable errors
 - Throughout the codebase, `NOTE:` comments document production improvements that are intentionally deferred to keep the learning implementation minimal
 - In tests, prefer `let-else` with `panic!` in the else branch over `match` with a wildcard panic arm when asserting on a specific enum variant. This reduces nesting and improves readability. Use judgment: if `let-else` would be more verbose (e.g., when only checking the variant with `assert!(matches!(...))`), keep the existing form
+- In tests, upper layers may use lower-layer functionality to set up test data. For example, executor and server tests should use `Parser::new(sql).parse()` to obtain AST nodes instead of constructing them manually
 
