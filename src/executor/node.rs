@@ -78,6 +78,11 @@ impl<C: ExecContext> ExecutorNode<C> {
     ///
     /// Uses `Pin<Box<...>>` to break the recursive future cycle
     /// (ExecutorNode -> Filter -> ExecutorNode).
+    ///
+    /// NOTE: Each call heap-allocates a `Box<dyn Future>`. For large scans
+    /// (Sort/Aggregate in Step 12), this per-row overhead may be significant.
+    /// Consider enum-based future dispatch or manual state machines if profiling
+    /// identifies this as a bottleneck.
     #[allow(clippy::should_implement_trait)]
     pub fn next(
         &mut self,
@@ -219,6 +224,10 @@ impl<C: ExecContext> Projection<C> {
     }
 
     /// Returns the next projected tuple.
+    ///
+    /// NOTE: Allocates a new Vec and Record per row. For production, consider
+    /// arena allocation or a reusable row buffer to reduce GC pressure on
+    /// large result sets.
     async fn next(&mut self) -> Result<Option<Row>, ExecutorError> {
         match self.child.next().await? {
             Some(tuple) => {

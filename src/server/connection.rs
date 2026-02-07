@@ -254,8 +254,10 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
                     })
                     .await?;
 
-                // For stub: Send NoData (no result columns yet)
-                // NOTE: Real implementation analyzes query to determine columns
+                // NOTE: Always returns NoData, so Extended Query Protocol clients
+                // cannot discover result column metadata before execution. This
+                // affects EXPLAIN and SELECT via prepared statements. A real
+                // implementation would plan the query here to produce RowDescription.
                 self.framed.send(BackendMessage::NoData).await?;
             }
             DescribeTarget::Portal => {

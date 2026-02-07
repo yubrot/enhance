@@ -386,6 +386,10 @@ fn promote_to_int64(v: &Value) -> Result<Value, ExecutorError> {
 ///
 /// Values are promoted to a common type before comparison.
 /// Boolean ordering: false < true.
+///
+/// NOTE: NaN floats are treated as equal to each other and equal to any
+/// non-NaN value when `partial_cmp` returns `None`. PostgreSQL treats NaN
+/// as greater than all non-NaN values. This will matter for ORDER BY (Step 12).
 fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering, ExecutorError> {
     match (left, right) {
         (Value::Boolean(a), Value::Boolean(b)) => Ok(a.cmp(b)),
@@ -601,6 +605,10 @@ fn value_type_name(v: &Value) -> String {
 }
 
 /// LIKE pattern matching with support for % and _ wildcards.
+///
+/// NOTE: The recursive backtracking implementation has worst-case O(n*m)
+/// complexity for patterns with multiple `%` wildcards (e.g., `%a%b%c%d%`).
+/// Production systems compile patterns into NFAs for linear-time matching.
 fn like_match(s: &str, pattern: &str, escape: Option<char>, case_insensitive: bool) -> bool {
     let s_chars: Vec<char> = if case_insensitive {
         s.to_lowercase().chars().collect()

@@ -69,6 +69,11 @@ impl<S: Storage, R: Replacer> ExecContextImpl<S, R> {
 }
 
 impl<S: Storage, R: Replacer> ExecContext for ExecContextImpl<S, R> {
+    // NOTE: All visible tuples from the page are loaded into a Vec<Row>
+    // so that the page latch is released before returning to the caller. This
+    // minimizes latch hold time but means memory usage is proportional to tuples
+    // per page. For production, consider streaming with explicit latch management,
+    // especially once Sort/Aggregate (Step 12) may need to scan large tables.
     async fn scan_heap_page(
         &self,
         page_id: PageId,

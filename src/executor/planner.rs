@@ -102,6 +102,9 @@ async fn build_table_ref_plan<S: Storage, R: Replacer>(
     snapshot: &Snapshot,
 ) -> Result<Plan, ExecutorError> {
     match table_ref {
+        // NOTE: Table alias is ignored. Queries like `SELECT t.id FROM sys_tables AS t`
+        // will fail to resolve `t.id`. Alias support requires propagating the alias
+        // into ColumnSource::table_name so that qualified column resolution uses it.
         TableRef::Table { name, alias: _ } => build_seq_scan_plan(name, database, snapshot).await,
         TableRef::Join { .. } => Err(ExecutorError::Unsupported("JOIN".to_string())),
         TableRef::Subquery { .. } => {
@@ -198,8 +201,9 @@ fn resolve_select_item(
         SelectItem::Wildcard => Ok(expand_all_columns(input_columns)),
         SelectItem::QualifiedWildcard(table_name) => {
             // NOTE: Currently expands all input columns regardless of table_name,
-            // since only single-table queries are supported. JOINs would require
-            // filtering by table_name here.
+            // since only single-table queries are supported. Step 19 (Nested Loop
+            // Join) requires filtering columns by table_name here so that `t1.*`
+            // does not include `t2`'s columns.
             let expanded = expand_all_columns(input_columns);
             if expanded.is_empty() {
                 return Err(ExecutorError::TableNotFound {
@@ -307,6 +311,9 @@ fn infer_data_type(expr: &Expr, columns: &[ColumnDesc]) -> Type {
             Type::Bool
         }
         Expr::Cast { data_type, .. } => data_type.to_type(),
+        // NOTE: Unrecognized expressions fall back to Text, similar to PostgreSQL's
+        // "unknown" type. This may cause issues in Step 11 (DML) where INSERT needs
+        // accurate type inference for literal values to match target column types.
         _ => Type::Text,
     }
 }
