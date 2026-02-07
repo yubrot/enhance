@@ -26,6 +26,13 @@ cargo run
 mise run psql
 ```
 
+## Communication Style
+
+- When refactoring Rust code, always run `cargo test` AND `cargo clippy` after changes. Do not consider a task complete until both pass with zero warnings
+- Do NOT make changes beyond what was explicitly requested. If you notice adjacent improvements (removing doc comments, inlining variables, removing calls), mention them but do not apply them without explicit approval
+- When the user suggests a design change, critically evaluate it against domain semantics before implementing. If the suggestion could violate correctness (e.g., RDBMS transaction semantics, PostgreSQL behavior), raise the concern BEFORE writing code rather than implementing and reverting
+- This is a self-built RDBMS engine in Rust. PostgreSQL is a design reference, NOT a compatibility target. Do not imply PostgreSQL compatibility in documentation or code comments
+
 ## Code Style
 
 - Use named module files (`src/foo.rs`) instead of `mod.rs` files
