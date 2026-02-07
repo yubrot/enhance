@@ -68,9 +68,9 @@ impl Plan {
     /// # Example output
     ///
     /// ```text
-    /// Projection: table_id, table_name
-    ///   Filter: (table_id > 1)
-    ///     SeqScan on sys_tables
+    /// Projection: $col0 (table_id), $col1 (table_name)
+    ///   Filter: ($col0 (table_id) > 1)
+    ///     SeqScan on sys_tables (cols: table_id, table_name, first_page)
     /// ```
     pub fn explain(&self) -> String {
         self.format_explain(0)
