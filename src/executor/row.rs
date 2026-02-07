@@ -32,4 +32,13 @@ impl Row {
     pub fn computed(record: Record) -> Self {
         Self { tid: None, record }
     }
+
+    /// Creates a single-column text row for EXPLAIN output.
+    ///
+    /// Corresponds to [`super::ColumnDesc::explain()`].
+    pub fn explain_line(line: &str) -> Self {
+        Self::computed(Record::new(vec![crate::datum::Value::Text(
+            line.to_string(),
+        )]))
+    }
 }
