@@ -295,6 +295,22 @@ async fn test_psql_explain_select() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_psql_explain_extended_query() {
+    let server = PsqlTestServer::start().await;
+
+    // Test EXPLAIN via Extended Query Protocol (Parse/Bind/Execute)
+    let result = server.run_psql(
+        r#"
+EXPLAIN SELECT * FROM sys_tables \parse explain_stmt
+\bind_named explain_stmt \g
+\q
+"#,
+    );
+    result.assert_success();
+    result.assert_output_contains("SeqScan");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_psql_select_table_not_found() {
     let server = PsqlTestServer::start().await;
 

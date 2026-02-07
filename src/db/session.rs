@@ -139,6 +139,54 @@ impl<S: Storage, R: Replacer> Session<S, R> {
         }
     }
 
+    /// Returns the output column descriptions for a statement without executing it.
+    ///
+    /// Used by the Extended Query Protocol's Describe message to send
+    /// `RowDescription` before Execute.
+    ///
+    /// Returns `None` for statements that don't produce rows (DDL, DML,
+    /// transaction control).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if query planning fails (e.g., table not found).
+    pub async fn describe_statement(
+        &self,
+        stmt: &Statement,
+    ) -> Result<Option<Vec<ColumnDesc>>, DatabaseError> {
+        match stmt {
+            Statement::Explain(inner) => match inner.as_ref() {
+                Statement::Select(_) => Ok(Some(vec![ColumnDesc {
+                    name: "QUERY PLAN".to_string(),
+                    source: None,
+                    data_type: crate::datum::Type::Text,
+                }])),
+                _ => Ok(None),
+            },
+            Statement::Select(select_stmt) => {
+                // Create a temporary snapshot for planning without modifying session state.
+                // NOTE: A production implementation would cache the plan from Describe
+                // and reuse it in Execute to avoid redundant planning.
+                let (txid, cid, need_abort) = match self.transaction {
+                    Some(tx) if !tx.failed => (tx.txid, tx.cid, false),
+                    _ => (
+                        self.database.tx_manager().begin(),
+                        CommandId::FIRST,
+                        true,
+                    ),
+                };
+                let snapshot = self.database.tx_manager().snapshot(txid, cid);
+                let result =
+                    executor::plan_select(select_stmt, &self.database, &snapshot).await;
+                if need_abort {
+                    let _ = self.database.tx_manager().abort(txid);
+                }
+                Ok(Some(result?.columns().to_vec()))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Executes a parsed SQL statement.
     ///
     /// This is used by both the Simple Query Protocol (after parsing)
@@ -561,6 +609,70 @@ mod tests {
             .join("\n");
         assert!(plan_text.contains("SeqScan"));
         assert!(plan_text.contains("Projection"));
+    }
+
+    #[tokio::test]
+    async fn test_describe_explain_select() {
+        let storage = Arc::new(MemoryStorage::new());
+        let db = Arc::new(Database::open(storage, 100).await.unwrap());
+        let session = Session::new(db);
+
+        let stmt = Parser::new("EXPLAIN SELECT * FROM sys_tables")
+            .parse()
+            .unwrap()
+            .unwrap();
+
+        let columns = session
+            .describe_statement(&stmt)
+            .await
+            .unwrap()
+            .expect("EXPLAIN SELECT should return columns");
+
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "QUERY PLAN");
+        assert_eq!(columns[0].data_type, crate::datum::Type::Text);
+        assert!(columns[0].source.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_describe_select() {
+        let storage = Arc::new(MemoryStorage::new());
+        let db = Arc::new(Database::open(storage, 100).await.unwrap());
+        let session = Session::new(db);
+
+        let stmt = Parser::new("SELECT table_id, table_name FROM sys_tables")
+            .parse()
+            .unwrap()
+            .unwrap();
+
+        let columns = session
+            .describe_statement(&stmt)
+            .await
+            .unwrap()
+            .expect("SELECT should return columns");
+
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name, "table_id");
+        assert_eq!(columns[1].name, "table_name");
+    }
+
+    #[tokio::test]
+    async fn test_describe_non_query() {
+        let storage = Arc::new(MemoryStorage::new());
+        let db = Arc::new(Database::open(storage, 100).await.unwrap());
+        let session = Session::new(db);
+
+        let stmt = Parser::new("CREATE TABLE test (id INT)")
+            .parse()
+            .unwrap()
+            .unwrap();
+
+        let result = session.describe_statement(&stmt).await.unwrap();
+        assert!(result.is_none(), "DDL should return None");
+
+        let stmt = Parser::new("BEGIN").parse().unwrap().unwrap();
+        let result = session.describe_statement(&stmt).await.unwrap();
+        assert!(result.is_none(), "Transaction control should return None");
     }
 
     #[tokio::test]
