@@ -95,20 +95,9 @@ mod tests {
     use super::*;
 
     fn dummy_stmt() -> PreparedStatement {
-        use crate::sql::{SelectItem, SelectStmt};
+        use crate::sql::Parser;
         PreparedStatement {
-            ast: Statement::Select(Box::new(SelectStmt {
-                distinct: false,
-                columns: vec![SelectItem::Wildcard],
-                from: None,
-                where_clause: None,
-                group_by: vec![],
-                having: None,
-                order_by: vec![],
-                limit: None,
-                offset: None,
-                locking: None,
-            })),
+            ast: Parser::new("SELECT *").parse().unwrap().unwrap(),
             param_types: vec![],
         }
     }

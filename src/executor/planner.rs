@@ -102,10 +102,9 @@ async fn build_table_ref_plan<S: Storage, R: Replacer>(
     snapshot: &Snapshot,
 ) -> Result<Plan, ExecutorError> {
     match table_ref {
-        // NOTE: Table alias is ignored. Queries like `SELECT t.id FROM sys_tables AS t`
-        // will fail to resolve `t.id`. Alias support requires propagating the alias
-        // into ColumnSource::table_name so that qualified column resolution uses it.
-        TableRef::Table { name, alias: _ } => build_seq_scan_plan(name, database, snapshot).await,
+        TableRef::Table { name, alias } => {
+            build_seq_scan_plan(name, alias.as_deref(), database, snapshot).await
+        }
         TableRef::Join { .. } => Err(ExecutorError::Unsupported("JOIN".to_string())),
         TableRef::Subquery { .. } => {
             Err(ExecutorError::Unsupported("subquery in FROM".to_string()))
@@ -114,8 +113,12 @@ async fn build_table_ref_plan<S: Storage, R: Replacer>(
 }
 
 /// Builds a SeqScan plan by looking up the table in the catalog.
+///
+/// When `alias` is provided, it is used as the column source table name
+/// so that qualified references like `t.id` resolve correctly.
 async fn build_seq_scan_plan<S: Storage, R: Replacer>(
     table_name: &str,
+    alias: Option<&str>,
     database: &Database<S, R>,
     snapshot: &Snapshot,
 ) -> Result<Plan, ExecutorError> {
@@ -137,8 +140,9 @@ async fn build_seq_scan_plan<S: Storage, R: Replacer>(
     // Build schema (data types) for record deserialization
     let schema: Vec<Type> = column_infos.iter().map(|c| c.data_type).collect();
 
-    // Build column descriptors
-    let columns = build_column_descs(&column_infos, table_info.table_id, table_name);
+    // Build column descriptors — use alias for column resolution if provided
+    let resolve_name = alias.unwrap_or(table_name);
+    let columns = build_column_descs(&column_infos, table_info.table_id, resolve_name);
 
     Ok(Plan::SeqScan {
         table_name: table_name.to_string(),
@@ -198,13 +202,9 @@ fn resolve_select_item(
     input_columns: &[ColumnDesc],
 ) -> Result<Vec<(BoundExpr, ColumnDesc)>, ExecutorError> {
     match item {
-        SelectItem::Wildcard => Ok(expand_all_columns(input_columns)),
+        SelectItem::Wildcard => Ok(expand_columns(input_columns, None)),
         SelectItem::QualifiedWildcard(table_name) => {
-            // NOTE: Currently expands all input columns regardless of table_name,
-            // since only single-table queries are supported. Step 19 (Nested Loop
-            // Join) requires filtering columns by table_name here so that `t1.*`
-            // does not include `t2`'s columns.
-            let expanded = expand_all_columns(input_columns);
+            let expanded = expand_columns(input_columns, Some(table_name));
             if expanded.is_empty() {
                 return Err(ExecutorError::TableNotFound {
                     name: table_name.clone(),
@@ -220,11 +220,26 @@ fn resolve_select_item(
     }
 }
 
-/// Expands all input columns into `(BoundExpr::Column, ColumnDesc)` pairs.
-fn expand_all_columns(input_columns: &[ColumnDesc]) -> Vec<(BoundExpr, ColumnDesc)> {
+/// Expands input columns into `(BoundExpr::Column, ColumnDesc)` pairs.
+///
+/// When `table_name` is `Some`, only columns whose source table matches are
+/// included. When `None`, all columns are expanded. The `BoundExpr::Column`
+/// index always refers to the position in the full input schema so that
+/// downstream evaluation resolves correctly.
+fn expand_columns(
+    input_columns: &[ColumnDesc],
+    table_name: Option<&str>,
+) -> Vec<(BoundExpr, ColumnDesc)> {
     input_columns
         .iter()
         .enumerate()
+        .filter(|(_, col)| match table_name {
+            Some(name) => col
+                .source
+                .as_ref()
+                .is_some_and(|s| s.table_name == name),
+            None => true,
+        })
         .map(|(i, col)| {
             let expr = BoundExpr::Column {
                 index: i,
@@ -324,6 +339,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::db::Database;
+    use crate::sql::{Parser, Statement};
     use crate::storage::MemoryStorage;
     use crate::tx::CommandId;
 
@@ -338,31 +354,21 @@ mod tests {
         (db, snapshot)
     }
 
+    fn parse_select(sql: &str) -> SelectStmt {
+        let stmt = Parser::new(sql).parse().unwrap().unwrap();
+        let Statement::Select(select) = stmt else {
+            panic!("expected SELECT statement");
+        };
+        *select
+    }
+
     #[tokio::test]
     async fn test_plan_select_from_sys_tables() {
         let (db, snapshot) = setup_test_db().await;
-
-        let select = SelectStmt {
-            distinct: false,
-            columns: vec![SelectItem::Wildcard],
-            from: Some(FromClause {
-                tables: vec![TableRef::Table {
-                    name: "sys_tables".to_string(),
-                    alias: None,
-                }],
-            }),
-            where_clause: None,
-            group_by: vec![],
-            having: None,
-            order_by: vec![],
-            limit: None,
-            offset: None,
-            locking: None,
-        };
+        let select = parse_select("SELECT * FROM sys_tables");
 
         let plan = plan_select(&select, &db, &snapshot).await.unwrap();
 
-        // Projection over SeqScan with 3 columns
         assert_eq!(plan.columns().len(), 3);
         assert_eq!(plan.columns()[0].name, "table_id");
         assert_eq!(plan.columns()[1].name, "table_name");
@@ -372,26 +378,10 @@ mod tests {
     #[tokio::test]
     async fn test_plan_select_no_from() {
         let (db, snapshot) = setup_test_db().await;
-
-        let select = SelectStmt {
-            distinct: false,
-            columns: vec![SelectItem::Expr {
-                expr: Expr::Integer(42),
-                alias: None,
-            }],
-            from: None,
-            where_clause: None,
-            group_by: vec![],
-            having: None,
-            order_by: vec![],
-            limit: None,
-            offset: None,
-            locking: None,
-        };
+        let select = parse_select("SELECT 42");
 
         let plan = plan_select(&select, &db, &snapshot).await.unwrap();
 
-        // Projection over ValuesScan with 1 expression column
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "?column?");
     }
@@ -399,24 +389,7 @@ mod tests {
     #[tokio::test]
     async fn test_plan_select_table_not_found() {
         let (db, snapshot) = setup_test_db().await;
-
-        let select = SelectStmt {
-            distinct: false,
-            columns: vec![SelectItem::Wildcard],
-            from: Some(FromClause {
-                tables: vec![TableRef::Table {
-                    name: "nonexistent".to_string(),
-                    alias: None,
-                }],
-            }),
-            where_clause: None,
-            group_by: vec![],
-            having: None,
-            order_by: vec![],
-            limit: None,
-            offset: None,
-            locking: None,
-        };
+        let select = parse_select("SELECT * FROM nonexistent");
 
         let result = plan_select(&select, &db, &snapshot).await;
         assert!(matches!(result, Err(ExecutorError::TableNotFound { .. })));
@@ -425,45 +398,12 @@ mod tests {
     #[tokio::test]
     async fn test_plan_select_with_where() {
         let (db, snapshot) = setup_test_db().await;
-
-        // SELECT table_name FROM sys_tables WHERE table_id = 1
-        let select = SelectStmt {
-            distinct: false,
-            columns: vec![SelectItem::Expr {
-                expr: Expr::ColumnRef {
-                    table: None,
-                    column: "table_name".to_string(),
-                },
-                alias: None,
-            }],
-            from: Some(FromClause {
-                tables: vec![TableRef::Table {
-                    name: "sys_tables".to_string(),
-                    alias: None,
-                }],
-            }),
-            where_clause: Some(Expr::BinaryOp {
-                left: Box::new(Expr::ColumnRef {
-                    table: None,
-                    column: "table_id".to_string(),
-                }),
-                op: crate::sql::BinaryOperator::Eq,
-                right: Box::new(Expr::Integer(1)),
-            }),
-            group_by: vec![],
-            having: None,
-            order_by: vec![],
-            limit: None,
-            offset: None,
-            locking: None,
-        };
+        let select = parse_select("SELECT table_name FROM sys_tables WHERE table_id = 1");
 
         let plan = plan_select(&select, &db, &snapshot).await.unwrap();
 
-        // Projection over Filter over SeqScan, output has 1 column
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "table_name");
-        // ColumnRef inherits source table metadata from input
         let source = plan.columns()[0].source.as_ref().expect("should have source");
         assert_eq!(source.table_name, "sys_tables");
         assert_ne!(source.table_oid, 0);
@@ -473,39 +413,10 @@ mod tests {
     #[tokio::test]
     async fn test_plan_select_expr_has_no_table_metadata() {
         let (db, snapshot) = setup_test_db().await;
-
-        // SELECT 1 + table_id FROM sys_tables
-        let select = SelectStmt {
-            distinct: false,
-            columns: vec![SelectItem::Expr {
-                expr: Expr::BinaryOp {
-                    left: Box::new(Expr::Integer(1)),
-                    op: crate::sql::BinaryOperator::Add,
-                    right: Box::new(Expr::ColumnRef {
-                        table: None,
-                        column: "table_id".to_string(),
-                    }),
-                },
-                alias: None,
-            }],
-            from: Some(FromClause {
-                tables: vec![TableRef::Table {
-                    name: "sys_tables".to_string(),
-                    alias: None,
-                }],
-            }),
-            where_clause: None,
-            group_by: vec![],
-            having: None,
-            order_by: vec![],
-            limit: None,
-            offset: None,
-            locking: None,
-        };
+        let select = parse_select("SELECT 1 + table_id FROM sys_tables");
 
         let plan = plan_select(&select, &db, &snapshot).await.unwrap();
 
-        // Computed expressions have no source table info
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "?column?");
         assert!(plan.columns()[0].source.is_none());
@@ -514,40 +425,70 @@ mod tests {
     #[tokio::test]
     async fn test_plan_select_qualified_column_ref() {
         let (db, snapshot) = setup_test_db().await;
-
-        // SELECT sys_tables.table_name FROM sys_tables
-        let select = SelectStmt {
-            distinct: false,
-            columns: vec![SelectItem::Expr {
-                expr: Expr::ColumnRef {
-                    table: Some("sys_tables".to_string()),
-                    column: "table_name".to_string(),
-                },
-                alias: None,
-            }],
-            from: Some(FromClause {
-                tables: vec![TableRef::Table {
-                    name: "sys_tables".to_string(),
-                    alias: None,
-                }],
-            }),
-            where_clause: None,
-            group_by: vec![],
-            having: None,
-            order_by: vec![],
-            limit: None,
-            offset: None,
-            locking: None,
-        };
+        let select = parse_select("SELECT sys_tables.table_name FROM sys_tables");
 
         let plan = plan_select(&select, &db, &snapshot).await.unwrap();
 
-        // Qualified ColumnRef resolves with full source table metadata
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "table_name");
         let source = plan.columns()[0].source.as_ref().expect("should have source");
         assert_eq!(source.table_name, "sys_tables");
         assert_ne!(source.table_oid, 0);
         assert_ne!(source.column_id, 0);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_qualified_wildcard() {
+        let (db, snapshot) = setup_test_db().await;
+        let select = parse_select("SELECT sys_tables.* FROM sys_tables");
+
+        let plan = plan_select(&select, &db, &snapshot).await.unwrap();
+
+        assert_eq!(plan.columns().len(), 3);
+        assert_eq!(plan.columns()[0].name, "table_id");
+        assert_eq!(plan.columns()[1].name, "table_name");
+        assert_eq!(plan.columns()[2].name, "first_page");
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_qualified_wildcard_wrong_table() {
+        let (db, snapshot) = setup_test_db().await;
+        let select = parse_select("SELECT nonexistent.* FROM sys_tables");
+
+        let result = plan_select(&select, &db, &snapshot).await;
+        assert!(matches!(result, Err(ExecutorError::TableNotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_with_table_alias() {
+        let (db, snapshot) = setup_test_db().await;
+        let select = parse_select("SELECT t.table_name FROM sys_tables AS t");
+
+        let plan = plan_select(&select, &db, &snapshot).await.unwrap();
+
+        assert_eq!(plan.columns().len(), 1);
+        assert_eq!(plan.columns()[0].name, "table_name");
+        let source = plan.columns()[0].source.as_ref().expect("should have source");
+        assert_eq!(source.table_name, "t");
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_alias_hides_original_name() {
+        let (db, snapshot) = setup_test_db().await;
+        let select = parse_select("SELECT sys_tables.table_name FROM sys_tables AS t");
+
+        let result = plan_select(&select, &db, &snapshot).await;
+        assert!(matches!(result, Err(ExecutorError::ColumnNotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_alias_qualified_wildcard() {
+        let (db, snapshot) = setup_test_db().await;
+        let select = parse_select("SELECT t.* FROM sys_tables AS t");
+
+        let plan = plan_select(&select, &db, &snapshot).await.unwrap();
+
+        assert_eq!(plan.columns().len(), 3);
+        assert_eq!(plan.columns()[0].name, "table_id");
     }
 }
