@@ -357,10 +357,10 @@ mod tests {
             .await
             .unwrap();
 
-        match result {
-            Some(QueryResult::Command { tag }) => assert_eq!(tag, "CREATE TABLE"),
-            _ => panic!("expected Command result"),
-        }
+        let Some(QueryResult::Command { tag }) = result else {
+            panic!("expected Command result");
+        };
+        assert_eq!(tag, "CREATE TABLE");
 
         // Auto-commit should leave us in idle state
         assert!(session.transaction().is_none());
@@ -374,10 +374,10 @@ mod tests {
 
         // Begin transaction
         let result = session.execute_query("BEGIN").await.unwrap();
-        match result {
-            Some(QueryResult::Command { tag }) => assert_eq!(tag, "BEGIN"),
-            _ => panic!("expected Command result"),
-        }
+        let Some(QueryResult::Command { tag }) = result else {
+            panic!("expected Command result");
+        };
+        assert_eq!(tag, "BEGIN");
         assert!(matches!(
             session.transaction(),
             Some(tx) if !tx.failed
@@ -395,10 +395,10 @@ mod tests {
 
         // Commit transaction
         let result = session.execute_query("COMMIT").await.unwrap();
-        match result {
-            Some(QueryResult::Command { tag }) => assert_eq!(tag, "COMMIT"),
-            _ => panic!("expected Command result"),
-        }
+        let Some(QueryResult::Command { tag }) = result else {
+            panic!("expected Command result");
+        };
+        assert_eq!(tag, "COMMIT");
         assert!(session.transaction().is_none());
     }
 
@@ -424,17 +424,15 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        match result {
-            QueryResult::Rows { columns, rows } => {
-                assert_eq!(columns.len(), 3);
-                assert_eq!(columns[0].name, "table_id");
-                assert_eq!(columns[1].name, "table_name");
-                assert_eq!(columns[2].name, "first_page");
-                // At least sys_tables, sys_columns, sys_sequences
-                assert!(rows.len() >= 3);
-            }
-            _ => panic!("expected Rows result"),
-        }
+        let QueryResult::Rows { columns, rows } = result else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(columns.len(), 3);
+        assert_eq!(columns[0].name, "table_id");
+        assert_eq!(columns[1].name, "table_name");
+        assert_eq!(columns[2].name, "first_page");
+        // At least sys_tables, sys_columns, sys_sequences
+        assert!(rows.len() >= 3);
     }
 
     #[tokio::test]
@@ -449,18 +447,16 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        match result {
-            QueryResult::Rows { columns, rows } => {
-                assert_eq!(columns.len(), 1);
-                assert_eq!(columns[0].name, "table_name");
-                assert_eq!(rows.len(), 1);
-                assert_eq!(
-                    rows[0].values[0],
-                    crate::datum::Value::Text("sys_tables".to_string())
-                );
-            }
-            _ => panic!("expected Rows result"),
-        }
+        let QueryResult::Rows { columns, rows } = result else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "table_name");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].values[0],
+            crate::datum::Value::Text("sys_tables".to_string())
+        );
     }
 
     #[tokio::test]
@@ -475,15 +471,13 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        match result {
-            QueryResult::Rows { columns, rows } => {
-                assert_eq!(columns.len(), 2);
-                assert_eq!(columns[0].name, "table_id");
-                assert_eq!(columns[1].name, "table_name");
-                assert!(rows.len() >= 3);
-            }
-            _ => panic!("expected Rows result"),
-        }
+        let QueryResult::Rows { columns, rows } = result else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name, "table_id");
+        assert_eq!(columns[1].name, "table_name");
+        assert!(rows.len() >= 3);
     }
 
     #[tokio::test]
@@ -498,14 +492,12 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        match result {
-            QueryResult::Rows { columns, rows } => {
-                assert_eq!(columns.len(), 1);
-                assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0].values[0], crate::datum::Value::Int64(2));
-            }
-            _ => panic!("expected Rows result"),
-        }
+        let QueryResult::Rows { columns, rows } = result else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(columns.len(), 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], crate::datum::Value::Int64(2));
     }
 
     #[tokio::test]
@@ -520,12 +512,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        match result {
-            QueryResult::Rows { rows, .. } => {
-                assert_eq!(rows[0].values[0], crate::datum::Value::Int64(7));
-            }
-            _ => panic!("expected Rows result"),
-        }
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(rows[0].values[0], crate::datum::Value::Int64(7));
 
         // String concatenation
         let result = session
@@ -533,15 +523,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        match result {
-            QueryResult::Rows { rows, .. } => {
-                assert_eq!(
-                    rows[0].values[0],
-                    crate::datum::Value::Text("hello world".to_string())
-                );
-            }
-            _ => panic!("expected Rows result"),
-        }
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(
+            rows[0].values[0],
+            crate::datum::Value::Text("hello world".to_string())
+        );
     }
 
     #[tokio::test]
@@ -556,25 +544,23 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        match result {
-            QueryResult::Rows { columns, rows } => {
-                assert_eq!(columns.len(), 1);
-                assert_eq!(columns[0].name, "QUERY PLAN");
-                assert!(!rows.is_empty());
-                // Should contain at least a Projection and SeqScan
-                let plan_text: String = rows
-                    .iter()
-                    .map(|r| match &r.values[0] {
-                        crate::datum::Value::Text(s) => s.as_str(),
-                        _ => "",
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                assert!(plan_text.contains("SeqScan"));
-                assert!(plan_text.contains("Projection"));
-            }
-            _ => panic!("expected Rows result"),
-        }
+        let QueryResult::Rows { columns, rows } = result else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "QUERY PLAN");
+        assert!(!rows.is_empty());
+        // Should contain at least a Projection and SeqScan
+        let plan_text: String = rows
+            .iter()
+            .map(|r| match &r.values[0] {
+                crate::datum::Value::Text(s) => s.as_str(),
+                _ => "",
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(plan_text.contains("SeqScan"));
+        assert!(plan_text.contains("Projection"));
     }
 
     #[tokio::test]

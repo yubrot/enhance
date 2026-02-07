@@ -1468,29 +1468,25 @@ mod tests {
     fn test_expr_precedence() {
         // 1 + 2 * 3 should be 1 + (2 * 3)
         let expr = parse_expr("1 + 2 * 3").unwrap();
-        match expr {
-            Expr::BinaryOp { op, left, right } => {
-                assert_eq!(op, BinaryOperator::Add);
-                assert!(matches!(*left, Expr::Integer(1)));
-                assert!(matches!(
-                    *right,
-                    Expr::BinaryOp {
-                        op: BinaryOperator::Mul,
-                        ..
-                    }
-                ));
+        let Expr::BinaryOp { op, left, right } = expr else {
+            panic!("expected BinaryOp");
+        };
+        assert_eq!(op, BinaryOperator::Add);
+        assert!(matches!(*left, Expr::Integer(1)));
+        assert!(matches!(
+            *right,
+            Expr::BinaryOp {
+                op: BinaryOperator::Mul,
+                ..
             }
-            _ => panic!("expected BinaryOp"),
-        }
+        ));
 
         // a AND b OR c should be (a AND b) OR c
         let expr = parse_expr("a AND b OR c").unwrap();
-        match expr {
-            Expr::BinaryOp { op, .. } => {
-                assert_eq!(op, BinaryOperator::Or);
-            }
-            _ => panic!("expected BinaryOp"),
-        }
+        let Expr::BinaryOp { op, .. } = expr else {
+            panic!("expected BinaryOp");
+        };
+        assert_eq!(op, BinaryOperator::Or);
     }
 
     #[test]
