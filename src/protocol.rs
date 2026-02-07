@@ -38,4 +38,4 @@ pub use frontend::{
     BindMessage, CloseMessage, CloseTarget, DescribeMessage, DescribeTarget, ExecuteMessage,
     FrontendMessage, ParseMessage, StartupMessage, StartupParameters,
 };
-pub use types::{ErrorFieldCode, FormatCode, type_oid};
+pub use types::{ErrorFieldCode, FormatCode};

@@ -12,14 +12,11 @@
 //!
 //! - [`HeapPage`]: Page-level tuple storage using slotted page structure
 //! - [`Record`]: Data values for a row (combined with TupleHeader to form a tuple)
-//! - [`Value`]: Typed database value enum
 
 mod error;
 mod page;
 mod record;
-mod value;
 
-pub use error::{HeapError, SerializationError};
+pub use error::HeapError;
 pub use page::{HeapPage, MAX_RECORD_SIZE, SlotId};
 pub use record::Record;
-pub use value::Value;

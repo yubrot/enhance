@@ -4,8 +4,8 @@
 //! sys_columns, sys_sequences) including their table IDs, column layouts,
 //! and conversion logic between heap records and typed structs.
 
-use crate::heap::{Record, Value};
-use crate::protocol::type_oid;
+use crate::datum::{Type, Value};
+use crate::heap::Record;
 use crate::storage::PageId;
 
 /// Last table ID reserved for system catalog tables.
@@ -29,8 +29,8 @@ pub trait SystemCatalogTable {
     /// The column names for this system catalog table.
     const COLUMN_NAMES: &'static [&'static str];
 
-    /// The schema (type OIDs) for this system catalog table.
-    const SCHEMA: &'static [i32];
+    /// The schema (data types) for this system catalog table.
+    const SCHEMA: &'static [Type];
 
     /// Returns the TableInfo for this system catalog table.
     ///
@@ -41,9 +41,9 @@ pub trait SystemCatalogTable {
 
     /// Returns the column definitions for this system catalog table.
     ///
-    /// Each tuple is (column_name, type_oid), automatically paired from
+    /// Each tuple is (column_name, data_type), automatically paired from
     /// COLUMN_NAMES and SCHEMA to guarantee consistency.
-    fn columns() -> impl IntoIterator<Item = (&'static str, i32)> {
+    fn columns() -> impl IntoIterator<Item = (&'static str, Type)> {
         Self::COLUMN_NAMES
             .iter()
             .copied()
@@ -109,7 +109,7 @@ impl SystemCatalogTable for TableInfo {
     const TABLE_ID: u32 = 1;
     const TABLE_NAME: &'static str = "sys_tables";
     const COLUMN_NAMES: &'static [&'static str] = &["table_id", "table_name", "first_page"];
-    const SCHEMA: &'static [i32] = &[type_oid::INT4, type_oid::TEXT, type_oid::INT8];
+    const SCHEMA: &'static [Type] = &[Type::Int4, Type::Text, Type::Int8];
 }
 
 /// Metadata for a column stored in the catalog (sys_columns row).
@@ -121,8 +121,8 @@ pub struct ColumnInfo {
     pub column_num: u32,
     /// Column name.
     pub column_name: String,
-    /// Type OID (using PostgreSQL's OID values for psql compatibility).
-    pub type_oid: i32,
+    /// Data type.
+    pub data_type: Type,
     /// Linked sequence ID for SERIAL columns (0 if not SERIAL).
     pub seq_id: u32,
 }
@@ -131,7 +131,7 @@ impl ColumnInfo {
     const COL_TABLE_ID: usize = 0;
     const COL_COLUMN_NUM: usize = 1;
     const COL_COLUMN_NAME: usize = 2;
-    const COL_TYPE_OID: usize = 3;
+    const COL_DATA_TYPE: usize = 3;
     const COL_SEQ_ID: usize = 4;
 
     /// Creates a new ColumnInfo.
@@ -139,14 +139,14 @@ impl ColumnInfo {
         table_id: u32,
         column_num: u32,
         column_name: String,
-        type_oid: i32,
+        data_type: Type,
         seq_id: u32,
     ) -> Self {
         Self {
             table_id,
             column_num,
             column_name,
-            type_oid,
+            data_type,
             seq_id,
         }
     }
@@ -167,8 +167,8 @@ impl ColumnInfo {
             Value::Text(s) => s.clone(),
             _ => return None,
         };
-        let type_oid = match record.values.get(Self::COL_TYPE_OID)? {
-            Value::Int32(oid) => *oid,
+        let data_type = match record.values.get(Self::COL_DATA_TYPE)? {
+            Value::Int32(oid) => Type::try_from(*oid).ok()?,
             _ => return None,
         };
         let seq_id = match record.values.get(Self::COL_SEQ_ID)? {
@@ -179,7 +179,7 @@ impl ColumnInfo {
             table_id,
             column_num,
             column_name,
-            type_oid,
+            data_type,
             seq_id,
         ))
     }
@@ -190,7 +190,7 @@ impl ColumnInfo {
             Value::Int32(self.table_id as i32),
             Value::Int32(self.column_num as i32),
             Value::Text(self.column_name.clone()),
-            Value::Int32(self.type_oid),
+            Value::Int32(self.data_type.oid()),
             Value::Int32(self.seq_id as i32),
         ])
     }
@@ -211,12 +211,12 @@ impl SystemCatalogTable for ColumnInfo {
         "type_oid",
         "seq_id",
     ];
-    const SCHEMA: &'static [i32] = &[
-        type_oid::INT4,
-        type_oid::INT4,
-        type_oid::TEXT,
-        type_oid::INT4,
-        type_oid::INT4,
+    const SCHEMA: &'static [Type] = &[
+        Type::Int4,
+        Type::Int4,
+        Type::Text,
+        Type::Int4,
+        Type::Int4,
     ];
 }
 
@@ -278,5 +278,5 @@ impl SystemCatalogTable for SequenceInfo {
     const TABLE_ID: u32 = 3;
     const TABLE_NAME: &'static str = "sys_sequences";
     const COLUMN_NAMES: &'static [&'static str] = &["seq_id", "seq_name", "next_val"];
-    const SCHEMA: &'static [i32] = &[type_oid::INT4, type_oid::TEXT, type_oid::INT8];
+    const SCHEMA: &'static [Type] = &[Type::Int4, Type::Text, Type::Int8];
 }

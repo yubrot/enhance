@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::datum::SerializationError;
+
 /// Errors from heap operations.
 #[derive(Debug)]
 pub enum HeapError {
@@ -61,53 +63,4 @@ impl From<SerializationError> for HeapError {
     fn from(err: SerializationError) -> Self {
         HeapError::Serialization(err)
     }
-}
-
-/// Errors from record serialization/deserialization.
-#[derive(Debug)]
-pub enum SerializationError {
-    /// Buffer too small for the operation.
-    BufferTooSmall {
-        /// Bytes required.
-        required: usize,
-        /// Bytes available.
-        available: usize,
-    },
-    /// Invalid data format.
-    InvalidFormat(String),
-}
-
-impl fmt::Display for SerializationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SerializationError::BufferTooSmall {
-                required,
-                available,
-            } => {
-                write!(
-                    f,
-                    "buffer too small: need {} bytes, have {}",
-                    required, available
-                )
-            }
-            SerializationError::InvalidFormat(msg) => {
-                write!(f, "invalid format: {}", msg)
-            }
-        }
-    }
-}
-
-impl std::error::Error for SerializationError {}
-
-/// Returns `SerializationError::BufferTooSmall` if the buffer is too small.
-#[macro_export]
-macro_rules! ensure_buf_len {
-    ($buf:expr, $required:expr) => {
-        if $buf.len() < $required {
-            return Err($crate::heap::SerializationError::BufferTooSmall {
-                required: $required,
-                available: $buf.len(),
-            });
-        }
-    };
 }

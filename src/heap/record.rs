@@ -1,7 +1,7 @@
 //! Record representation and serialization.
 //!
 //! A [`Record`] represents the data portion of a database row, consisting of multiple
-//! [`Value`]s. Records can be serialized to a compact binary format for storage.
+//! [`Value`](crate::datum::Value)s. Records can be serialized to a compact binary format for storage.
 //!
 //! ## Relationship to Tuples
 //!
@@ -11,8 +11,7 @@
 //!
 //! Records are combined with TupleHeaders when stored in heap pages to form complete tuples.
 
-use super::error::SerializationError;
-use super::value::Value;
+use crate::datum::{SerializationError, Type, Value};
 use crate::ensure_buf_len;
 
 /// A record (row of data values).
@@ -36,8 +35,8 @@ use crate::ensure_buf_len;
 /// # Example
 ///
 /// ```no_run
-/// use enhance::heap::{Record, Value};
-/// use enhance::protocol::type_oid;
+/// use enhance::datum::{Type, Value};
+/// use enhance::heap::Record;
 ///
 /// let record = Record::new(vec![
 ///     Value::Int32(42),
@@ -48,7 +47,7 @@ use crate::ensure_buf_len;
 /// let mut buf = vec![0u8; record.serialized_size()];
 /// record.serialize(&mut buf).unwrap();
 ///
-/// let schema = [type_oid::INT4, type_oid::TEXT, type_oid::INT4];
+/// let schema = [Type::Int4, Type::Text, Type::Int4];
 /// let parsed = Record::deserialize(&buf, &schema).unwrap();
 /// assert_eq!(parsed, record);
 /// ```
@@ -123,12 +122,12 @@ impl Record {
     /// # Arguments
     ///
     /// * `buf` - Source buffer containing serialized record data
-    /// * `schema` - Column type OIDs (needed to parse each value)
+    /// * `schema` - Column data types (needed to parse each value)
     ///
     /// # Errors
     ///
     /// Returns error if buffer is malformed or too small.
-    pub fn deserialize(buf: &[u8], schema: &[i32]) -> Result<Self, SerializationError> {
+    pub fn deserialize(buf: &[u8], schema: &[Type]) -> Result<Self, SerializationError> {
         let num_cols = schema.len();
         let null_bitmap_bytes = num_cols.div_ceil(8);
         ensure_buf_len!(buf, null_bitmap_bytes);
@@ -147,11 +146,11 @@ impl Record {
         let mut offset = null_bitmap_bytes;
         let mut values = Vec::with_capacity(num_cols);
 
-        for (i, &type_oid) in schema.iter().enumerate() {
+        for (i, &ty) in schema.iter().enumerate() {
             if is_null[i] {
                 values.push(Value::Null);
             } else {
-                let (value, bytes_read) = Value::deserialize(&buf[offset..], type_oid)?;
+                let (value, bytes_read) = Value::deserialize(&buf[offset..], ty)?;
                 values.push(value);
                 offset += bytes_read;
             }
@@ -164,7 +163,6 @@ impl Record {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::type_oid;
 
     #[test]
     fn test_empty_record() {
@@ -192,7 +190,7 @@ mod tests {
         let written = record.serialize(&mut buf).unwrap();
         assert_eq!(written, 5);
 
-        let schema = [type_oid::INT4];
+        let schema = [Type::Int4];
         let parsed = Record::deserialize(&buf, &schema).unwrap();
         assert_eq!(parsed, record);
     }
@@ -208,7 +206,7 @@ mod tests {
         let mut buf = vec![0u8; record.serialized_size()];
         record.serialize(&mut buf).unwrap();
 
-        let schema = [type_oid::INT4, type_oid::TEXT, type_oid::BOOL];
+        let schema = [Type::Int4, Type::Text, Type::Bool];
         let parsed = Record::deserialize(&buf, &schema).unwrap();
         assert_eq!(parsed, record);
     }
@@ -226,10 +224,10 @@ mod tests {
         record.serialize(&mut buf).unwrap();
 
         let schema = [
-            type_oid::INT4,
-            type_oid::TEXT,
-            type_oid::TEXT,
-            type_oid::INT4,
+            Type::Int4,
+            Type::Text,
+            Type::Text,
+            Type::Int4,
         ];
         let parsed = Record::deserialize(&buf, &schema).unwrap();
         assert_eq!(parsed, record);
@@ -244,7 +242,7 @@ mod tests {
         let mut buf = vec![0u8; record.serialized_size()];
         record.serialize(&mut buf).unwrap();
 
-        let schema = [type_oid::INT4, type_oid::TEXT, type_oid::BOOL];
+        let schema = [Type::Int4, Type::Text, Type::Bool];
         let parsed = Record::deserialize(&buf, &schema).unwrap();
         assert_eq!(parsed, record);
     }
@@ -270,7 +268,7 @@ mod tests {
         let mut buf = vec![0u8; record.serialized_size()];
         record.serialize(&mut buf).unwrap();
 
-        let schema = vec![type_oid::INT4; 9];
+        let schema = vec![Type::Int4; 9];
         let parsed = Record::deserialize(&buf, &schema).unwrap();
         assert_eq!(parsed, record);
     }
@@ -292,14 +290,14 @@ mod tests {
         record.serialize(&mut buf).unwrap();
 
         let schema = [
-            type_oid::BOOL,
-            type_oid::INT2,
-            type_oid::INT4,
-            type_oid::INT8,
-            type_oid::FLOAT4,
-            type_oid::FLOAT8,
-            type_oid::TEXT,
-            type_oid::BYTEA,
+            Type::Bool,
+            Type::Int2,
+            Type::Int4,
+            Type::Int8,
+            Type::Float4,
+            Type::Float8,
+            Type::Text,
+            Type::Bytea,
         ];
         let parsed = Record::deserialize(&buf, &schema).unwrap();
         assert_eq!(parsed, record);
@@ -320,7 +318,7 @@ mod tests {
     #[test]
     fn test_deserialize_buffer_too_small() {
         let buf = vec![0u8; 0];
-        let schema = [type_oid::INT4];
+        let schema = [Type::Int4];
 
         let result = Record::deserialize(&buf, &schema);
         assert!(matches!(
@@ -340,7 +338,7 @@ mod tests {
         let mut buf = vec![0u8; record.serialized_size()];
         record.serialize(&mut buf).unwrap();
 
-        let schema = [type_oid::TEXT];
+        let schema = [Type::Text];
         let parsed = Record::deserialize(&buf, &schema).unwrap();
         assert_eq!(parsed, record);
     }
@@ -352,7 +350,7 @@ mod tests {
         let mut buf = vec![0u8; record.serialized_size()];
         record.serialize(&mut buf).unwrap();
 
-        let schema = [type_oid::TEXT];
+        let schema = [Type::Text];
         let parsed = Record::deserialize(&buf, &schema).unwrap();
         assert_eq!(parsed, record);
     }

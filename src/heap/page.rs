@@ -25,6 +25,7 @@
 
 use super::error::HeapError;
 use super::record::Record;
+use crate::datum::Type;
 use crate::storage::{PAGE_HEADER_SIZE, PAGE_SIZE, PageHeader};
 use crate::tx::{CommandId, TUPLE_HEADER_SIZE, TupleHeader, TxId};
 
@@ -416,7 +417,7 @@ impl<T: AsRef<[u8]>> HeapPage<T> {
     /// Reads a tuple (header + record) by slot ID.
     ///
     /// Returns `None` if the slot is out of bounds or deleted.
-    pub fn get(&self, slot_id: SlotId, schema: &[i32]) -> Option<(TupleHeader, Record)> {
+    pub fn get(&self, slot_id: SlotId, schema: &[Type]) -> Option<(TupleHeader, Record)> {
         let raw = self.page.get(slot_id)?;
 
         let header = TupleHeader::read(&raw[..TUPLE_HEADER_SIZE]);
@@ -429,7 +430,7 @@ impl<T: AsRef<[u8]>> HeapPage<T> {
     /// Yields `(SlotId, TupleHeader, Record)` for each valid (non-deleted) slot.
     pub fn scan<'a>(
         &'a self,
-        schema: &'a [i32],
+        schema: &'a [Type],
     ) -> impl Iterator<Item = (SlotId, TupleHeader, Record)> + 'a {
         let header = self.page.header();
         (0..header.slot_count).filter_map(move |slot_id| {
@@ -775,8 +776,8 @@ mod tests {
 
     #[test]
     fn test_heap_page_insert() {
-        use crate::heap::{Record, Value};
-        use crate::protocol::type_oid;
+        use crate::datum::{Type, Value};
+        use crate::heap::Record;
         use crate::tx::{CommandId, TxId};
 
         let mut page = create_heap_page();
@@ -788,7 +789,7 @@ mod tests {
         assert_eq!(slot, 0);
 
         // Verify we can read it back
-        let schema = [type_oid::INT4, type_oid::TEXT];
+        let schema = [Type::Int4, Type::Text];
         let (header, read_record) = page.get(slot, &schema).unwrap();
 
         assert_eq!(header.xmin, TxId::new(1));
@@ -800,10 +801,10 @@ mod tests {
 
     #[test]
     fn test_heap_page_get_none_for_deleted_slot() {
-        use crate::protocol::type_oid;
+        use crate::datum::Type;
 
         let page = create_heap_page();
-        let schema = [type_oid::INT4];
+        let schema = [Type::Int4];
 
         // Slot doesn't exist
         assert!(page.get(0, &schema).is_none());
@@ -811,8 +812,8 @@ mod tests {
 
     #[test]
     fn test_heap_page_update_header() {
-        use crate::heap::{Record, Value};
-        use crate::protocol::type_oid;
+        use crate::datum::{Type, Value};
+        use crate::heap::Record;
         use crate::tx::{CommandId, Infomask, TupleHeader, TxId};
 
         let mut page = create_heap_page();
@@ -833,7 +834,7 @@ mod tests {
         page.update_header(slot, new_header).unwrap();
 
         // Read back and verify
-        let schema = [type_oid::INT4];
+        let schema = [Type::Int4];
         let (header, read_record) = page.get(slot, &schema).unwrap();
 
         assert_eq!(header.xmin, TxId::new(1));
@@ -844,8 +845,8 @@ mod tests {
 
     #[test]
     fn test_heap_page_scan() {
-        use crate::heap::{Record, Value};
-        use crate::protocol::type_oid;
+        use crate::datum::{Type, Value};
+        use crate::heap::Record;
         use crate::tx::{CommandId, TxId};
 
         let mut page = create_heap_page();
@@ -863,7 +864,7 @@ mod tests {
             .unwrap();
 
         // Iterate and collect
-        let schema = [type_oid::INT4];
+        let schema = [Type::Int4];
         let tuples: Vec<_> = page.scan(&schema).collect();
 
         assert_eq!(tuples.len(), 3);
@@ -882,8 +883,8 @@ mod tests {
 
     #[test]
     fn test_heap_page_insert_with_null_values() {
-        use crate::heap::{Record, Value};
-        use crate::protocol::type_oid;
+        use crate::datum::{Type, Value};
+        use crate::heap::Record;
         use crate::tx::{CommandId, TxId};
 
         let mut page = create_heap_page();
@@ -898,7 +899,7 @@ mod tests {
             .unwrap();
 
         // Read back
-        let schema = [type_oid::INT4, type_oid::INT4, type_oid::TEXT];
+        let schema = [Type::Int4, Type::Int4, Type::Text];
         let (_, read_record) = page.get(slot, &schema).unwrap();
         assert_eq!(read_record, record);
     }
@@ -918,8 +919,8 @@ mod tests {
 
     #[test]
     fn test_heap_page_update_record_in_place() {
-        use crate::heap::{Record, Value};
-        use crate::protocol::type_oid;
+        use crate::datum::{Type, Value};
+        use crate::heap::Record;
         use crate::tx::{CommandId, TxId};
 
         let mut page = create_heap_page();
@@ -935,7 +936,7 @@ mod tests {
         page.update_record_in_place(slot, &updated).unwrap();
 
         // Verify update
-        let schema = [type_oid::INT4, type_oid::INT8];
+        let schema = [Type::Int4, Type::Int8];
         let (header, read_record) = page.get(slot, &schema).unwrap();
 
         // Header unchanged
@@ -948,7 +949,8 @@ mod tests {
 
     #[test]
     fn test_heap_page_update_record_in_place_size_mismatch() {
-        use crate::heap::{Record, Value};
+        use crate::datum::Value;
+        use crate::heap::Record;
         use crate::tx::{CommandId, TxId};
 
         let mut page = create_heap_page();

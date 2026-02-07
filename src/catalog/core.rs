@@ -341,7 +341,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
                 table_id,
                 col_num as u32,
                 col_def.name.clone(),
-                col_def.data_type.to_oid(),
+                col_def.data_type.to_type(),
                 seq_id,
             ));
         }

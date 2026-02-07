@@ -3,7 +3,7 @@
 //! This module defines the data structures that represent parsed SQL statements.
 //! The AST is produced by the parser and consumed by the query planner/executor.
 
-use crate::protocol::type_oid;
+use crate::datum::Type;
 
 /// A SQL statement.
 #[derive(Debug, Clone, PartialEq)]
@@ -278,22 +278,22 @@ impl DataType {
         }
     }
 
-    /// Converts this data type to a PostgreSQL type OID for psql compatibility.
+    /// Converts this SQL data type to the corresponding database [`Type`].
     ///
     /// SERIAL columns are stored as INT4 with a linked sequence.
-    pub fn to_oid(&self) -> i32 {
+    pub fn to_type(&self) -> Type {
         match self {
-            DataType::Boolean => type_oid::BOOL,
-            DataType::Smallint => type_oid::INT2,
-            DataType::Integer => type_oid::INT4,
-            DataType::Bigint => type_oid::INT8,
-            DataType::Real => type_oid::FLOAT4,
-            DataType::DoublePrecision => type_oid::FLOAT8,
-            DataType::Text => type_oid::TEXT,
-            DataType::Varchar(_) => type_oid::VARCHAR,
-            DataType::Bytea => type_oid::BYTEA,
+            DataType::Boolean => Type::Bool,
+            DataType::Smallint => Type::Int2,
+            DataType::Integer => Type::Int4,
+            DataType::Bigint => Type::Int8,
+            DataType::Real => Type::Float4,
+            DataType::DoublePrecision => Type::Float8,
+            DataType::Text => Type::Text,
+            DataType::Varchar(_) => Type::Varchar,
+            DataType::Bytea => Type::Bytea,
             // SERIAL is stored as INT4 internally; sequence handles auto-increment
-            DataType::Serial => type_oid::INT4,
+            DataType::Serial => Type::Int4,
         }
     }
 }
@@ -589,18 +589,18 @@ mod tests {
     }
 
     #[test]
-    fn test_data_type_to_oid() {
-        assert_eq!(DataType::Boolean.to_oid(), type_oid::BOOL);
-        assert_eq!(DataType::Smallint.to_oid(), type_oid::INT2);
-        assert_eq!(DataType::Integer.to_oid(), type_oid::INT4);
-        assert_eq!(DataType::Bigint.to_oid(), type_oid::INT8);
-        assert_eq!(DataType::Real.to_oid(), type_oid::FLOAT4);
-        assert_eq!(DataType::DoublePrecision.to_oid(), type_oid::FLOAT8);
-        assert_eq!(DataType::Text.to_oid(), type_oid::TEXT);
-        assert_eq!(DataType::Varchar(Some(255)).to_oid(), type_oid::VARCHAR);
-        assert_eq!(DataType::Bytea.to_oid(), type_oid::BYTEA);
+    fn test_data_type_to_type() {
+        assert_eq!(DataType::Boolean.to_type(), Type::Bool);
+        assert_eq!(DataType::Smallint.to_type(), Type::Int2);
+        assert_eq!(DataType::Integer.to_type(), Type::Int4);
+        assert_eq!(DataType::Bigint.to_type(), Type::Int8);
+        assert_eq!(DataType::Real.to_type(), Type::Float4);
+        assert_eq!(DataType::DoublePrecision.to_type(), Type::Float8);
+        assert_eq!(DataType::Text.to_type(), Type::Text);
+        assert_eq!(DataType::Varchar(Some(255)).to_type(), Type::Varchar);
+        assert_eq!(DataType::Bytea.to_type(), Type::Bytea);
         // SERIAL is stored as INT4
-        assert_eq!(DataType::Serial.to_oid(), type_oid::INT4);
+        assert_eq!(DataType::Serial.to_type(), Type::Int4);
     }
 
     #[test]

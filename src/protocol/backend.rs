@@ -370,7 +370,7 @@ mod tests {
     use bytes::BytesMut;
     use tokio_util::codec::Encoder;
 
-    use crate::protocol::type_oid;
+    use crate::datum::Type;
 
     /// Helper to encode a message and return the buffer.
     fn encode_message(msg: BackendMessage) -> Vec<u8> {
@@ -480,7 +480,7 @@ mod tests {
                     name: "col".to_string(),
                     table_oid: 0,
                     column_id: 0,
-                    type_oid: type_oid::INT4,
+                    type_oid: Type::Int4.oid(),
                     type_size: 4,
                     type_modifier: -1,
                     format_code: FormatCode::Text,
@@ -489,7 +489,7 @@ mod tests {
                     name: "text_col".to_string(),
                     table_oid: 16384,
                     column_id: 2,
-                    type_oid: type_oid::TEXT,
+                    type_oid: Type::Text.oid(),
                     type_size: -1,
                     type_modifier: -1,
                     format_code: FormatCode::Text,
@@ -498,7 +498,7 @@ mod tests {
                     name: "binary_col".to_string(),
                     table_oid: 16384,
                     column_id: 3,
-                    type_oid: type_oid::BYTEA,
+                    type_oid: Type::Bytea.oid(),
                     type_size: -1,
                     type_modifier: -1,
                     format_code: FormatCode::Binary,
@@ -589,15 +589,15 @@ mod tests {
     #[test]
     fn test_write_parameter_description() {
         let msg = BackendMessage::ParameterDescription {
-            param_types: vec![type_oid::INT4, type_oid::TEXT, type_oid::VARCHAR],
+            param_types: vec![Type::Int4.oid(), Type::Text.oid(), Type::Varchar.oid()],
         };
         let buf = encode_message(msg);
 
         assert_eq!(buf[0], b't');
         assert_eq!(read_i32(&buf, 1), 18); // 4 + 2 + 3*4
         assert_eq!(read_i16(&buf, 5), 3); // param count
-        assert_eq!(read_i32(&buf, 7), type_oid::INT4);
-        assert_eq!(read_i32(&buf, 11), type_oid::TEXT);
-        assert_eq!(read_i32(&buf, 15), type_oid::VARCHAR);
+        assert_eq!(read_i32(&buf, 7), Type::Int4.oid());
+        assert_eq!(read_i32(&buf, 11), Type::Text.oid());
+        assert_eq!(read_i32(&buf, 15), Type::Varchar.oid());
     }
 }

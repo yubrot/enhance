@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod datum;
 pub mod db;
 pub mod heap;
 pub mod protocol;

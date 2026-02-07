@@ -443,7 +443,7 @@ mod tests {
     use bytes::{BufMut, BytesMut};
     use tokio_util::codec::Decoder;
 
-    use crate::protocol::type_oid;
+    use crate::datum::Type;
 
     /// Helper to create a startup message with given code and body
     fn make_startup_message(code: i32, body: &[u8]) -> Vec<u8> {
@@ -597,8 +597,8 @@ mod tests {
         body.push(0); // empty (unnamed) statement - commonly used in PostgreSQL
         body.extend_from_slice(b"SELECT $1, $2\0");
         body.put_i16(2); // 2 parameters
-        body.put_i32(type_oid::INT4);
-        body.put_i32(type_oid::TEXT);
+        body.put_i32(Type::Int4.oid());
+        body.put_i32(Type::Text.oid());
 
         let buf = make_frontend_message(b'P', &body);
         let msg = decode_frontend_message(&buf).unwrap().unwrap();
@@ -609,7 +609,7 @@ mod tests {
 
         assert_eq!(parse.statement_name, ""); // unnamed statement
         assert_eq!(parse.query, "SELECT $1, $2");
-        assert_eq!(parse.param_types, vec![type_oid::INT4, type_oid::TEXT]);
+        assert_eq!(parse.param_types, vec![Type::Int4.oid(), Type::Text.oid()]);
     }
 
     #[test]
@@ -618,7 +618,7 @@ mod tests {
         body.extend_from_slice(b"portal\0");
         body.extend_from_slice(b"SELECT $1\0");
         body.put_i16(1);
-        body.put_i32(type_oid::INT4);
+        body.put_i32(Type::Int4.oid());
 
         let buf = make_frontend_message(b'P', &body);
         let msg = decode_frontend_message(&buf).unwrap().unwrap();
@@ -629,7 +629,7 @@ mod tests {
 
         assert_eq!(parse.statement_name, "portal");
         assert_eq!(parse.query, "SELECT $1");
-        assert_eq!(parse.param_types, vec![type_oid::INT4]);
+        assert_eq!(parse.param_types, vec![Type::Int4.oid()]);
     }
 
     #[test]
