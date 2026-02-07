@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::datum::Value;
 use crate::db::{Database, QueryResult, Session};
+use crate::executor::ExecutorError;
 use crate::protocol::{
     BackendMessage, BindMessage, CloseMessage, CloseTarget, DataValue, DescribeMessage,
     DescribeTarget, ErrorInfo, ExecuteMessage, FieldDescription, FormatCode, FrontendMessage,
@@ -132,16 +133,11 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
                 self.framed.send(BackendMessage::EmptyQueryResponse).await?;
             }
             Ok(Some(QueryResult::Command { tag })) => {
-                self.framed
-                    .send(BackendMessage::CommandComplete { tag })
-                    .await?;
+                self.send_command_complete(tag).await?;
             }
             Ok(Some(QueryResult::Rows { columns, rows })) => {
                 self.send_rows(&columns, &rows).await?;
-                self.framed
-                    .send(BackendMessage::CommandComplete {
-                        tag: format!("SELECT {}", rows.len()),
-                    })
+                self.send_command_complete(format!("SELECT {}", rows.len()))
                     .await?;
             }
             Err(crate::db::DatabaseError::Parse(err)) => {
@@ -151,12 +147,8 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
             }
             Err(crate::db::DatabaseError::Executor(ref exec_err)) => {
                 let sql_code = match exec_err {
-                    crate::executor::ExecutorError::TableNotFound { .. } => {
-                        sql_state::UNDEFINED_TABLE
-                    }
-                    crate::executor::ExecutorError::ColumnNotFound { .. } => {
-                        sql_state::UNDEFINED_COLUMN
-                    }
+                    ExecutorError::TableNotFound { .. } => sql_state::UNDEFINED_TABLE,
+                    ExecutorError::ColumnNotFound { .. } => sql_state::UNDEFINED_COLUMN,
                     _ => sql_state::INTERNAL_ERROR,
                 };
                 let error = ErrorInfo::new(sql_code, exec_err.to_string());
@@ -313,16 +305,11 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
         // Execute the statement via Session
         match self.session.execute_statement(&ast).await {
             Ok(QueryResult::Command { tag }) => {
-                self.framed
-                    .send(BackendMessage::CommandComplete { tag })
-                    .await?;
+                self.send_command_complete(tag).await?;
             }
             Ok(QueryResult::Rows { columns, rows }) => {
                 self.send_rows(&columns, &rows).await?;
-                self.framed
-                    .send(BackendMessage::CommandComplete {
-                        tag: format!("SELECT {}", rows.len()),
-                    })
+                self.send_command_complete(format!("SELECT {}", rows.len()))
                     .await?;
             }
             Err(e) => {
@@ -385,28 +372,27 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
         rows: &[crate::heap::Record],
     ) -> Result<(), ConnectionError> {
         // Send RowDescription
-        let fields: Vec<FieldDescription> = columns
-            .iter()
-            .map(|col| {
-                let type_size = col.data_type.fixed_size().map(|s| s as i16).unwrap_or(-1);
-                let (table_oid, column_id) = col
-                    .source
-                    .as_ref()
-                    .map_or((0, 0), |s| (s.table_oid, s.column_id));
-                FieldDescription {
-                    name: col.name.clone(),
-                    table_oid,
-                    column_id,
-                    type_oid: col.data_type.oid(),
-                    type_size,
-                    type_modifier: -1,
-                    format_code: FormatCode::Text,
-                }
-            })
-            .collect();
-        self.framed
-            .send(BackendMessage::RowDescription { fields })
-            .await?;
+        let row_description = BackendMessage::RowDescription {
+            fields: columns
+                .iter()
+                .map(|col| {
+                    let (table_oid, column_id) = match &col.source {
+                        Some(s) => (s.table_oid, s.column_id),
+                        None => (0, 0),
+                    };
+                    FieldDescription {
+                        name: col.name.clone(),
+                        table_oid,
+                        column_id,
+                        type_oid: col.data_type.oid(),
+                        type_size: col.data_type.fixed_size().map(|s| s as i16).unwrap_or(-1),
+                        type_modifier: -1,
+                        format_code: FormatCode::Text,
+                    }
+                })
+                .collect(),
+        };
+        self.framed.send(row_description).await?;
 
         // Send DataRow for each row
         for row in rows {
@@ -421,6 +407,14 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
             self.framed.send(BackendMessage::DataRow { values }).await?;
         }
 
+        Ok(())
+    }
+
+    /// Sends a CommandComplete message with the given tag.
+    async fn send_command_complete(&mut self, tag: String) -> Result<(), ConnectionError> {
+        self.framed
+            .send(BackendMessage::CommandComplete { tag })
+            .await?;
         Ok(())
     }
 
