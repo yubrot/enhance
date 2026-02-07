@@ -2,7 +2,7 @@
 //!
 //! Provides a simple interface for setting up a test server and running psql commands.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -67,29 +67,45 @@ impl PsqlTestServer {
         Self { port, handle }
     }
 
-    /// Runs psql with the given input and returns the result.
-    ///
-    /// The input is piped to psql's stdin.
+    /// Runs psql with input piped to stdin for meta-commands
+    /// (`\parse`, `\bind_named`, etc.) that require interactive mode.
     pub fn run_psql(&self, input: &str) -> PsqlOutput {
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "echo '{}' | psql -h 127.0.0.1 -p {} -U postgres 2>&1",
-                input, self.port
-            ))
-            .output()
+        let mut child = Command::new("psql")
+            .args([
+                "-h",
+                "127.0.0.1",
+                "-p",
+                &self.port.to_string(),
+                "-U",
+                "postgres",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .expect("Failed to execute psql");
 
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin.write_all(input.as_bytes()).unwrap();
+        }
+
+        let output = child.wait_with_output().expect("Failed to wait on psql");
+
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
         PsqlOutput {
-            output: String::from_utf8_lossy(&output.stdout).to_string(),
+            output: combined,
             exit_code: output.status.code().unwrap_or(-1),
         }
     }
 
-    /// Runs psql with the given query using -c flag (handles quoting correctly).
-    ///
-    /// Use this instead of `run_psql` when the SQL contains single quotes.
-    pub fn run_psql_direct(&self, query: &str) -> PsqlOutput {
+    /// Runs psql with the given query using `-c` flag and returns the result.
+    pub fn run_psql_c(&self, query: &str) -> PsqlOutput {
         let output = Command::new("psql")
             .args([
                 "-h",
