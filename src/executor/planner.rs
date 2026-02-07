@@ -12,7 +12,7 @@ use crate::tx::Snapshot;
 
 use super::ColumnDesc;
 use super::error::ExecutorError;
-use super::expr::BoundExpr;
+use super::expr::{BoundExpr, resolve_column_index};
 use super::plan::Plan;
 
 /// Plans a SELECT statement into a logical [`Plan`] tree.
@@ -111,8 +111,6 @@ async fn build_table_ref_plan<S: Storage, R: Replacer>(
 }
 
 /// Builds a SeqScan plan by looking up the table in the catalog.
-///
-/// No data is loaded — only catalog metadata is gathered.
 async fn build_seq_scan_plan<S: Storage, R: Replacer>(
     table_name: &str,
     database: &Database<S, R>,
@@ -168,95 +166,116 @@ fn build_column_descs(
 }
 
 /// Builds a Projection plan from the SELECT list.
-///
-/// Column names and types are inferred from the AST expression *before* binding,
-/// then the expression is bound to positional indices for efficient evaluation.
 fn build_projection_plan(input: Plan, select_items: &[SelectItem]) -> Result<Plan, ExecutorError> {
     let input_columns = input.columns().to_vec();
     let mut exprs = Vec::new();
-    let mut out_columns = Vec::new();
+    let mut columns = Vec::new();
 
     for item in select_items {
-        match item {
-            SelectItem::Wildcard => {
-                // Expand to all input columns using positional indices
-                for (i, col) in input_columns.iter().enumerate() {
-                    exprs.push(BoundExpr::Column {
-                        index: i,
-                        name: Some(col.name.clone()),
-                    });
-                    out_columns.push(ColumnDesc {
-                        name: col.name.clone(),
-                        table_name: col.table_name.clone(),
-                        table_oid: col.table_oid,
-                        column_id: col.column_id,
-                        data_type: col.data_type,
-                    });
-                }
-            }
-            SelectItem::QualifiedWildcard(table_name) => {
-                // Expand to all columns from the specified table
-                let mut found = false;
-                for (i, col) in input_columns.iter().enumerate() {
-                    // For single-table queries, we match by checking if the child is a
-                    // SeqScan with the matching table name. Since we only support
-                    // single-table queries now, all columns belong to the table.
-                    // A more sophisticated check would be needed for JOINs.
-                    let _ = table_name;
-                    found = true;
-                    exprs.push(BoundExpr::Column {
-                        index: i,
-                        name: Some(col.name.clone()),
-                    });
-                    out_columns.push(ColumnDesc {
-                        name: col.name.clone(),
-                        table_name: col.table_name.clone(),
-                        table_oid: col.table_oid,
-                        column_id: col.column_id,
-                        data_type: col.data_type,
-                    });
-                }
-                if !found {
-                    return Err(ExecutorError::TableNotFound {
-                        name: table_name.clone(),
-                    });
-                }
-            }
-            SelectItem::Expr { expr, alias } => {
-                // Infer name and type from AST before binding
-                let col_name = alias.clone().unwrap_or_else(|| infer_column_name(expr));
-                let col_data_type = infer_data_type(expr, &input_columns);
-
-                // Bind column names to positional indices
-                let bound = BoundExpr::bind(expr, &input_columns)?;
-
-                exprs.push(bound);
-                out_columns.push(ColumnDesc {
-                    name: col_name,
-                    table_name: None,
-                    table_oid: 0,
-                    column_id: 0,
-                    data_type: col_data_type,
-                });
-            }
+        for (expr, desc) in resolve_select_item(item, &input_columns)? {
+            exprs.push(expr);
+            columns.push(desc);
         }
     }
 
     Ok(Plan::Projection {
         input: Box::new(input),
         exprs,
-        columns: out_columns,
+        columns,
     })
 }
 
-/// Infers a column name from an expression (for un-aliased expressions).
-fn infer_column_name(expr: &Expr) -> String {
-    match expr {
-        Expr::ColumnRef { column, .. } => column.clone(),
-        Expr::Function { name, .. } => name.clone(),
-        Expr::Cast { data_type, .. } => data_type.display_name().to_lowercase(),
-        _ => "?column?".to_string(),
+/// Resolves a single [`SelectItem`] into `(BoundExpr, ColumnDesc)` pairs.
+///
+/// Wildcards expand to all input columns; expressions produce a single pair.
+fn resolve_select_item(
+    item: &SelectItem,
+    input_columns: &[ColumnDesc],
+) -> Result<Vec<(BoundExpr, ColumnDesc)>, ExecutorError> {
+    match item {
+        SelectItem::Wildcard => Ok(expand_all_columns(input_columns)),
+        SelectItem::QualifiedWildcard(table_name) => {
+            // NOTE: Currently expands all input columns regardless of table_name,
+            // since only single-table queries are supported. JOINs would require
+            // filtering by table_name here.
+            let expanded = expand_all_columns(input_columns);
+            if expanded.is_empty() {
+                return Err(ExecutorError::TableNotFound {
+                    name: table_name.clone(),
+                });
+            }
+            Ok(expanded)
+        }
+        SelectItem::Expr { expr, alias } => {
+            let bound = BoundExpr::bind(expr, input_columns)?;
+            let desc = infer_column_desc(expr, alias.as_deref(), input_columns);
+            Ok(vec![(bound, desc)])
+        }
     }
+}
+
+/// Expands all input columns into `(BoundExpr::Column, ColumnDesc)` pairs.
+fn expand_all_columns(input_columns: &[ColumnDesc]) -> Vec<(BoundExpr, ColumnDesc)> {
+    input_columns
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            let expr = BoundExpr::Column {
+                index: i,
+                name: Some(col.name.clone()),
+            };
+            (expr, col.clone())
+        })
+        .collect()
+}
+
+/// Infers the output [`ColumnDesc`] for an expression.
+///
+/// For column references, looks up the full metadata (including source table info)
+/// from the input columns. For other expressions, infers name and type heuristically
+/// with no source table info.
+fn infer_column_desc(expr: &Expr, alias: Option<&str>, input_columns: &[ColumnDesc]) -> ColumnDesc {
+    let mut desc = match expr {
+        Expr::ColumnRef { table, column } => {
+            match resolve_column_index(table.as_deref(), column, input_columns) {
+                Ok(i) => input_columns[i].clone(),
+                Err(_) => ColumnDesc {
+                    name: column.clone(),
+                    table_name: None,
+                    table_oid: 0,
+                    column_id: 0,
+                    data_type: Type::Text,
+                },
+            }
+        }
+        Expr::Function { name, .. } => ColumnDesc {
+            name: name.clone(),
+            table_name: None,
+            table_oid: 0,
+            column_id: 0,
+            data_type: infer_data_type(expr, input_columns),
+        },
+        Expr::Cast { data_type, .. } => ColumnDesc {
+            name: data_type.display_name().to_lowercase(),
+            table_name: None,
+            table_oid: 0,
+            column_id: 0,
+            data_type: infer_data_type(expr, input_columns),
+        },
+        _ => ColumnDesc {
+            name: "?column?".to_string(),
+            table_name: None,
+            table_oid: 0,
+            column_id: 0,
+            data_type: infer_data_type(expr, input_columns),
+        },
+    };
+
+    if let Some(alias) = alias {
+        desc.name = alias.to_string();
+    }
+
+    desc
 }
 
 /// Infers the output data type from an expression.
@@ -266,14 +285,11 @@ fn infer_column_name(expr: &Expr) -> String {
 /// determined at evaluation time and may differ.
 fn infer_data_type(expr: &Expr, columns: &[ColumnDesc]) -> Type {
     match expr {
-        Expr::ColumnRef { column, .. } => {
-            // Look up the column type
-            for col in columns {
-                if col.name.eq_ignore_ascii_case(column) {
-                    return col.data_type;
-                }
+        Expr::ColumnRef { table, column } => {
+            match resolve_column_index(table.as_deref(), column, columns) {
+                Ok(i) => columns[i].data_type,
+                Err(_) => Type::Text,
             }
-            Type::Text
         }
         Expr::Integer(_) => Type::Int8,
         Expr::Float(_) => Type::Float8,
@@ -446,5 +462,91 @@ mod tests {
         // Projection over Filter over SeqScan, output has 1 column
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "table_name");
+        // ColumnRef inherits source table metadata from input
+        assert_eq!(plan.columns()[0].table_name.as_deref(), Some("sys_tables"));
+        assert_ne!(plan.columns()[0].table_oid, 0);
+        assert_ne!(plan.columns()[0].column_id, 0);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_expr_has_no_table_metadata() {
+        let (db, snapshot) = setup_test_db().await;
+
+        // SELECT 1 + table_id FROM sys_tables
+        let select = SelectStmt {
+            distinct: false,
+            columns: vec![SelectItem::Expr {
+                expr: Expr::BinaryOp {
+                    left: Box::new(Expr::Integer(1)),
+                    op: crate::sql::BinaryOperator::Add,
+                    right: Box::new(Expr::ColumnRef {
+                        table: None,
+                        column: "table_id".to_string(),
+                    }),
+                },
+                alias: None,
+            }],
+            from: Some(FromClause {
+                tables: vec![TableRef::Table {
+                    name: "sys_tables".to_string(),
+                    alias: None,
+                }],
+            }),
+            where_clause: None,
+            group_by: vec![],
+            having: None,
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            locking: None,
+        };
+
+        let plan = plan_select(&select, &db, &snapshot).await.unwrap();
+
+        // Computed expressions have no source table info
+        assert_eq!(plan.columns().len(), 1);
+        assert_eq!(plan.columns()[0].name, "?column?");
+        assert_eq!(plan.columns()[0].table_name, None);
+        assert_eq!(plan.columns()[0].table_oid, 0);
+        assert_eq!(plan.columns()[0].column_id, 0);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_qualified_column_ref() {
+        let (db, snapshot) = setup_test_db().await;
+
+        // SELECT sys_tables.table_name FROM sys_tables
+        let select = SelectStmt {
+            distinct: false,
+            columns: vec![SelectItem::Expr {
+                expr: Expr::ColumnRef {
+                    table: Some("sys_tables".to_string()),
+                    column: "table_name".to_string(),
+                },
+                alias: None,
+            }],
+            from: Some(FromClause {
+                tables: vec![TableRef::Table {
+                    name: "sys_tables".to_string(),
+                    alias: None,
+                }],
+            }),
+            where_clause: None,
+            group_by: vec![],
+            having: None,
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            locking: None,
+        };
+
+        let plan = plan_select(&select, &db, &snapshot).await.unwrap();
+
+        // Qualified ColumnRef resolves with full source table metadata
+        assert_eq!(plan.columns().len(), 1);
+        assert_eq!(plan.columns()[0].name, "table_name");
+        assert_eq!(plan.columns()[0].table_name.as_deref(), Some("sys_tables"));
+        assert_ne!(plan.columns()[0].table_oid, 0);
+        assert_ne!(plan.columns()[0].column_id, 0);
     }
 }

@@ -308,7 +308,7 @@ impl fmt::Display for BoundExpr {
 ///
 /// Uses case-insensitive matching. Returns [`ExecutorError::AmbiguousColumn`]
 /// if multiple columns match an unqualified name.
-fn resolve_column_index(
+pub(super) fn resolve_column_index(
     table: Option<&str>,
     column: &str,
     columns: &[ColumnDesc],
