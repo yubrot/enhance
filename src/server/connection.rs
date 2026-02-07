@@ -377,7 +377,7 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
                 .iter()
                 .map(|col| {
                     let (table_oid, column_id) = match &col.source {
-                        Some(s) => (s.table_oid, s.column_id),
+                        Some(s) => (s.table_oid as i32, s.column_id),
                         None => (0, 0),
                     };
                     FieldDescription {

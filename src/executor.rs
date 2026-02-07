@@ -58,7 +58,7 @@ pub struct ColumnSource {
     /// Source table name (for qualified column resolution).
     pub table_name: String,
     /// OID of the source table.
-    pub table_oid: i32,
+    pub table_oid: u32,
     /// Column attribute number within the source table (1-indexed).
     pub column_id: i16,
 }

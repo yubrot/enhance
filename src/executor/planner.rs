@@ -159,7 +159,7 @@ fn build_column_descs(
             name: col.column_name.clone(),
             source: Some(ColumnSource {
                 table_name: table_name.to_string(),
-                table_oid: table_id as i32,
+                table_oid: table_id,
                 column_id: (i + 1) as i16,
             }),
             data_type: col.data_type,
