@@ -386,10 +386,7 @@ fn promote_to_int64(v: &Value) -> Result<Value, ExecutorError> {
 ///
 /// Values are promoted to a common type before comparison.
 /// Boolean ordering: false < true.
-///
-/// NOTE: NaN floats are treated as equal to each other and equal to any
-/// non-NaN value when `partial_cmp` returns `None`. PostgreSQL treats NaN
-/// as greater than all non-NaN values. This will matter for ORDER BY (Step 12).
+/// Float ordering: NaN is greater than all non-NaN values; NaN == NaN.
 fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering, ExecutorError> {
     match (left, right) {
         (Value::Boolean(a), Value::Boolean(b)) => Ok(a.cmp(b)),
@@ -401,23 +398,30 @@ fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering, Exe
             let r = promote_to_int64(right)?;
             match (&l, &r) {
                 (Value::Int64(a), Value::Int64(b)) => Ok(a.cmp(b)),
-                (Value::Float64(a), Value::Float64(b)) => {
-                    Ok(a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                }
-                (Value::Float64(a), Value::Int64(b)) => {
-                    let b_f = *b as f64;
-                    Ok(a.partial_cmp(&b_f).unwrap_or(std::cmp::Ordering::Equal))
-                }
-                (Value::Int64(a), Value::Float64(b)) => {
-                    let a_f = *a as f64;
-                    Ok(a_f.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                }
+                (Value::Float64(a), Value::Float64(b)) => Ok(compare_f64(*a, *b)),
+                (Value::Float64(a), Value::Int64(b)) => Ok(compare_f64(*a, *b as f64)),
+                (Value::Int64(a), Value::Float64(b)) => Ok(compare_f64(*a as f64, *b)),
                 _ => Err(ExecutorError::TypeMismatch {
                     expected: "comparable types".to_string(),
                     found: format!("{}, {}", value_type_name(left), value_type_name(right)),
                 }),
             }
         }
+    }
+}
+
+/// Compares two f64 values with NaN-aware total ordering.
+///
+/// NaN is treated as greater than all non-NaN values, and NaN == NaN.
+fn compare_f64(a: f64, b: f64) -> std::cmp::Ordering {
+    match a.partial_cmp(&b) {
+        Some(ord) => ord,
+        None => match (a.is_nan(), b.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => unreachable!(),
+        },
     }
 }
 
@@ -1104,5 +1108,61 @@ mod tests {
             eval_binop(Value::Float64(1.0), BinaryOperator::Div, Value::Float64(0.0)),
             Err(ExecutorError::DivisionByZero)
         ));
+    }
+
+    // --- NaN ordering tests ---
+
+    #[test]
+    fn test_compare_f64_nan_ordering() {
+        use std::cmp::Ordering;
+
+        // NaN > any non-NaN value
+        assert_eq!(compare_f64(f64::NAN, 0.0), Ordering::Greater);
+        assert_eq!(compare_f64(f64::NAN, f64::INFINITY), Ordering::Greater);
+        assert_eq!(compare_f64(f64::NAN, f64::NEG_INFINITY), Ordering::Greater);
+
+        // any non-NaN value < NaN
+        assert_eq!(compare_f64(0.0, f64::NAN), Ordering::Less);
+        assert_eq!(compare_f64(f64::INFINITY, f64::NAN), Ordering::Less);
+        assert_eq!(compare_f64(f64::NEG_INFINITY, f64::NAN), Ordering::Less);
+
+        // NaN == NaN
+        assert_eq!(compare_f64(f64::NAN, f64::NAN), Ordering::Equal);
+
+        // Normal comparisons still work
+        assert_eq!(compare_f64(1.0, 2.0), Ordering::Less);
+        assert_eq!(compare_f64(2.0, 1.0), Ordering::Greater);
+        assert_eq!(compare_f64(1.0, 1.0), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_compare_values_nan_ordering() {
+        use std::cmp::Ordering;
+
+        // NaN > regular float
+        assert_eq!(
+            compare_values(&Value::Float64(f64::NAN), &Value::Float64(1.0)).unwrap(),
+            Ordering::Greater
+        );
+        // regular float < NaN
+        assert_eq!(
+            compare_values(&Value::Float64(1.0), &Value::Float64(f64::NAN)).unwrap(),
+            Ordering::Less
+        );
+        // NaN == NaN
+        assert_eq!(
+            compare_values(&Value::Float64(f64::NAN), &Value::Float64(f64::NAN)).unwrap(),
+            Ordering::Equal
+        );
+
+        // NaN > integer (cross-type comparison via promotion)
+        assert_eq!(
+            compare_values(&Value::Float64(f64::NAN), &Value::Int64(100)).unwrap(),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_values(&Value::Int64(100), &Value::Float64(f64::NAN)).unwrap(),
+            Ordering::Less
+        );
     }
 }
