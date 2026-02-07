@@ -29,13 +29,12 @@
 //! - [`planner::build_executor`]: Materializes a Plan into an ExecutorNode tree
 //! - [`Plan`]: Logical query plan (no data)
 //! - [`ExecutorNode`]: Physical executor nodes with async `next()` (Volcano model)
-//! - [`explain::explain_plan`]: EXPLAIN output from logical Plan
+//! - [`Plan::explain`]: EXPLAIN output from logical Plan
 //! - [`expr::BoundExpr`]: Bound expression tree with compile-time column resolution
 //! - [`ColumnDesc`]: Output column metadata
 
 mod error;
 mod eval;
-mod explain;
 mod expr;
 mod node;
 mod plan;
@@ -46,7 +45,6 @@ use crate::datum::Type;
 pub use error::ExecutorError;
 pub use eval::{bind_expr, format_bound_expr};
 pub use expr::BoundExpr;
-pub use explain::explain_plan;
 pub use node::ExecutorNode;
 pub use plan::Plan;
 pub use planner::{build_executor, plan_select};

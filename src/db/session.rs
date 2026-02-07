@@ -224,7 +224,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                         let snapshot = db.tx_manager().snapshot(txid, cid);
                         let plan =
                             executor::plan_select(select_stmt, &db, &snapshot).await?;
-                        let explain_text = executor::explain_plan(&plan);
+                        let explain_text = plan.explain();
                         let columns = vec![ColumnDesc {
                             name: "QUERY PLAN".to_string(),
                             table_oid: 0,
