@@ -9,7 +9,6 @@
 
 use crate::datum::{Type, Value};
 use crate::heap::Record;
-use crate::heap::Tuple;
 use crate::storage::PageId;
 
 use super::ColumnDesc;
@@ -17,6 +16,7 @@ use super::context::ExecContext;
 use super::error::ExecutorError;
 use super::expr::BoundExpr;
 use super::plan::Plan;
+use super::row::Row;
 
 /// A query executor node.
 ///
@@ -82,7 +82,7 @@ impl<C: ExecContext> ExecutorNode<C> {
     pub fn next(
         &mut self,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Option<Tuple>, ExecutorError>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<Option<Row>, ExecutorError>> + Send + '_>,
     > {
         Box::pin(async move {
             match self {
@@ -125,7 +125,7 @@ pub struct SeqScan<C: ExecContext> {
     /// Next page to scan, or `None` if exhausted.
     next_page_id: Option<PageId>,
     /// Buffer of tuples from the current page (ownership-based, no clone).
-    buffer: std::vec::IntoIter<Tuple>,
+    buffer: std::vec::IntoIter<Row>,
 }
 
 impl<C: ExecContext> SeqScan<C> {
@@ -148,7 +148,7 @@ impl<C: ExecContext> SeqScan<C> {
     }
 
     /// Returns the next visible tuple, loading pages lazily as needed.
-    async fn next(&mut self) -> Result<Option<Tuple>, ExecutorError> {
+    async fn next(&mut self) -> Result<Option<Row>, ExecutorError> {
         loop {
             if let Some(tuple) = self.buffer.next() {
                 return Ok(Some(tuple));
@@ -182,7 +182,7 @@ impl<C: ExecContext> Filter<C> {
     }
 
     /// Returns the next tuple that satisfies the predicate.
-    async fn next(&mut self) -> Result<Option<Tuple>, ExecutorError> {
+    async fn next(&mut self) -> Result<Option<Row>, ExecutorError> {
         loop {
             match self.child.next().await? {
                 Some(tuple) => {
@@ -219,14 +219,14 @@ impl<C: ExecContext> Projection<C> {
     }
 
     /// Returns the next projected tuple.
-    async fn next(&mut self) -> Result<Option<Tuple>, ExecutorError> {
+    async fn next(&mut self) -> Result<Option<Row>, ExecutorError> {
         match self.child.next().await? {
             Some(tuple) => {
                 let mut values = Vec::with_capacity(self.exprs.len());
                 for expr in &self.exprs {
                     values.push(expr.evaluate(&tuple.record)?);
                 }
-                Ok(Some(Tuple::computed(Record::new(values))))
+                Ok(Some(Row::computed(Record::new(values))))
             }
             None => Ok(None),
         }
@@ -254,12 +254,12 @@ impl ValuesScan {
     }
 
     /// Returns the single empty tuple, then `None`.
-    async fn next(&mut self) -> Result<Option<Tuple>, ExecutorError> {
+    async fn next(&mut self) -> Result<Option<Row>, ExecutorError> {
         if self.done {
             Ok(None)
         } else {
             self.done = true;
-            Ok(Some(Tuple::computed(Record::new(vec![]))))
+            Ok(Some(Row::computed(Record::new(vec![]))))
         }
     }
 }
@@ -275,12 +275,12 @@ mod tests {
     #[derive(Clone)]
     struct MockContext {
         /// Pages indexed by page number. Each page is a Vec of tuples.
-        pages: Arc<Vec<Vec<Tuple>>>,
+        pages: Arc<Vec<Vec<Row>>>,
     }
 
     impl MockContext {
         /// Creates a mock context with a single page of tuples.
-        fn single_page(tuples: Vec<Tuple>) -> Self {
+        fn single_page(tuples: Vec<Row>) -> Self {
             Self {
                 pages: Arc::new(vec![tuples]),
             }
@@ -292,7 +292,7 @@ mod tests {
             &self,
             page_id: PageId,
             _schema: &[Type],
-        ) -> Result<Vec<Tuple>, ExecutorError> {
+        ) -> Result<Vec<Row>, ExecutorError> {
             Ok(self
                 .pages
                 .get(page_id.page_num() as usize)
@@ -311,9 +311,9 @@ mod tests {
         }
     }
 
-    fn make_tuples(rows: Vec<Vec<Value>>) -> Vec<Tuple> {
+    fn make_tuples(rows: Vec<Vec<Value>>) -> Vec<Row> {
         rows.into_iter()
-            .map(|values| Tuple::computed(Record::new(values)))
+            .map(|values| Row::computed(Record::new(values)))
             .collect()
     }
 

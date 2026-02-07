@@ -7,11 +7,12 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::datum::Type;
-use crate::heap::{HeapPage, Tuple, TupleId};
+use crate::heap::{HeapPage, TupleId};
 use crate::storage::{BufferPool, PageId, Replacer, Storage};
 use crate::tx::{Snapshot, TransactionManager};
 
 use super::error::ExecutorError;
+use super::row::Row;
 
 /// Execution context providing stateless storage operations to executor nodes.
 ///
@@ -27,7 +28,7 @@ pub trait ExecContext: Send + Clone {
         &self,
         page_id: PageId,
         schema: &[Type],
-    ) -> impl Future<Output = Result<Vec<Tuple>, ExecutorError>> + Send;
+    ) -> impl Future<Output = Result<Vec<Row>, ExecutorError>> + Send;
 }
 
 /// Concrete [`ExecContext`] backed by a [`BufferPool`] and [`TransactionManager`].
@@ -72,7 +73,7 @@ impl<S: Storage, R: Replacer> ExecContext for ExecContextImpl<S, R> {
         &self,
         page_id: PageId,
         schema: &[Type],
-    ) -> Result<Vec<Tuple>, ExecutorError> {
+    ) -> Result<Vec<Row>, ExecutorError> {
         let page = HeapPage::new(self.pool.fetch_page(page_id).await?);
 
         let mut tuples = Vec::new();
@@ -81,7 +82,7 @@ impl<S: Storage, R: Replacer> ExecContext for ExecContextImpl<S, R> {
                 continue;
             }
             let tid = TupleId { page_id, slot_id };
-            tuples.push(Tuple::from_heap(tid, record));
+            tuples.push(Row::from_heap(tid, record));
         }
 
         Ok(tuples)

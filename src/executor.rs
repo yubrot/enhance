@@ -40,6 +40,7 @@ mod expr;
 mod node;
 mod plan;
 mod planner;
+mod row;
 
 use crate::datum::Type;
 
@@ -49,6 +50,7 @@ pub use expr::BoundExpr;
 pub use node::ExecutorNode;
 pub use plan::Plan;
 pub use planner::plan_select;
+pub use row::Row;
 
 /// Metadata describing a result column.
 #[derive(Debug, Clone)]
