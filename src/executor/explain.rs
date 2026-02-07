@@ -67,7 +67,7 @@ fn format_plan(plan: &Plan, indent: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::eval::BoundExpr;
+    use crate::executor::expr::BoundExpr;
     use crate::datum::Type;
     use crate::executor::ColumnDesc;
     use crate::sql::BinaryOperator;

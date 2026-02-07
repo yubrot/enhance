@@ -4,94 +4,13 @@
 //! [`Value`] result. Supports arithmetic, comparison, logical, string, NULL,
 //! LIKE, CASE, and CAST operations.
 
-use crate::datum::Value;
+use crate::datum::{Type, Value};
 use crate::heap::Record;
-use crate::sql::{BinaryOperator, DataType, Expr, UnaryOperator};
+use crate::sql::{BinaryOperator, Expr, UnaryOperator};
 
 use super::error::ExecutorError;
+use super::expr::{BoundExpr, BoundWhenClause};
 use super::ColumnDesc;
-
-// ---------------------------------------------------------------------------
-// BoundExpr: compile-time resolved expression tree
-// ---------------------------------------------------------------------------
-
-/// An expression tree with column references resolved to positional indices.
-///
-/// Unlike the AST [`Expr`], `BoundExpr` replaces `ColumnRef { table, column }`
-/// with `Column(usize)`, enabling O(1) column access during evaluation instead
-/// of O(n) name matching on every row.
-#[derive(Debug, Clone)]
-pub enum BoundExpr {
-    /// NULL literal.
-    Null,
-    /// Boolean literal.
-    Boolean(bool),
-    /// Integer literal.
-    Integer(i64),
-    /// Float literal.
-    Float(f64),
-    /// String literal.
-    String(String),
-    /// Column reference resolved to a positional index.
-    Column(usize),
-    /// Binary operation.
-    BinaryOp {
-        left: Box<BoundExpr>,
-        op: BinaryOperator,
-        right: Box<BoundExpr>,
-    },
-    /// Unary operation.
-    UnaryOp {
-        op: UnaryOperator,
-        operand: Box<BoundExpr>,
-    },
-    /// IS [NOT] NULL test.
-    IsNull {
-        expr: Box<BoundExpr>,
-        negated: bool,
-    },
-    /// IN list test.
-    InList {
-        expr: Box<BoundExpr>,
-        list: Vec<BoundExpr>,
-        negated: bool,
-    },
-    /// BETWEEN range test.
-    Between {
-        expr: Box<BoundExpr>,
-        low: Box<BoundExpr>,
-        high: Box<BoundExpr>,
-        negated: bool,
-    },
-    /// LIKE / ILIKE pattern matching.
-    Like {
-        expr: Box<BoundExpr>,
-        pattern: Box<BoundExpr>,
-        escape: Option<Box<BoundExpr>>,
-        negated: bool,
-        case_insensitive: bool,
-    },
-    /// CASE expression (searched or simple).
-    Case {
-        operand: Option<Box<BoundExpr>>,
-        when_clauses: Vec<BoundWhenClause>,
-        else_result: Option<Box<BoundExpr>>,
-    },
-    /// CAST expression.
-    Cast {
-        expr: Box<BoundExpr>,
-        data_type: DataType,
-    },
-}
-
-/// A WHEN clause in a bound CASE expression.
-#[derive(Debug, Clone)]
-pub struct BoundWhenClause {
-    /// Condition (searched CASE) or comparison value (simple CASE).
-    pub condition: BoundExpr,
-    /// Result expression when the condition matches.
-    pub result: BoundExpr,
-}
 
 /// Converts an AST [`Expr`] into a [`BoundExpr`] by resolving column names
 /// to positional indices via the provided column descriptors.
@@ -206,7 +125,7 @@ pub fn bind_expr(expr: &Expr, columns: &[ColumnDesc]) -> Result<BoundExpr, Execu
 
         Expr::Cast { expr, data_type } => Ok(BoundExpr::Cast {
             expr: Box::new(bind_expr(expr, columns)?),
-            data_type: data_type.clone(),
+            data_type: data_type.to_type(),
         }),
 
         Expr::Parameter(_) => Err(ExecutorError::Unsupported(
@@ -937,12 +856,12 @@ fn eval_unary_op(op: UnaryOperator, val: &Value) -> Result<Value, ExecutorError>
 }
 
 /// Evaluates a type cast (CAST(expr AS type)).
-fn eval_cast(v: Value, target: &DataType) -> Result<Value, ExecutorError> {
+fn eval_cast(v: Value, target: &Type) -> Result<Value, ExecutorError> {
     if v.is_null() {
         return Ok(Value::Null);
     }
     match target {
-        DataType::Boolean => match &v {
+        Type::Bool => match &v {
             Value::Boolean(_) => Ok(v),
             Value::Text(s) => match s.to_lowercase().as_str() {
                 "true" | "t" | "yes" | "y" | "1" | "on" => Ok(Value::Boolean(true)),
@@ -960,7 +879,7 @@ fn eval_cast(v: Value, target: &DataType) -> Result<Value, ExecutorError> {
                 to: "boolean".to_string(),
             }),
         },
-        DataType::Smallint => match &v {
+        Type::Int2 => match &v {
             Value::Int16(_) => Ok(v),
             Value::Int32(n) => Ok(Value::Int16(*n as i16)),
             Value::Int64(n) => Ok(Value::Int16(*n as i16)),
@@ -980,7 +899,7 @@ fn eval_cast(v: Value, target: &DataType) -> Result<Value, ExecutorError> {
                 to: "smallint".to_string(),
             }),
         },
-        DataType::Integer | DataType::Serial => match &v {
+        Type::Int4 => match &v {
             Value::Int32(_) => Ok(v),
             Value::Int16(n) => Ok(Value::Int32(*n as i32)),
             Value::Int64(n) => Ok(Value::Int32(*n as i32)),
@@ -1000,7 +919,7 @@ fn eval_cast(v: Value, target: &DataType) -> Result<Value, ExecutorError> {
                 to: "integer".to_string(),
             }),
         },
-        DataType::Bigint => match &v {
+        Type::Int8 => match &v {
             Value::Int64(_) => Ok(v),
             Value::Int16(n) => Ok(Value::Int64(*n as i64)),
             Value::Int32(n) => Ok(Value::Int64(*n as i64)),
@@ -1020,7 +939,7 @@ fn eval_cast(v: Value, target: &DataType) -> Result<Value, ExecutorError> {
                 to: "bigint".to_string(),
             }),
         },
-        DataType::Real => match &v {
+        Type::Float4 => match &v {
             Value::Float32(_) => Ok(v),
             Value::Float64(n) => Ok(Value::Float32(*n as f32)),
             Value::Int16(n) => Ok(Value::Float32(*n as f32)),
@@ -1039,7 +958,7 @@ fn eval_cast(v: Value, target: &DataType) -> Result<Value, ExecutorError> {
                 to: "real".to_string(),
             }),
         },
-        DataType::DoublePrecision => match &v {
+        Type::Float8 => match &v {
             Value::Float64(_) => Ok(v),
             Value::Float32(n) => Ok(Value::Float64(*n as f64)),
             Value::Int16(n) => Ok(Value::Float64(*n as f64)),
@@ -1058,8 +977,8 @@ fn eval_cast(v: Value, target: &DataType) -> Result<Value, ExecutorError> {
                 to: "double precision".to_string(),
             }),
         },
-        DataType::Text | DataType::Varchar(_) => Ok(Value::Text(v.to_text())),
-        DataType::Bytea => match &v {
+        Type::Text | Type::Varchar | Type::Bpchar => Ok(Value::Text(v.to_text())),
+        Type::Bytea => match &v {
             Value::Bytea(_) => Ok(v),
             Value::Text(s) => Ok(Value::Bytea(s.as_bytes().to_vec())),
             _ => Err(ExecutorError::InvalidCast {

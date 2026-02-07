@@ -19,7 +19,8 @@ use crate::tx::Snapshot;
 use crate::heap::{Tuple, TupleId};
 
 use super::error::ExecutorError;
-use super::eval::{BoundExpr, bind_expr};
+use super::eval::bind_expr;
+use super::expr::BoundExpr;
 use super::node::{ExecutorNode, Filter, Projection, SeqScan, ValuesScan};
 use super::plan::Plan;
 use super::ColumnDesc;

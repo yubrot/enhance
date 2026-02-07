@@ -91,6 +91,22 @@ impl Type {
         self as i32
     }
 
+    /// Returns the SQL display name for this type (e.g., `"BOOLEAN"`, `"INTEGER"`).
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Type::Bool => "BOOLEAN",
+            Type::Bytea => "BYTEA",
+            Type::Int2 => "SMALLINT",
+            Type::Int4 => "INTEGER",
+            Type::Int8 => "BIGINT",
+            Type::Float4 => "REAL",
+            Type::Float8 => "DOUBLE PRECISION",
+            Type::Text => "TEXT",
+            Type::Varchar => "VARCHAR",
+            Type::Bpchar => "CHAR",
+        }
+    }
+
     /// Returns the fixed byte size for fixed-length types, or `None` for variable-length types.
     pub const fn fixed_size(self) -> Option<usize> {
         match self {

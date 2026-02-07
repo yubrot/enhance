@@ -10,7 +10,7 @@ use crate::heap::Record;
 use crate::heap::Tuple;
 
 use super::error::ExecutorError;
-use super::eval::BoundExpr;
+use super::expr::BoundExpr;
 use super::ColumnDesc;
 
 /// A query executor node.
