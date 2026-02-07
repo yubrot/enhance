@@ -5,7 +5,7 @@
 
 use super::error::TxError;
 use super::snapshot::Snapshot;
-use super::types::{CommandId, TxId, TxState};
+use super::{CommandId, TxId, TxState};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 

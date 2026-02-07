@@ -10,7 +10,7 @@
 
 use super::manager::TransactionManager;
 use super::tuple_header::TupleHeader;
-use super::types::{CommandId, TxId, TxState};
+use super::{CommandId, TxId, TxState};
 
 /// Snapshot for MVCC visibility determination.
 ///
@@ -166,7 +166,7 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tx::types::Infomask;
+    use crate::tx::Infomask;
 
     /// Helper: create a TupleHeader inserted by the given transaction, not deleted.
     fn inserted_by(xmin: TxId, cmin: CommandId, infomask: Infomask) -> TupleHeader {

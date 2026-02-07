@@ -1,6 +1,6 @@
 //! Transaction error types.
 
-use super::types::{TxId, TxState};
+use super::{TxId, TxState};
 
 /// Errors that can occur during transaction operations.
 #[derive(Debug, Clone, PartialEq, Eq)]

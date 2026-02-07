@@ -1,6 +1,89 @@
 //! Tuple header for MVCC versioning.
 
-use super::types::{CommandId, Infomask, TxId};
+use std::fmt;
+
+use super::{CommandId, TxId};
+
+/// Tuple header information mask (16-bit flags).
+///
+/// Stores commit/abort status hints for xmin and xmax to avoid repeated
+/// lookups in the transaction state table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Infomask(u16);
+
+impl Infomask {
+    const XMIN_COMMITTED: u16 = 1 << 0;
+    const XMIN_ABORTED: u16 = 1 << 1;
+    const XMAX_COMMITTED: u16 = 1 << 2;
+    const XMAX_ABORTED: u16 = 1 << 3;
+
+    /// Create an empty infomask with no flags set.
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// Check if xmin is committed.
+    pub const fn xmin_committed(&self) -> bool {
+        (self.0 & Self::XMIN_COMMITTED) != 0
+    }
+
+    /// Check if xmin is aborted.
+    pub const fn xmin_aborted(&self) -> bool {
+        (self.0 & Self::XMIN_ABORTED) != 0
+    }
+
+    /// Check if xmax is committed.
+    pub const fn xmax_committed(&self) -> bool {
+        (self.0 & Self::XMAX_COMMITTED) != 0
+    }
+
+    /// Check if xmax is aborted.
+    pub const fn xmax_aborted(&self) -> bool {
+        (self.0 & Self::XMAX_ABORTED) != 0
+    }
+
+    /// Set xmin committed flag.
+    pub const fn with_xmin_committed(self) -> Self {
+        Self(self.0 | Self::XMIN_COMMITTED)
+    }
+
+    /// Set xmin aborted flag.
+    pub const fn with_xmin_aborted(self) -> Self {
+        Self(self.0 | Self::XMIN_ABORTED)
+    }
+
+    /// Set xmax committed flag.
+    pub const fn with_xmax_committed(self) -> Self {
+        Self(self.0 | Self::XMAX_COMMITTED)
+    }
+
+    /// Set xmax aborted flag.
+    pub const fn with_xmax_aborted(self) -> Self {
+        Self(self.0 | Self::XMAX_ABORTED)
+    }
+
+    /// Get the raw u16 value.
+    pub const fn as_u16(&self) -> u16 {
+        self.0
+    }
+
+    /// Create an infomask from a raw u16 value (used for deserialization).
+    pub const fn from_raw(value: u16) -> Self {
+        Self(value)
+    }
+}
+
+impl Default for Infomask {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl fmt::Display for Infomask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "0x{:04x}", self.0)
+    }
+}
 
 /// Size of the tuple header in bytes: 8 (xmin) + 8 (xmax) + 4 (cmin) + 4 (cmax) + 2 (infomask) = 26 bytes.
 pub const TUPLE_HEADER_SIZE: usize = 26;
@@ -100,5 +183,24 @@ mod tests {
 
         let read_back = TupleHeader::read(&buf);
         assert_eq!(read_back, original);
+    }
+
+    #[test]
+    fn test_infomask() {
+        type FlagPair = (fn(&Infomask) -> bool, fn(Infomask) -> Infomask);
+        let flags: [FlagPair; 4] = [
+            (Infomask::xmin_committed, Infomask::with_xmin_committed),
+            (Infomask::xmin_aborted, Infomask::with_xmin_aborted),
+            (Infomask::xmax_committed, Infomask::with_xmax_committed),
+            (Infomask::xmax_aborted, Infomask::with_xmax_aborted),
+        ];
+
+        // Test that each setter only affects its corresponding getter
+        for (i, (_, setter)) in flags.iter().enumerate() {
+            let mask = setter(Infomask::empty());
+            for (j, (getter, _)) in flags.iter().enumerate() {
+                assert_eq!(getter(&mask), i == j);
+            }
+        }
     }
 }
