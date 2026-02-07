@@ -34,7 +34,7 @@ pub struct TupleId {
     /// Page containing the tuple.
     pub page_id: PageId,
     /// Slot within the page.
-    pub slot_id: u16,
+    pub slot_id: SlotId,
 }
 
 /// A single tuple produced by the executor.
