@@ -18,12 +18,11 @@ use crate::tx::Snapshot;
 
 use crate::heap::{Tuple, TupleId};
 
+use super::ColumnDesc;
 use super::error::ExecutorError;
-use super::eval::bind_expr;
 use super::expr::BoundExpr;
 use super::node::{ExecutorNode, Filter, Projection, SeqScan, ValuesScan};
 use super::plan::Plan;
-use super::ColumnDesc;
 
 /// Plans a SELECT statement into a logical [`Plan`] tree.
 ///
@@ -78,7 +77,7 @@ pub async fn plan_select<S: Storage, R: Replacer>(
     // Step 2: WHERE clause -> Filter (bind column names to indices)
     if let Some(where_clause) = &select.where_clause {
         let columns = plan.columns().to_vec();
-        let bound_predicate = bind_expr(where_clause, &columns)?;
+        let bound_predicate = BoundExpr::bind(where_clause, &columns)?;
         plan = Plan::Filter {
             input: Box::new(plan),
             predicate: bound_predicate,
@@ -197,7 +196,7 @@ async fn build_seq_scan_plan<S: Storage, R: Replacer>(
     let schema: Vec<Type> = column_infos.iter().map(|c| c.data_type).collect();
 
     // Build column descriptors
-    let columns = build_column_descs(&column_infos, table_info.table_id);
+    let columns = build_column_descs(&column_infos, table_info.table_id, table_name);
 
     Ok(Plan::SeqScan {
         table_name: table_name.to_string(),
@@ -209,12 +208,17 @@ async fn build_seq_scan_plan<S: Storage, R: Replacer>(
 }
 
 /// Builds column descriptors from catalog column info.
-fn build_column_descs(column_infos: &[ColumnInfo], table_id: u32) -> Vec<ColumnDesc> {
+fn build_column_descs(
+    column_infos: &[ColumnInfo],
+    table_id: u32,
+    table_name: &str,
+) -> Vec<ColumnDesc> {
     column_infos
         .iter()
         .enumerate()
         .map(|(i, col)| ColumnDesc {
             name: col.column_name.clone(),
+            table_name: Some(table_name.to_string()),
             table_oid: table_id as i32,
             column_id: (i + 1) as i16,
             data_type: col.data_type,
@@ -258,9 +262,13 @@ fn build_projection_plan(input: Plan, select_items: &[SelectItem]) -> Result<Pla
             SelectItem::Wildcard => {
                 // Expand to all input columns using positional indices
                 for (i, col) in input_columns.iter().enumerate() {
-                    exprs.push(BoundExpr::Column(i));
+                    exprs.push(BoundExpr::Column {
+                        index: i,
+                        name: Some(col.name.clone()),
+                    });
                     out_columns.push(ColumnDesc {
                         name: col.name.clone(),
+                        table_name: col.table_name.clone(),
                         table_oid: col.table_oid,
                         column_id: col.column_id,
                         data_type: col.data_type,
@@ -277,9 +285,13 @@ fn build_projection_plan(input: Plan, select_items: &[SelectItem]) -> Result<Pla
                     // A more sophisticated check would be needed for JOINs.
                     let _ = table_name;
                     found = true;
-                    exprs.push(BoundExpr::Column(i));
+                    exprs.push(BoundExpr::Column {
+                        index: i,
+                        name: Some(col.name.clone()),
+                    });
                     out_columns.push(ColumnDesc {
                         name: col.name.clone(),
+                        table_name: col.table_name.clone(),
                         table_oid: col.table_oid,
                         column_id: col.column_id,
                         data_type: col.data_type,
@@ -297,11 +309,12 @@ fn build_projection_plan(input: Plan, select_items: &[SelectItem]) -> Result<Pla
                 let col_data_type = infer_data_type(expr, &input_columns);
 
                 // Bind column names to positional indices
-                let bound = bind_expr(expr, &input_columns)?;
+                let bound = BoundExpr::bind(expr, &input_columns)?;
 
                 exprs.push(bound);
                 out_columns.push(ColumnDesc {
                     name: col_name,
+                    table_name: None,
                     table_oid: 0,
                     column_id: 0,
                     data_type: col_data_type,

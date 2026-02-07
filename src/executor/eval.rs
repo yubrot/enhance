@@ -1,181 +1,15 @@
 //! Expression evaluator for SQL expressions.
 //!
-//! Evaluates [`Expr`] AST nodes against a row of values, producing a single
+//! Evaluates [`BoundExpr`] nodes against a row of values, producing a single
 //! [`Value`] result. Supports arithmetic, comparison, logical, string, NULL,
 //! LIKE, CASE, and CAST operations.
 
 use crate::datum::{Type, Value};
 use crate::heap::Record;
-use crate::sql::{BinaryOperator, Expr, UnaryOperator};
+use crate::sql::{BinaryOperator, UnaryOperator};
 
 use super::error::ExecutorError;
-use super::expr::{BoundExpr, BoundWhenClause};
-use super::ColumnDesc;
-
-/// Converts an AST [`Expr`] into a [`BoundExpr`] by resolving column names
-/// to positional indices via the provided column descriptors.
-///
-/// Unsupported AST variants (Parameter, Function, Subquery, InSubquery, Exists)
-/// return [`ExecutorError::Unsupported`].
-pub fn bind_expr(expr: &Expr, columns: &[ColumnDesc]) -> Result<BoundExpr, ExecutorError> {
-    match expr {
-        Expr::Null => Ok(BoundExpr::Null),
-        Expr::Boolean(b) => Ok(BoundExpr::Boolean(*b)),
-        Expr::Integer(n) => Ok(BoundExpr::Integer(*n)),
-        Expr::Float(f) => Ok(BoundExpr::Float(*f)),
-        Expr::String(s) => Ok(BoundExpr::String(s.clone())),
-
-        Expr::ColumnRef { table, column } => {
-            let idx = resolve_column_index(table.as_deref(), column, columns)?;
-            Ok(BoundExpr::Column(idx))
-        }
-
-        Expr::BinaryOp { left, op, right } => Ok(BoundExpr::BinaryOp {
-            left: Box::new(bind_expr(left, columns)?),
-            op: *op,
-            right: Box::new(bind_expr(right, columns)?),
-        }),
-
-        Expr::UnaryOp { op, operand } => Ok(BoundExpr::UnaryOp {
-            op: *op,
-            operand: Box::new(bind_expr(operand, columns)?),
-        }),
-
-        Expr::IsNull { expr, negated } => Ok(BoundExpr::IsNull {
-            expr: Box::new(bind_expr(expr, columns)?),
-            negated: *negated,
-        }),
-
-        Expr::InList {
-            expr,
-            list,
-            negated,
-        } => {
-            let bound_list = list
-                .iter()
-                .map(|e| bind_expr(e, columns))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(BoundExpr::InList {
-                expr: Box::new(bind_expr(expr, columns)?),
-                list: bound_list,
-                negated: *negated,
-            })
-        }
-
-        Expr::Between {
-            expr,
-            low,
-            high,
-            negated,
-        } => Ok(BoundExpr::Between {
-            expr: Box::new(bind_expr(expr, columns)?),
-            low: Box::new(bind_expr(low, columns)?),
-            high: Box::new(bind_expr(high, columns)?),
-            negated: *negated,
-        }),
-
-        Expr::Like {
-            expr,
-            pattern,
-            escape,
-            negated,
-            case_insensitive,
-        } => {
-            let bound_escape = match escape {
-                Some(e) => Some(Box::new(bind_expr(e, columns)?)),
-                None => None,
-            };
-            Ok(BoundExpr::Like {
-                expr: Box::new(bind_expr(expr, columns)?),
-                pattern: Box::new(bind_expr(pattern, columns)?),
-                escape: bound_escape,
-                negated: *negated,
-                case_insensitive: *case_insensitive,
-            })
-        }
-
-        Expr::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => {
-            let bound_operand = match operand {
-                Some(op) => Some(Box::new(bind_expr(op, columns)?)),
-                None => None,
-            };
-            let bound_whens = when_clauses
-                .iter()
-                .map(|wc| {
-                    Ok(BoundWhenClause {
-                        condition: bind_expr(&wc.condition, columns)?,
-                        result: bind_expr(&wc.result, columns)?,
-                    })
-                })
-                .collect::<Result<Vec<_>, ExecutorError>>()?;
-            let bound_else = match else_result {
-                Some(e) => Some(Box::new(bind_expr(e, columns)?)),
-                None => None,
-            };
-            Ok(BoundExpr::Case {
-                operand: bound_operand,
-                when_clauses: bound_whens,
-                else_result: bound_else,
-            })
-        }
-
-        Expr::Cast { expr, data_type } => Ok(BoundExpr::Cast {
-            expr: Box::new(bind_expr(expr, columns)?),
-            data_type: data_type.to_type(),
-        }),
-
-        Expr::Parameter(_) => Err(ExecutorError::Unsupported(
-            "parameter placeholders are not yet supported".to_string(),
-        )),
-
-        Expr::Function { .. } => Err(ExecutorError::Unsupported(
-            "function calls are not yet supported".to_string(),
-        )),
-
-        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::Subquery(_) => {
-            Err(ExecutorError::Unsupported(
-                "subqueries are not yet supported".to_string(),
-            ))
-        }
-    }
-}
-
-/// Resolves a column name (optionally table-qualified) to a positional index.
-///
-/// Uses case-insensitive matching. Returns [`ExecutorError::AmbiguousColumn`]
-/// if multiple columns match an unqualified name.
-pub fn resolve_column_index(
-    table: Option<&str>,
-    column: &str,
-    columns: &[ColumnDesc],
-) -> Result<usize, ExecutorError> {
-    let mut matched_idx = None;
-    for (i, desc) in columns.iter().enumerate() {
-        let name_matches = desc.name.eq_ignore_ascii_case(column);
-        let table_matches = match table {
-            Some(_t) => name_matches,
-            None => name_matches,
-        };
-        if table_matches {
-            if matched_idx.is_some() && table.is_none() {
-                return Err(ExecutorError::AmbiguousColumn {
-                    name: column.to_string(),
-                });
-            }
-            matched_idx = Some(i);
-            if table.is_some() {
-                break;
-            }
-        }
-    }
-    matched_idx.ok_or_else(|| ExecutorError::ColumnNotFound {
-        name: column.to_string(),
-    })
-}
+use super::expr::BoundExpr;
 
 impl BoundExpr {
     /// Evaluates the bound expression against a record, producing a [`Value`].
@@ -190,12 +24,12 @@ impl BoundExpr {
             BoundExpr::Float(f) => Ok(Value::Float64(*f)),
             BoundExpr::String(s) => Ok(Value::Text(s.clone())),
 
-            BoundExpr::Column(idx) => {
-                if *idx < record.values.len() {
-                    Ok(record.values[*idx].clone())
+            BoundExpr::Column { index, .. } => {
+                if *index < record.values.len() {
+                    Ok(record.values[*index].clone())
                 } else {
                     Err(ExecutorError::ColumnIndexOutOfBounds {
-                        index: *idx,
+                        index: *index,
                         len: record.values.len(),
                     })
                 }
@@ -288,7 +122,7 @@ impl BoundExpr {
                             _ => {
                                 return Err(ExecutorError::Unsupported(
                                     "ESCAPE must be a single character".to_string(),
-                                ))
+                                ));
                             }
                         }
                     }
@@ -300,7 +134,7 @@ impl BoundExpr {
                         return Err(ExecutorError::TypeMismatch {
                             expected: "text".to_string(),
                             found: format!("{:?}", v),
-                        })
+                        });
                     }
                 };
                 let matched = like_match(s, pat, escape_char, *case_insensitive);
@@ -345,242 +179,8 @@ impl BoundExpr {
     }
 }
 
-/// Formats a [`BoundExpr`] as a human-readable SQL-like string for EXPLAIN output.
-///
-/// Column references are displayed as `$col{idx}` (e.g., `$col0`).
-pub fn format_bound_expr(expr: &BoundExpr) -> String {
-    match expr {
-        BoundExpr::Null => "NULL".to_string(),
-        BoundExpr::Boolean(b) => b.to_string(),
-        BoundExpr::Integer(n) => n.to_string(),
-        BoundExpr::Float(f) => f.to_string(),
-        BoundExpr::String(s) => format!("'{}'", s),
-        BoundExpr::Column(idx) => format!("$col{}", idx),
-        BoundExpr::BinaryOp { left, op, right } => {
-            format!(
-                "({} {} {})",
-                format_bound_expr(left),
-                op.as_str(),
-                format_bound_expr(right)
-            )
-        }
-        BoundExpr::UnaryOp { op, operand } => match op {
-            UnaryOperator::Not => format!("(NOT {})", format_bound_expr(operand)),
-            _ => format!("({}{})", op.as_str(), format_bound_expr(operand)),
-        },
-        BoundExpr::IsNull { expr, negated } => {
-            if *negated {
-                format!("({} IS NOT NULL)", format_bound_expr(expr))
-            } else {
-                format!("({} IS NULL)", format_bound_expr(expr))
-            }
-        }
-        BoundExpr::InList {
-            expr,
-            list,
-            negated,
-        } => {
-            let items: Vec<String> = list.iter().map(format_bound_expr).collect();
-            let neg = if *negated { " NOT" } else { "" };
-            format!(
-                "({}{} IN ({}))",
-                format_bound_expr(expr),
-                neg,
-                items.join(", ")
-            )
-        }
-        BoundExpr::Between {
-            expr,
-            low,
-            high,
-            negated,
-        } => {
-            let neg = if *negated { " NOT" } else { "" };
-            format!(
-                "({}{} BETWEEN {} AND {})",
-                format_bound_expr(expr),
-                neg,
-                format_bound_expr(low),
-                format_bound_expr(high)
-            )
-        }
-        BoundExpr::Like {
-            expr,
-            pattern,
-            negated,
-            case_insensitive,
-            ..
-        } => {
-            let op = if *case_insensitive { "ILIKE" } else { "LIKE" };
-            let neg = if *negated { " NOT" } else { "" };
-            format!(
-                "({}{} {} {})",
-                format_bound_expr(expr),
-                neg,
-                op,
-                format_bound_expr(pattern)
-            )
-        }
-        BoundExpr::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => {
-            let mut s = "CASE".to_string();
-            if let Some(op) = operand {
-                s.push_str(&format!(" {}", format_bound_expr(op)));
-            }
-            for clause in when_clauses {
-                s.push_str(&format!(
-                    " WHEN {} THEN {}",
-                    format_bound_expr(&clause.condition),
-                    format_bound_expr(&clause.result)
-                ));
-            }
-            if let Some(e) = else_result {
-                s.push_str(&format!(" ELSE {}", format_bound_expr(e)));
-            }
-            s.push_str(" END");
-            s
-        }
-        BoundExpr::Cast { expr, data_type } => {
-            format!("CAST({} AS {})", format_bound_expr(expr), data_type.display_name())
-        }
-    }
-}
-
-/// Formats a [`BoundExpr`] with column names resolved from the provided descriptors.
-///
-/// Column indices are resolved back to their human-readable names using `columns`.
-/// Falls back to `$col{idx}` if the index is out of bounds.
-pub fn format_bound_expr_with_columns(expr: &BoundExpr, columns: &[ColumnDesc]) -> String {
-    match expr {
-        BoundExpr::Column(idx) => {
-            if *idx < columns.len() {
-                columns[*idx].name.clone()
-            } else {
-                format!("$col{}", idx)
-            }
-        }
-        BoundExpr::BinaryOp { left, op, right } => {
-            format!(
-                "({} {} {})",
-                format_bound_expr_with_columns(left, columns),
-                op.as_str(),
-                format_bound_expr_with_columns(right, columns)
-            )
-        }
-        BoundExpr::UnaryOp { op, operand } => match op {
-            UnaryOperator::Not => {
-                format!("(NOT {})", format_bound_expr_with_columns(operand, columns))
-            }
-            _ => format!(
-                "({}{})",
-                op.as_str(),
-                format_bound_expr_with_columns(operand, columns)
-            ),
-        },
-        BoundExpr::IsNull { expr, negated } => {
-            if *negated {
-                format!(
-                    "({} IS NOT NULL)",
-                    format_bound_expr_with_columns(expr, columns)
-                )
-            } else {
-                format!(
-                    "({} IS NULL)",
-                    format_bound_expr_with_columns(expr, columns)
-                )
-            }
-        }
-        BoundExpr::InList {
-            expr,
-            list,
-            negated,
-        } => {
-            let items: Vec<String> = list
-                .iter()
-                .map(|e| format_bound_expr_with_columns(e, columns))
-                .collect();
-            let neg = if *negated { " NOT" } else { "" };
-            format!(
-                "({}{} IN ({}))",
-                format_bound_expr_with_columns(expr, columns),
-                neg,
-                items.join(", ")
-            )
-        }
-        BoundExpr::Between {
-            expr,
-            low,
-            high,
-            negated,
-        } => {
-            let neg = if *negated { " NOT" } else { "" };
-            format!(
-                "({}{} BETWEEN {} AND {})",
-                format_bound_expr_with_columns(expr, columns),
-                neg,
-                format_bound_expr_with_columns(low, columns),
-                format_bound_expr_with_columns(high, columns)
-            )
-        }
-        BoundExpr::Like {
-            expr,
-            pattern,
-            negated,
-            case_insensitive,
-            ..
-        } => {
-            let op = if *case_insensitive { "ILIKE" } else { "LIKE" };
-            let neg = if *negated { " NOT" } else { "" };
-            format!(
-                "({}{} {} {})",
-                format_bound_expr_with_columns(expr, columns),
-                neg,
-                op,
-                format_bound_expr_with_columns(pattern, columns)
-            )
-        }
-        BoundExpr::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => {
-            let mut s = "CASE".to_string();
-            if let Some(op) = operand {
-                s.push_str(&format!(
-                    " {}",
-                    format_bound_expr_with_columns(op, columns)
-                ));
-            }
-            for clause in when_clauses {
-                s.push_str(&format!(
-                    " WHEN {} THEN {}",
-                    format_bound_expr_with_columns(&clause.condition, columns),
-                    format_bound_expr_with_columns(&clause.result, columns)
-                ));
-            }
-            if let Some(e) = else_result {
-                s.push_str(&format!(
-                    " ELSE {}",
-                    format_bound_expr_with_columns(e, columns)
-                ));
-            }
-            s.push_str(" END");
-            s
-        }
-        // Delegate non-column variants to the plain formatter
-        other => format_bound_expr(other),
-    }
-}
-
 /// Evaluates a binary operation.
-fn eval_binary_op(
-    left: &Value,
-    op: BinaryOperator,
-    right: &Value,
-) -> Result<Value, ExecutorError> {
+fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) -> Result<Value, ExecutorError> {
     // Logical operators with 3-value NULL logic
     match op {
         BinaryOperator::And => return eval_and(left, right),
@@ -693,15 +293,15 @@ fn eval_arithmetic(
     match (&l, &r) {
         (Value::Int64(a), Value::Int64(b)) => {
             let result = match op {
-                BinaryOperator::Add => a.checked_add(*b).ok_or(ExecutorError::Unsupported(
-                    "integer overflow".to_string(),
-                ))?,
-                BinaryOperator::Sub => a.checked_sub(*b).ok_or(ExecutorError::Unsupported(
-                    "integer overflow".to_string(),
-                ))?,
-                BinaryOperator::Mul => a.checked_mul(*b).ok_or(ExecutorError::Unsupported(
-                    "integer overflow".to_string(),
-                ))?,
+                BinaryOperator::Add => a
+                    .checked_add(*b)
+                    .ok_or(ExecutorError::Unsupported("integer overflow".to_string()))?,
+                BinaryOperator::Sub => a
+                    .checked_sub(*b)
+                    .ok_or(ExecutorError::Unsupported("integer overflow".to_string()))?,
+                BinaryOperator::Mul => a
+                    .checked_mul(*b)
+                    .ok_or(ExecutorError::Unsupported("integer overflow".to_string()))?,
                 BinaryOperator::Div => {
                     if *b == 0 {
                         return Err(ExecutorError::DivisionByZero);
@@ -786,10 +386,7 @@ fn promote_to_int64(v: &Value) -> Result<Value, ExecutorError> {
 ///
 /// Values are promoted to a common type before comparison.
 /// Boolean ordering: false < true.
-fn compare_values(
-    left: &Value,
-    right: &Value,
-) -> Result<std::cmp::Ordering, ExecutorError> {
+fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering, ExecutorError> {
     match (left, right) {
         (Value::Boolean(a), Value::Boolean(b)) => Ok(a.cmp(b)),
         (Value::Text(a), Value::Text(b)) => Ok(a.cmp(b)),
@@ -845,8 +442,11 @@ fn eval_unary_op(op: UnaryOperator, val: &Value) -> Result<Value, ExecutorError>
             }),
         },
         UnaryOperator::Plus => match val {
-            Value::Int16(_) | Value::Int32(_) | Value::Int64(_)
-            | Value::Float32(_) | Value::Float64(_) => Ok(val.clone()),
+            Value::Int16(_)
+            | Value::Int32(_)
+            | Value::Int64(_)
+            | Value::Float32(_)
+            | Value::Float64(_) => Ok(val.clone()),
             _ => Err(ExecutorError::TypeMismatch {
                 expected: "numeric".to_string(),
                 found: value_type_name(val),
@@ -879,80 +479,78 @@ fn eval_cast(v: Value, target: &Type) -> Result<Value, ExecutorError> {
                 to: "boolean".to_string(),
             }),
         },
-        Type::Int2 => match &v {
-            Value::Int16(_) => Ok(v),
-            Value::Int32(n) => Ok(Value::Int16(*n as i16)),
-            Value::Int64(n) => Ok(Value::Int16(*n as i16)),
-            Value::Float32(n) => Ok(Value::Int16(*n as i16)),
-            Value::Float64(n) => Ok(Value::Int16(*n as i16)),
-            Value::Text(s) => s
-                .trim()
-                .parse::<i16>()
-                .map(Value::Int16)
-                .map_err(|_| ExecutorError::InvalidCast {
-                    from: format!("'{}'", s),
+        Type::Int2 => {
+            match &v {
+                Value::Int16(_) => Ok(v),
+                Value::Int32(n) => Ok(Value::Int16(*n as i16)),
+                Value::Int64(n) => Ok(Value::Int16(*n as i16)),
+                Value::Float32(n) => Ok(Value::Int16(*n as i16)),
+                Value::Float64(n) => Ok(Value::Int16(*n as i16)),
+                Value::Text(s) => s.trim().parse::<i16>().map(Value::Int16).map_err(|_| {
+                    ExecutorError::InvalidCast {
+                        from: format!("'{}'", s),
+                        to: "smallint".to_string(),
+                    }
+                }),
+                Value::Boolean(b) => Ok(Value::Int16(if *b { 1 } else { 0 })),
+                _ => Err(ExecutorError::InvalidCast {
+                    from: value_type_name(&v),
                     to: "smallint".to_string(),
                 }),
-            Value::Boolean(b) => Ok(Value::Int16(if *b { 1 } else { 0 })),
-            _ => Err(ExecutorError::InvalidCast {
-                from: value_type_name(&v),
-                to: "smallint".to_string(),
-            }),
-        },
-        Type::Int4 => match &v {
-            Value::Int32(_) => Ok(v),
-            Value::Int16(n) => Ok(Value::Int32(*n as i32)),
-            Value::Int64(n) => Ok(Value::Int32(*n as i32)),
-            Value::Float32(n) => Ok(Value::Int32(*n as i32)),
-            Value::Float64(n) => Ok(Value::Int32(*n as i32)),
-            Value::Text(s) => s
-                .trim()
-                .parse::<i32>()
-                .map(Value::Int32)
-                .map_err(|_| ExecutorError::InvalidCast {
-                    from: format!("'{}'", s),
+            }
+        }
+        Type::Int4 => {
+            match &v {
+                Value::Int32(_) => Ok(v),
+                Value::Int16(n) => Ok(Value::Int32(*n as i32)),
+                Value::Int64(n) => Ok(Value::Int32(*n as i32)),
+                Value::Float32(n) => Ok(Value::Int32(*n as i32)),
+                Value::Float64(n) => Ok(Value::Int32(*n as i32)),
+                Value::Text(s) => s.trim().parse::<i32>().map(Value::Int32).map_err(|_| {
+                    ExecutorError::InvalidCast {
+                        from: format!("'{}'", s),
+                        to: "integer".to_string(),
+                    }
+                }),
+                Value::Boolean(b) => Ok(Value::Int32(if *b { 1 } else { 0 })),
+                _ => Err(ExecutorError::InvalidCast {
+                    from: value_type_name(&v),
                     to: "integer".to_string(),
                 }),
-            Value::Boolean(b) => Ok(Value::Int32(if *b { 1 } else { 0 })),
-            _ => Err(ExecutorError::InvalidCast {
-                from: value_type_name(&v),
-                to: "integer".to_string(),
-            }),
-        },
-        Type::Int8 => match &v {
-            Value::Int64(_) => Ok(v),
-            Value::Int16(n) => Ok(Value::Int64(*n as i64)),
-            Value::Int32(n) => Ok(Value::Int64(*n as i64)),
-            Value::Float32(n) => Ok(Value::Int64(*n as i64)),
-            Value::Float64(n) => Ok(Value::Int64(*n as i64)),
-            Value::Text(s) => s
-                .trim()
-                .parse::<i64>()
-                .map(Value::Int64)
-                .map_err(|_| ExecutorError::InvalidCast {
-                    from: format!("'{}'", s),
+            }
+        }
+        Type::Int8 => {
+            match &v {
+                Value::Int64(_) => Ok(v),
+                Value::Int16(n) => Ok(Value::Int64(*n as i64)),
+                Value::Int32(n) => Ok(Value::Int64(*n as i64)),
+                Value::Float32(n) => Ok(Value::Int64(*n as i64)),
+                Value::Float64(n) => Ok(Value::Int64(*n as i64)),
+                Value::Text(s) => s.trim().parse::<i64>().map(Value::Int64).map_err(|_| {
+                    ExecutorError::InvalidCast {
+                        from: format!("'{}'", s),
+                        to: "bigint".to_string(),
+                    }
+                }),
+                Value::Boolean(b) => Ok(Value::Int64(if *b { 1 } else { 0 })),
+                _ => Err(ExecutorError::InvalidCast {
+                    from: value_type_name(&v),
                     to: "bigint".to_string(),
                 }),
-            Value::Boolean(b) => Ok(Value::Int64(if *b { 1 } else { 0 })),
-            _ => Err(ExecutorError::InvalidCast {
-                from: value_type_name(&v),
-                to: "bigint".to_string(),
-            }),
-        },
+            }
+        }
         Type::Float4 => match &v {
             Value::Float32(_) => Ok(v),
             Value::Float64(n) => Ok(Value::Float32(*n as f32)),
             Value::Int16(n) => Ok(Value::Float32(*n as f32)),
             Value::Int32(n) => Ok(Value::Float32(*n as f32)),
             Value::Int64(n) => Ok(Value::Float32(*n as f32)),
-            Value::Text(s) => s
-                .trim()
-                .parse::<f32>()
-                .map(Value::Float32)
-                .map_err(|_| ExecutorError::InvalidCast {
+            Value::Text(s) => s.trim().parse::<f32>().map(Value::Float32).map_err(|_| {
+                ExecutorError::InvalidCast {
                     from: format!("'{}'", s),
                     to: "real".to_string(),
-                }),
+                }
+            }),
             _ => Err(ExecutorError::InvalidCast {
                 from: value_type_name(&v),
                 to: "real".to_string(),
@@ -964,14 +562,12 @@ fn eval_cast(v: Value, target: &Type) -> Result<Value, ExecutorError> {
             Value::Int16(n) => Ok(Value::Float64(*n as f64)),
             Value::Int32(n) => Ok(Value::Float64(*n as f64)),
             Value::Int64(n) => Ok(Value::Float64(*n as f64)),
-            Value::Text(s) => s
-                .trim()
-                .parse::<f64>()
-                .map(Value::Float64)
-                .map_err(|_| ExecutorError::InvalidCast {
+            Value::Text(s) => s.trim().parse::<f64>().map(Value::Float64).map_err(|_| {
+                ExecutorError::InvalidCast {
                     from: format!("'{}'", s),
                     to: "double precision".to_string(),
-                }),
+                }
+            }),
             _ => Err(ExecutorError::InvalidCast {
                 from: value_type_name(&v),
                 to: "double precision".to_string(),
@@ -1067,69 +663,12 @@ fn like_match_recursive(s: &[char], p: &[char], escape: Option<char>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datum::Type;
 
     // --- BoundExpr tests ---
 
-    fn make_record(cols: &[(&str, Value)]) -> (Record, Vec<ColumnDesc>) {
+    fn make_record(cols: &[(&str, Value)]) -> Record {
         let values: Vec<Value> = cols.iter().map(|(_, v)| v.clone()).collect();
-        let descs: Vec<ColumnDesc> = cols
-            .iter()
-            .map(|(name, v)| ColumnDesc {
-                name: name.to_string(),
-                table_oid: 0,
-                column_id: 0,
-                data_type: v.data_type().unwrap_or(Type::Text),
-            })
-            .collect();
-        (Record::new(values), descs)
-    }
-
-    #[test]
-    fn test_bind_expr_literals() {
-        let cols: Vec<ColumnDesc> = vec![];
-        let bound = bind_expr(&Expr::Integer(42), &cols).unwrap();
-        assert!(matches!(bound, BoundExpr::Integer(42)));
-
-        let bound = bind_expr(&Expr::String("hello".into()), &cols).unwrap();
-        assert!(matches!(bound, BoundExpr::String(ref s) if s == "hello"));
-    }
-
-    #[test]
-    fn test_bind_expr_column_resolution() {
-        let cols = vec![
-            ColumnDesc {
-                name: "id".to_string(),
-                table_oid: 0,
-                column_id: 0,
-                data_type: Type::Int8,
-            },
-            ColumnDesc {
-                name: "name".to_string(),
-                table_oid: 0,
-                column_id: 0,
-                data_type: Type::Text,
-            },
-        ];
-        let expr = Expr::ColumnRef {
-            table: None,
-            column: "name".to_string(),
-        };
-        let bound = bind_expr(&expr, &cols).unwrap();
-        assert!(matches!(bound, BoundExpr::Column(1)));
-    }
-
-    #[test]
-    fn test_bind_expr_column_not_found() {
-        let cols: Vec<ColumnDesc> = vec![];
-        let expr = Expr::ColumnRef {
-            table: None,
-            column: "missing".to_string(),
-        };
-        assert!(matches!(
-            bind_expr(&expr, &cols),
-            Err(ExecutorError::ColumnNotFound { .. })
-        ));
+        Record::new(values)
     }
 
     #[test]
@@ -1148,16 +687,26 @@ mod tests {
 
     #[test]
     fn test_bound_expr_evaluate_column() {
-        let (record, _) = make_record(&[
+        let record = make_record(&[
             ("id", Value::Int64(1)),
             ("name", Value::Text("alice".into())),
         ]);
         assert_eq!(
-            BoundExpr::Column(0).evaluate(&record).unwrap(),
+            BoundExpr::Column {
+                index: 0,
+                name: None
+            }
+            .evaluate(&record)
+            .unwrap(),
             Value::Int64(1)
         );
         assert_eq!(
-            BoundExpr::Column(1).evaluate(&record).unwrap(),
+            BoundExpr::Column {
+                index: 1,
+                name: Some("name".into())
+            }
+            .evaluate(&record)
+            .unwrap(),
             Value::Text("alice".into())
         );
     }
@@ -1166,7 +715,11 @@ mod tests {
     fn test_bound_expr_evaluate_column_out_of_bounds() {
         let record = Record::new(vec![Value::Int64(1)]);
         assert!(matches!(
-            BoundExpr::Column(5).evaluate(&record),
+            BoundExpr::Column {
+                index: 5,
+                name: None
+            }
+            .evaluate(&record),
             Err(ExecutorError::ColumnIndexOutOfBounds { index: 5, len: 1 })
         ));
     }
@@ -1175,51 +728,13 @@ mod tests {
     fn test_bound_expr_evaluate_binary_op() {
         let record = Record::new(vec![Value::Int64(10)]);
         let expr = BoundExpr::BinaryOp {
-            left: Box::new(BoundExpr::Column(0)),
+            left: Box::new(BoundExpr::Column {
+                index: 0,
+                name: None,
+            }),
             op: BinaryOperator::Gt,
             right: Box::new(BoundExpr::Integer(5)),
         };
         assert_eq!(expr.evaluate(&record).unwrap(), Value::Boolean(true));
-    }
-
-    #[test]
-    fn test_format_bound_expr_basic() {
-        assert_eq!(format_bound_expr(&BoundExpr::Integer(42)), "42");
-        assert_eq!(format_bound_expr(&BoundExpr::Column(0)), "$col0");
-        assert_eq!(
-            format_bound_expr(&BoundExpr::BinaryOp {
-                left: Box::new(BoundExpr::Column(0)),
-                op: BinaryOperator::Gt,
-                right: Box::new(BoundExpr::Integer(5)),
-            }),
-            "($col0 > 5)"
-        );
-    }
-
-    #[test]
-    fn test_format_bound_expr_with_columns() {
-        let cols = vec![
-            ColumnDesc {
-                name: "id".to_string(),
-                table_oid: 0,
-                column_id: 0,
-                data_type: Type::Int8,
-            },
-            ColumnDesc {
-                name: "name".to_string(),
-                table_oid: 0,
-                column_id: 0,
-                data_type: Type::Text,
-            },
-        ];
-        let expr = BoundExpr::BinaryOp {
-            left: Box::new(BoundExpr::Column(0)),
-            op: BinaryOperator::Gt,
-            right: Box::new(BoundExpr::Integer(5)),
-        };
-        assert_eq!(
-            format_bound_expr_with_columns(&expr, &cols),
-            "(id > 5)"
-        );
     }
 }

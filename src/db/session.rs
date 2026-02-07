@@ -222,11 +222,11 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 Statement::Select(select_stmt) => {
                     self.within_transaction(|db, txid, cid| async move {
                         let snapshot = db.tx_manager().snapshot(txid, cid);
-                        let plan =
-                            executor::plan_select(select_stmt, &db, &snapshot).await?;
+                        let plan = executor::plan_select(select_stmt, &db, &snapshot).await?;
                         let explain_text = plan.explain();
                         let columns = vec![ColumnDesc {
                             name: "QUERY PLAN".to_string(),
+                            table_name: None,
                             table_oid: 0,
                             column_id: 0,
                             data_type: crate::datum::Type::Text,
@@ -584,9 +584,7 @@ mod tests {
         let db = Arc::new(Database::open(storage, 100).await.unwrap());
         let mut session = Session::new(db);
 
-        let result = session
-            .execute_query("SELECT * FROM nonexistent")
-            .await;
+        let result = session.execute_query("SELECT * FROM nonexistent").await;
         assert!(matches!(result, Err(DatabaseError::Executor(_))));
     }
 

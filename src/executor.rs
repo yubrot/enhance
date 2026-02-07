@@ -43,7 +43,6 @@ mod planner;
 use crate::datum::Type;
 
 pub use error::ExecutorError;
-pub use eval::{bind_expr, format_bound_expr};
 pub use expr::BoundExpr;
 pub use node::ExecutorNode;
 pub use plan::Plan;
@@ -54,10 +53,25 @@ pub use planner::{build_executor, plan_select};
 pub struct ColumnDesc {
     /// Column name (or alias).
     pub name: String,
+    /// Source table name (if from a table, for qualified column resolution).
+    pub table_name: Option<String>,
     /// OID of the source table (0 if not from a table).
     pub table_oid: i32,
     /// Column attribute number within the source table (0 if not from a table).
     pub column_id: i16,
     /// Data type.
     pub data_type: Type,
+}
+
+impl ColumnDesc {
+    /// Returns the display name for this column.
+    ///
+    /// If the column has a source table name, returns `table.column`,
+    /// otherwise returns just the column name.
+    pub fn display_name(&self) -> String {
+        match &self.table_name {
+            Some(t) => format!("{}.{}", t, self.name),
+            None => self.name.clone(),
+        }
+    }
 }

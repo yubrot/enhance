@@ -7,9 +7,8 @@
 use crate::datum::Type;
 use crate::storage::PageId;
 
-use super::eval::format_bound_expr_with_columns;
-use super::expr::BoundExpr;
 use super::ColumnDesc;
+use super::expr::BoundExpr;
 
 /// A logical query plan node.
 ///
@@ -95,21 +94,11 @@ impl Plan {
                 )
             }
             Plan::Filter { input, predicate } => {
-                let input_columns = input.columns();
-                let filter_str = format_bound_expr_with_columns(predicate, input_columns);
                 let child_str = input.format_explain(indent + 1);
-                format!("{}Filter: {}\n{}", prefix, filter_str, child_str)
+                format!("{}Filter: {}\n{}", prefix, predicate, child_str)
             }
-            Plan::Projection {
-                input,
-                exprs,
-                ..
-            } => {
-                let input_columns = input.columns();
-                let cols: Vec<String> = exprs
-                    .iter()
-                    .map(|e| format_bound_expr_with_columns(e, input_columns))
-                    .collect();
+            Plan::Projection { input, exprs, .. } => {
+                let cols: Vec<String> = exprs.iter().map(|e| e.to_string()).collect();
                 let child_str = input.format_explain(indent + 1);
                 format!("{}Projection: {}\n{}", prefix, cols.join(", "), child_str)
             }
@@ -130,6 +119,7 @@ mod tests {
     fn int_col(name: &str) -> ColumnDesc {
         ColumnDesc {
             name: name.to_string(),
+            table_name: None,
             table_oid: 0,
             column_id: 0,
             data_type: Type::Int8,
@@ -160,14 +150,17 @@ mod tests {
         let plan = Plan::Filter {
             input: Box::new(scan),
             predicate: BoundExpr::BinaryOp {
-                left: Box::new(BoundExpr::Column(0)),
+                left: Box::new(BoundExpr::Column {
+                    index: 0,
+                    name: Some("id".into()),
+                }),
                 op: BinaryOperator::Gt,
                 right: Box::new(BoundExpr::Integer(5)),
             },
         };
         assert_eq!(
             plan.explain(),
-            "Filter: (id > 5)\n  SeqScan on users (cols: id)"
+            "Filter: ($col0 (id) > 5)\n  SeqScan on users (cols: id)"
         );
     }
 
@@ -182,12 +175,15 @@ mod tests {
         };
         let plan = Plan::Projection {
             input: Box::new(scan),
-            exprs: vec![BoundExpr::Column(1)],
+            exprs: vec![BoundExpr::Column {
+                index: 1,
+                name: Some("name".into()),
+            }],
             columns: vec![int_col("name")],
         };
         assert_eq!(
             plan.explain(),
-            "Projection: name\n  SeqScan on users (cols: id, name)"
+            "Projection: $col1 (name)\n  SeqScan on users (cols: id, name)"
         );
     }
 

@@ -9,9 +9,9 @@ use crate::heap::Record;
 
 use crate::heap::Tuple;
 
+use super::ColumnDesc;
 use super::error::ExecutorError;
 use super::expr::BoundExpr;
-use super::ColumnDesc;
 
 /// A query executor node.
 ///
@@ -215,6 +215,7 @@ mod tests {
     fn int_col(name: &str) -> ColumnDesc {
         ColumnDesc {
             name: name.to_string(),
+            table_name: None,
             table_oid: 0,
             column_id: 0,
             data_type: Type::Int8,
@@ -272,7 +273,10 @@ mod tests {
 
         // Filter: $col0 > 2
         let predicate = BoundExpr::BinaryOp {
-            left: Box::new(BoundExpr::Column(0)),
+            left: Box::new(BoundExpr::Column {
+                index: 0,
+                name: None,
+            }),
             op: BinaryOperator::Gt,
             right: Box::new(BoundExpr::Integer(2)),
         };
@@ -301,6 +305,7 @@ mod tests {
                 int_col("id"),
                 ColumnDesc {
                     name: "name".to_string(),
+                    table_name: None,
                     table_oid: 0,
                     column_id: 0,
                     data_type: Type::Text,
@@ -310,9 +315,13 @@ mod tests {
         ));
 
         // Project: just the name column (index 1)
-        let exprs = vec![BoundExpr::Column(1)];
+        let exprs = vec![BoundExpr::Column {
+            index: 1,
+            name: Some("name".into()),
+        }];
         let out_cols = vec![ColumnDesc {
             name: "name".to_string(),
+            table_name: None,
             table_oid: 0,
             column_id: 0,
             data_type: Type::Text,
