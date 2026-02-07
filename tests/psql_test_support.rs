@@ -92,10 +92,14 @@ impl PsqlTestServer {
     pub fn run_psql_direct(&self, query: &str) -> PsqlOutput {
         let output = Command::new("psql")
             .args([
-                "-h", "127.0.0.1",
-                "-p", &self.port.to_string(),
-                "-U", "postgres",
-                "-c", query,
+                "-h",
+                "127.0.0.1",
+                "-p",
+                &self.port.to_string(),
+                "-U",
+                "postgres",
+                "-c",
+                query,
             ])
             .output()
             .expect("Failed to execute psql");

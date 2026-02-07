@@ -223,12 +223,7 @@ mod tests {
         let mut buf = vec![0u8; record.serialized_size()];
         record.serialize(&mut buf).unwrap();
 
-        let schema = [
-            Type::Int4,
-            Type::Text,
-            Type::Text,
-            Type::Int4,
-        ];
+        let schema = [Type::Int4, Type::Text, Type::Text, Type::Int4];
         let parsed = Record::deserialize(&buf, &schema).unwrap();
         assert_eq!(parsed, record);
     }

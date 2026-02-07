@@ -10,8 +10,8 @@ use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
-use crate::db::{Database, QueryResult, Session};
 use crate::datum::Value;
+use crate::db::{Database, QueryResult, Session};
 use crate::protocol::{
     BackendMessage, BindMessage, CloseMessage, CloseTarget, DataValue, DescribeMessage,
     DescribeTarget, ErrorInfo, ExecuteMessage, FieldDescription, FormatCode, FrontendMessage,
@@ -388,11 +388,7 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
         let fields: Vec<FieldDescription> = columns
             .iter()
             .map(|col| {
-                let type_size = col
-                    .data_type
-                    .fixed_size()
-                    .map(|s| s as i16)
-                    .unwrap_or(-1);
+                let type_size = col.data_type.fixed_size().map(|s| s as i16).unwrap_or(-1);
                 FieldDescription {
                     name: col.name.clone(),
                     table_oid: col.table_oid,

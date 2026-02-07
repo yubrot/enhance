@@ -211,13 +211,7 @@ impl SystemCatalogTable for ColumnInfo {
         "type_oid",
         "seq_id",
     ];
-    const SCHEMA: &'static [Type] = &[
-        Type::Int4,
-        Type::Int4,
-        Type::Text,
-        Type::Int4,
-        Type::Int4,
-    ];
+    const SCHEMA: &'static [Type] = &[Type::Int4, Type::Int4, Type::Text, Type::Int4, Type::Int4];
 }
 
 /// Metadata for a sequence stored in the catalog (sys_sequences row).
