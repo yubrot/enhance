@@ -381,7 +381,7 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
     /// Sends RowDescription and DataRow messages for a result set.
     async fn send_rows(
         &mut self,
-        columns: &[crate::db::ColumnDesc],
+        columns: &[crate::executor::ColumnDesc],
         rows: &[crate::heap::Record],
     ) -> Result<(), ConnectionError> {
         // Send RowDescription
