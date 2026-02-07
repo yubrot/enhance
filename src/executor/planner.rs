@@ -1,43 +1,48 @@
 //! Query planner for SELECT statements.
 //!
-//! Transforms a parsed [`SelectStmt`] AST into an [`ExecutorNode`] tree
-//! by resolving table references via the catalog, scanning heap pages
-//! for visible tuples, and building Filter/Projection nodes.
+//! Transforms a parsed [`SelectStmt`] AST into a logical [`Plan`] tree
+//! by resolving table references via the catalog and binding column names.
+//! The plan is then materialized into an [`ExecutorNode`] tree by
+//! [`build_executor`].
+
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::catalog::ColumnInfo;
 use crate::datum::Type;
 use crate::db::Database;
 use crate::heap::HeapPage;
 use crate::sql::{Expr, FromClause, SelectItem, SelectStmt, TableRef};
-use crate::storage::{Replacer, Storage};
+use crate::storage::{PageId, Replacer, Storage};
 use crate::tx::Snapshot;
 
 use super::error::ExecutorError;
 use super::eval::{bind_expr, BoundExpr};
 use super::node::{ExecutorNode, Filter, Projection, SeqScan, ValuesScan};
+use super::plan::Plan;
 use super::types::{ColumnDesc, Tuple, TupleId};
 
-/// Plans a SELECT statement into an executor node tree.
+/// Plans a SELECT statement into a logical [`Plan`] tree.
 ///
-/// The planner resolves table references, constructs SeqScan nodes by
-/// reading visible tuples from heap pages, and wraps them with Filter
-/// and Projection nodes as needed.
+/// The planner resolves table references, binds column names to positional
+/// indices, and constructs Filter/Projection plan nodes. No data is loaded
+/// at this stage.
 ///
 /// # Arguments
 ///
 /// * `select` - The parsed SELECT statement
-/// * `database` - Database for catalog and buffer pool access
-/// * `snapshot` - MVCC snapshot for visibility checks
+/// * `database` - Database for catalog access
+/// * `snapshot` - MVCC snapshot for catalog visibility checks
 ///
 /// # Errors
 ///
 /// Returns [`ExecutorError`] for unresolvable tables/columns, unsupported
-/// features (JOINs, subqueries), or I/O errors.
+/// features (JOINs, subqueries), or catalog I/O errors.
 pub async fn plan_select<S: Storage, R: Replacer>(
     select: &SelectStmt,
     database: &Database<S, R>,
     snapshot: &Snapshot,
-) -> Result<ExecutorNode, ExecutorError> {
+) -> Result<Plan, ExecutorError> {
     // Check for unsupported features
     if select.distinct {
         return Err(ExecutorError::Unsupported("DISTINCT".to_string()));
@@ -61,48 +66,102 @@ pub async fn plan_select<S: Storage, R: Replacer>(
         return Err(ExecutorError::Unsupported("FOR UPDATE/SHARE".to_string()));
     }
 
-    // Step 1: FROM clause -> base node
-    let mut node = match &select.from {
-        Some(from) => build_from_node(from, database, snapshot).await?,
-        None => ExecutorNode::ValuesScan(ValuesScan::new()),
+    // Step 1: FROM clause -> base plan
+    let mut plan = match &select.from {
+        Some(from) => build_from_plan(from, database, snapshot).await?,
+        None => Plan::ValuesScan,
     };
 
     // Step 2: WHERE clause -> Filter (bind column names to indices)
     if let Some(where_clause) = &select.where_clause {
-        let child_columns = node.columns().to_vec();
-        let bound_predicate = bind_expr(where_clause, &child_columns)?;
-        node = ExecutorNode::Filter(Filter::new(node, bound_predicate));
+        let columns = plan.columns().to_vec();
+        let bound_predicate = bind_expr(where_clause, &columns)?;
+        plan = Plan::Filter {
+            input: Box::new(plan),
+            predicate: bound_predicate,
+        };
     }
 
     // Step 3: SELECT list -> Projection
-    node = build_projection(node, &select.columns)?;
+    plan = build_projection_plan(plan, &select.columns)?;
 
-    Ok(node)
+    Ok(plan)
 }
 
-/// Builds an executor node from a FROM clause.
-async fn build_from_node<S: Storage, R: Replacer>(
+/// Materializes a logical [`Plan`] into a physical [`ExecutorNode`] tree.
+///
+/// Currently pre-loads all tuples from heap pages into memory. For future
+/// streaming support:
+///
+/// 1. Define a `HeapScanner` trait or `Pin<Box<dyn Stream<Item = ...>>>`
+/// 2. Inject a scanner into SeqScan instead of pre-loaded `Vec`
+/// 3. `SeqScan::next().await` fetches pages lazily via the scanner
+/// 4. Plan, explain, and all other nodes remain unchanged
+///
+/// The async `next()` introduced here is the prerequisite that makes
+/// this transition non-breaking.
+pub fn build_executor<'a, S: Storage, R: Replacer>(
+    plan: Plan,
+    database: &'a Database<S, R>,
+    snapshot: &'a Snapshot,
+) -> Pin<Box<dyn Future<Output = Result<ExecutorNode, ExecutorError>> + Send + 'a>> {
+    Box::pin(async move {
+        match plan {
+            Plan::SeqScan {
+                table_name,
+                first_page,
+                schema,
+                columns,
+                ..
+            } => {
+                let tuples =
+                    scan_visible_tuples(database, snapshot, first_page, &schema).await?;
+                Ok(ExecutorNode::SeqScan(SeqScan::new(
+                    table_name, columns, tuples,
+                )))
+            }
+            Plan::Filter { input, predicate } => {
+                let child = build_executor(*input, database, snapshot).await?;
+                Ok(ExecutorNode::Filter(Filter::new(child, predicate)))
+            }
+            Plan::Projection {
+                input,
+                exprs,
+                columns,
+            } => {
+                let child = build_executor(*input, database, snapshot).await?;
+                Ok(ExecutorNode::Projection(Projection::new(
+                    child, exprs, columns,
+                )))
+            }
+            Plan::ValuesScan => Ok(ExecutorNode::ValuesScan(ValuesScan::new())),
+        }
+    })
+}
+
+/// Builds a plan from a FROM clause.
+async fn build_from_plan<S: Storage, R: Replacer>(
     from: &FromClause,
     database: &Database<S, R>,
     snapshot: &Snapshot,
-) -> Result<ExecutorNode, ExecutorError> {
+) -> Result<Plan, ExecutorError> {
     if from.tables.len() != 1 {
         return Err(ExecutorError::Unsupported(
             "multiple tables in FROM (use JOIN)".to_string(),
         ));
     }
-    build_table_ref(&from.tables[0], database, snapshot).await
+    build_table_ref_plan(&from.tables[0], database, snapshot).await
 }
 
-/// Builds an executor node from a table reference.
-async fn build_table_ref<S: Storage, R: Replacer>(
+/// Builds a plan from a table reference.
+async fn build_table_ref_plan<S: Storage, R: Replacer>(
     table_ref: &TableRef,
     database: &Database<S, R>,
     snapshot: &Snapshot,
-) -> Result<ExecutorNode, ExecutorError> {
+) -> Result<Plan, ExecutorError> {
     match table_ref {
         TableRef::Table { name, alias: _ } => {
-            build_seq_scan(name, database, snapshot).await
+            build_seq_scan_plan(name, database, snapshot).await
         }
         TableRef::Join { .. } => Err(ExecutorError::Unsupported("JOIN".to_string())),
         TableRef::Subquery { .. } => {
@@ -111,13 +170,14 @@ async fn build_table_ref<S: Storage, R: Replacer>(
     }
 }
 
-/// Builds a SeqScan node by looking up the table in the catalog and
-/// scanning its heap page for visible tuples.
-async fn build_seq_scan<S: Storage, R: Replacer>(
+/// Builds a SeqScan plan by looking up the table in the catalog.
+///
+/// No data is loaded — only catalog metadata is gathered.
+async fn build_seq_scan_plan<S: Storage, R: Replacer>(
     table_name: &str,
     database: &Database<S, R>,
     snapshot: &Snapshot,
-) -> Result<ExecutorNode, ExecutorError> {
+) -> Result<Plan, ExecutorError> {
     // Look up table in catalog
     let table_info = database
         .catalog()
@@ -139,15 +199,13 @@ async fn build_seq_scan<S: Storage, R: Replacer>(
     // Build column descriptors
     let columns = build_column_descs(&column_infos, table_info.table_id);
 
-    // Scan heap page for visible tuples
-    let tuples =
-        scan_visible_tuples(database, snapshot, table_info.first_page, &schema).await?;
-
-    Ok(ExecutorNode::SeqScan(SeqScan::new(
-        table_name.to_string(),
+    Ok(Plan::SeqScan {
+        table_name: table_name.to_string(),
+        table_id: table_info.table_id,
+        first_page: table_info.first_page,
+        schema,
         columns,
-        tuples,
-    )))
+    })
 }
 
 /// Builds column descriptors from catalog column info.
@@ -168,7 +226,7 @@ fn build_column_descs(column_infos: &[ColumnInfo], table_id: u32) -> Vec<ColumnD
 async fn scan_visible_tuples<S: Storage, R: Replacer>(
     database: &Database<S, R>,
     snapshot: &Snapshot,
-    page_id: crate::storage::PageId,
+    page_id: PageId,
     schema: &[Type],
 ) -> Result<Vec<Tuple>, ExecutorError> {
     let page_guard = database.pool().fetch_page(page_id).await?;
@@ -189,23 +247,23 @@ async fn scan_visible_tuples<S: Storage, R: Replacer>(
     Ok(tuples)
 }
 
-/// Builds a Projection node from the SELECT list.
+/// Builds a Projection plan from the SELECT list.
 ///
 /// Column names and types are inferred from the AST expression *before* binding,
 /// then the expression is bound to positional indices for efficient evaluation.
-fn build_projection(
-    child: ExecutorNode,
+fn build_projection_plan(
+    input: Plan,
     select_items: &[SelectItem],
-) -> Result<ExecutorNode, ExecutorError> {
-    let child_columns = child.columns().to_vec();
+) -> Result<Plan, ExecutorError> {
+    let input_columns = input.columns().to_vec();
     let mut exprs = Vec::new();
     let mut out_columns = Vec::new();
 
     for item in select_items {
         match item {
             SelectItem::Wildcard => {
-                // Expand to all child columns using positional indices
-                for (i, col) in child_columns.iter().enumerate() {
+                // Expand to all input columns using positional indices
+                for (i, col) in input_columns.iter().enumerate() {
                     exprs.push(BoundExpr::Column(i));
                     out_columns.push(ColumnDesc {
                         name: col.name.clone(),
@@ -218,7 +276,7 @@ fn build_projection(
             SelectItem::QualifiedWildcard(table_name) => {
                 // Expand to all columns from the specified table
                 let mut found = false;
-                for (i, col) in child_columns.iter().enumerate() {
+                for (i, col) in input_columns.iter().enumerate() {
                     // For single-table queries, we match by checking if the child is a
                     // SeqScan with the matching table name. Since we only support
                     // single-table queries now, all columns belong to the table.
@@ -242,10 +300,10 @@ fn build_projection(
             SelectItem::Expr { expr, alias } => {
                 // Infer name and type from AST before binding
                 let col_name = alias.clone().unwrap_or_else(|| infer_column_name(expr));
-                let col_data_type = infer_data_type(expr, &child_columns);
+                let col_data_type = infer_data_type(expr, &input_columns);
 
                 // Bind column names to positional indices
-                let bound = bind_expr(expr, &child_columns)?;
+                let bound = bind_expr(expr, &input_columns)?;
 
                 exprs.push(bound);
                 out_columns.push(ColumnDesc {
@@ -258,11 +316,11 @@ fn build_projection(
         }
     }
 
-    Ok(ExecutorNode::Projection(Projection::new(
-        child,
+    Ok(Plan::Projection {
+        input: Box::new(input),
         exprs,
-        out_columns,
-    )))
+        columns: out_columns,
+    })
 }
 
 /// Infers a column name from an expression (for un-aliased expressions).
@@ -357,17 +415,18 @@ mod tests {
             locking: None,
         };
 
-        let mut node = plan_select(&select, &db, &snapshot).await.unwrap();
+        let plan = plan_select(&select, &db, &snapshot).await.unwrap();
 
         // Should have 3 columns (table_id, table_name, first_page)
-        assert_eq!(node.columns().len(), 3);
-        assert_eq!(node.columns()[0].name, "table_id");
-        assert_eq!(node.columns()[1].name, "table_name");
-        assert_eq!(node.columns()[2].name, "first_page");
+        assert_eq!(plan.columns().len(), 3);
+        assert_eq!(plan.columns()[0].name, "table_id");
+        assert_eq!(plan.columns()[1].name, "table_name");
+        assert_eq!(plan.columns()[2].name, "first_page");
 
-        // Should have at least 3 rows (sys_tables, sys_columns, sys_sequences)
+        // Materialize and verify rows
+        let mut node = build_executor(plan, &db, &snapshot).await.unwrap();
         let mut count = 0;
-        while node.next().unwrap().is_some() {
+        while node.next().await.unwrap().is_some() {
             count += 1;
         }
         assert!(count >= 3, "expected at least 3 catalog tables, got {}", count);
@@ -393,12 +452,13 @@ mod tests {
             locking: None,
         };
 
-        let mut node = plan_select(&select, &db, &snapshot).await.unwrap();
+        let plan = plan_select(&select, &db, &snapshot).await.unwrap();
+        let mut node = build_executor(plan, &db, &snapshot).await.unwrap();
 
-        let tuple = node.next().unwrap().unwrap();
+        let tuple = node.next().await.unwrap().unwrap();
         assert_eq!(tuple.record.values.len(), 1);
         assert_eq!(tuple.record.values[0], crate::datum::Value::Int64(42));
-        assert!(node.next().unwrap().is_none());
+        assert!(node.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -463,14 +523,15 @@ mod tests {
             locking: None,
         };
 
-        let mut node = plan_select(&select, &db, &snapshot).await.unwrap();
+        let plan = plan_select(&select, &db, &snapshot).await.unwrap();
+        let mut node = build_executor(plan, &db, &snapshot).await.unwrap();
 
-        let tuple = node.next().unwrap().unwrap();
+        let tuple = node.next().await.unwrap().unwrap();
         assert_eq!(tuple.record.values.len(), 1);
         assert_eq!(
             tuple.record.values[0],
             crate::datum::Value::Text("sys_tables".to_string())
         );
-        assert!(node.next().unwrap().is_none());
+        assert!(node.next().await.unwrap().is_none());
     }
 }

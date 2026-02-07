@@ -8,7 +8,7 @@ use crate::datum::Value;
 use crate::heap::Record;
 
 use super::error::ExecutorError;
-use super::eval::{format_bound_expr_with_columns, BoundExpr};
+use super::eval::BoundExpr;
 use super::types::{ColumnDesc, Tuple};
 
 /// A query executor node.
@@ -31,14 +31,25 @@ impl ExecutorNode {
     ///
     /// This method follows the Volcano iterator model naming convention,
     /// not `std::iter::Iterator`, because it returns `Result<Option<_>>`.
+    /// The async signature prepares for future page-level streaming where
+    /// SeqScan would fetch pages lazily.
+    ///
+    /// Uses `Pin<Box<...>>` to break the recursive future cycle
+    /// (ExecutorNode -> Filter -> ExecutorNode).
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Result<Option<Tuple>, ExecutorError> {
-        match self {
-            ExecutorNode::SeqScan(n) => n.next(),
-            ExecutorNode::Filter(n) => n.next(),
-            ExecutorNode::Projection(n) => n.next(),
-            ExecutorNode::ValuesScan(n) => n.next(),
-        }
+    pub fn next(
+        &mut self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<Tuple>, ExecutorError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            match self {
+                ExecutorNode::SeqScan(n) => n.next().await,
+                ExecutorNode::Filter(n) => n.next().await,
+                ExecutorNode::Projection(n) => n.next().await,
+                ExecutorNode::ValuesScan(n) => n.next().await,
+            }
+        })
     }
 
     /// Returns the column descriptors for this node's output.
@@ -50,48 +61,17 @@ impl ExecutorNode {
             ExecutorNode::ValuesScan(n) => &n.columns,
         }
     }
-
-    /// Produces a human-readable EXPLAIN output for this node.
-    pub fn explain(&self, indent: usize) -> String {
-        let prefix = "  ".repeat(indent);
-        match self {
-            ExecutorNode::SeqScan(n) => {
-                format!(
-                    "{}SeqScan on {} ({} rows)",
-                    prefix,
-                    n.table_name,
-                    n.tuples.len()
-                )
-            }
-            ExecutorNode::Filter(n) => {
-                let child_columns = n.child.columns();
-                let filter_str = format_bound_expr_with_columns(&n.predicate, child_columns);
-                let child_str = n.child.explain(indent + 1);
-                format!("{}Filter: {}\n{}", prefix, filter_str, child_str)
-            }
-            ExecutorNode::Projection(n) => {
-                let child_columns = n.child.columns();
-                let cols: Vec<String> = n
-                    .exprs
-                    .iter()
-                    .map(|e| format_bound_expr_with_columns(e, child_columns))
-                    .collect();
-                let child_str = n.child.explain(indent + 1);
-                format!("{}Projection: {}\n{}", prefix, cols.join(", "), child_str)
-            }
-            ExecutorNode::ValuesScan(_) => {
-                format!("{}ValuesScan (1 row)", prefix)
-            }
-        }
-    }
 }
 
 /// Sequential scan node that pre-loads all visible tuples from a heap page.
 ///
 /// Pre-loading avoids holding page latches across `next()` calls and
 /// sidesteps lifetime issues with page guards.
+///
+/// NOTE: For future streaming, this node would accept a `HeapScanner`
+/// instead of a pre-loaded `Vec`, fetching pages lazily via `next().await`.
 pub struct SeqScan {
-    /// Table name (for EXPLAIN output).
+    /// Table name (for identification).
     pub table_name: String,
     /// Column descriptors for the output.
     pub columns: Vec<ColumnDesc>,
@@ -113,7 +93,7 @@ impl SeqScan {
     }
 
     /// Returns the next tuple.
-    fn next(&mut self) -> Result<Option<Tuple>, ExecutorError> {
+    async fn next(&mut self) -> Result<Option<Tuple>, ExecutorError> {
         if self.cursor < self.tuples.len() {
             let tuple = self.tuples[self.cursor].clone();
             self.cursor += 1;
@@ -142,9 +122,9 @@ impl Filter {
     }
 
     /// Returns the next tuple that satisfies the predicate.
-    fn next(&mut self) -> Result<Option<Tuple>, ExecutorError> {
+    async fn next(&mut self) -> Result<Option<Tuple>, ExecutorError> {
         loop {
-            match self.child.next()? {
+            match self.child.next().await? {
                 Some(tuple) => {
                     let result = self.predicate.evaluate(&tuple.record)?;
                     if matches!(result, Value::Boolean(true)) {
@@ -179,8 +159,8 @@ impl Projection {
     }
 
     /// Returns the next projected tuple.
-    fn next(&mut self) -> Result<Option<Tuple>, ExecutorError> {
-        match self.child.next()? {
+    async fn next(&mut self) -> Result<Option<Tuple>, ExecutorError> {
+        match self.child.next().await? {
             Some(tuple) => {
                 let mut values = Vec::with_capacity(self.exprs.len());
                 for expr in &self.exprs {
@@ -214,7 +194,7 @@ impl ValuesScan {
     }
 
     /// Returns the single empty tuple, then `None`.
-    fn next(&mut self) -> Result<Option<Tuple>, ExecutorError> {
+    async fn next(&mut self) -> Result<Option<Tuple>, ExecutorError> {
         if self.done {
             Ok(None)
         } else {
@@ -245,8 +225,8 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn test_seq_scan_cursor() {
+    #[tokio::test]
+    async fn test_seq_scan_cursor() {
         let tuples = make_tuples(vec![
             vec![Value::Int64(1)],
             vec![Value::Int64(2)],
@@ -259,23 +239,23 @@ mod tests {
         ));
 
         assert_eq!(
-            node.next().unwrap().unwrap().record.values,
+            node.next().await.unwrap().unwrap().record.values,
             vec![Value::Int64(1)]
         );
         assert_eq!(
-            node.next().unwrap().unwrap().record.values,
+            node.next().await.unwrap().unwrap().record.values,
             vec![Value::Int64(2)]
         );
         assert_eq!(
-            node.next().unwrap().unwrap().record.values,
+            node.next().await.unwrap().unwrap().record.values,
             vec![Value::Int64(3)]
         );
-        assert!(node.next().unwrap().is_none());
-        assert!(node.next().unwrap().is_none()); // Idempotent
+        assert!(node.next().await.unwrap().is_none());
+        assert!(node.next().await.unwrap().is_none()); // Idempotent
     }
 
-    #[test]
-    fn test_filter_predicate() {
+    #[tokio::test]
+    async fn test_filter_predicate() {
         let tuples = make_tuples(vec![
             vec![Value::Int64(1)],
             vec![Value::Int64(2)],
@@ -297,18 +277,18 @@ mod tests {
         let mut node = ExecutorNode::Filter(Filter::new(scan, predicate));
 
         assert_eq!(
-            node.next().unwrap().unwrap().record.values,
+            node.next().await.unwrap().unwrap().record.values,
             vec![Value::Int64(3)]
         );
         assert_eq!(
-            node.next().unwrap().unwrap().record.values,
+            node.next().await.unwrap().unwrap().record.values,
             vec![Value::Int64(4)]
         );
-        assert!(node.next().unwrap().is_none());
+        assert!(node.next().await.unwrap().is_none());
     }
 
-    #[test]
-    fn test_projection() {
+    #[tokio::test]
+    async fn test_projection() {
         let tuples = make_tuples(vec![
             vec![Value::Int64(1), Value::Text("alice".into())],
             vec![Value::Int64(2), Value::Text("bob".into())],
@@ -338,45 +318,22 @@ mod tests {
         let mut node = ExecutorNode::Projection(Projection::new(scan, exprs, out_cols));
 
         assert_eq!(
-            node.next().unwrap().unwrap().record.values,
+            node.next().await.unwrap().unwrap().record.values,
             vec![Value::Text("alice".into())]
         );
         assert_eq!(
-            node.next().unwrap().unwrap().record.values,
+            node.next().await.unwrap().unwrap().record.values,
             vec![Value::Text("bob".into())]
         );
-        assert!(node.next().unwrap().is_none());
+        assert!(node.next().await.unwrap().is_none());
     }
 
-    #[test]
-    fn test_values_scan() {
+    #[tokio::test]
+    async fn test_values_scan() {
         let mut node = ExecutorNode::ValuesScan(ValuesScan::new());
-        let tuple = node.next().unwrap().unwrap();
+        let tuple = node.next().await.unwrap().unwrap();
         assert!(tuple.record.values.is_empty());
         assert!(tuple.tid.is_none());
-        assert!(node.next().unwrap().is_none());
-    }
-
-    #[test]
-    fn test_explain_output() {
-        let tuples = make_tuples(vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]);
-        let scan = ExecutorNode::SeqScan(SeqScan::new(
-            "users".to_string(),
-            vec![int_col("id")],
-            tuples,
-        ));
-
-        let filter = ExecutorNode::Filter(Filter::new(
-            scan,
-            BoundExpr::BinaryOp {
-                left: Box::new(BoundExpr::Column(0)),
-                op: BinaryOperator::Gt,
-                right: Box::new(BoundExpr::Integer(1)),
-            },
-        ));
-
-        let explain = filter.explain(0);
-        assert!(explain.contains("Filter:"));
-        assert!(explain.contains("SeqScan on users"));
+        assert!(node.next().await.unwrap().is_none());
     }
 }

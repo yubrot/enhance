@@ -186,10 +186,11 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::Select(select_stmt) => {
                 self.within_transaction(|db, txid, cid| async move {
                     let snapshot = db.tx_manager().snapshot(txid, cid);
-                    let mut node = executor::plan_select(select_stmt, &db, &snapshot).await?;
-                    let columns = node.columns().to_vec();
+                    let plan = executor::plan_select(select_stmt, &db, &snapshot).await?;
+                    let columns = plan.columns().to_vec();
+                    let mut node = executor::build_executor(plan, &db, &snapshot).await?;
                     let mut rows = Vec::new();
-                    while let Some(tuple) = node.next()? {
+                    while let Some(tuple) = node.next().await? {
                         rows.push(tuple.record);
                     }
                     Ok(QueryResult::Rows { columns, rows })
@@ -221,9 +222,9 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 Statement::Select(select_stmt) => {
                     self.within_transaction(|db, txid, cid| async move {
                         let snapshot = db.tx_manager().snapshot(txid, cid);
-                        let node =
+                        let plan =
                             executor::plan_select(select_stmt, &db, &snapshot).await?;
-                        let explain_text = node.explain(0);
+                        let explain_text = executor::explain_plan(&plan);
                         let columns = vec![ColumnDesc {
                             name: "QUERY PLAN".to_string(),
                             table_oid: 0,
