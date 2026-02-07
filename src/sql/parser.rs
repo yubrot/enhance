@@ -852,8 +852,8 @@ impl<'a> Parser<'a> {
         let distinct = match_tokens!(self, { [Distinct]! => true, _ => false });
 
         let args = match_tokens!(self, {
-            // Check for empty argument list or wildcard
-            [RParen]! => Vec::new(),
+            // Check for empty argument list first
+            [RParen] => Vec::new(),
             // Check for COUNT(*)
             [Asterisk]! => vec![Expr::ColumnRef { table: None, column: "*".to_string() }],
             _ => self.parse_comma_separated(Self::parse_expr)?,
