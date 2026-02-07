@@ -745,4 +745,364 @@ mod tests {
         };
         assert_eq!(expr.evaluate(&record).unwrap(), Value::Boolean(true));
     }
+
+    // --- 3-value NULL logic tests ---
+
+    fn eval_binop(left: Value, op: BinaryOperator, right: Value) -> Result<Value, ExecutorError> {
+        eval_binary_op(&left, op, &right)
+    }
+
+    #[test]
+    fn test_and_null_propagation() {
+        // TRUE AND NULL = NULL
+        assert_eq!(
+            eval_binop(Value::Boolean(true), BinaryOperator::And, Value::Null).unwrap(),
+            Value::Null
+        );
+        // NULL AND TRUE = NULL
+        assert_eq!(
+            eval_binop(Value::Null, BinaryOperator::And, Value::Boolean(true)).unwrap(),
+            Value::Null
+        );
+        // FALSE AND NULL = FALSE (short-circuit)
+        assert_eq!(
+            eval_binop(Value::Boolean(false), BinaryOperator::And, Value::Null).unwrap(),
+            Value::Boolean(false)
+        );
+        // NULL AND FALSE = FALSE (short-circuit)
+        assert_eq!(
+            eval_binop(Value::Null, BinaryOperator::And, Value::Boolean(false)).unwrap(),
+            Value::Boolean(false)
+        );
+        // NULL AND NULL = NULL
+        assert_eq!(
+            eval_binop(Value::Null, BinaryOperator::And, Value::Null).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_or_null_propagation() {
+        // TRUE OR NULL = TRUE (short-circuit)
+        assert_eq!(
+            eval_binop(Value::Boolean(true), BinaryOperator::Or, Value::Null).unwrap(),
+            Value::Boolean(true)
+        );
+        // NULL OR TRUE = TRUE (short-circuit)
+        assert_eq!(
+            eval_binop(Value::Null, BinaryOperator::Or, Value::Boolean(true)).unwrap(),
+            Value::Boolean(true)
+        );
+        // FALSE OR NULL = NULL
+        assert_eq!(
+            eval_binop(Value::Boolean(false), BinaryOperator::Or, Value::Null).unwrap(),
+            Value::Null
+        );
+        // NULL OR FALSE = NULL
+        assert_eq!(
+            eval_binop(Value::Null, BinaryOperator::Or, Value::Boolean(false)).unwrap(),
+            Value::Null
+        );
+        // NULL OR NULL = NULL
+        assert_eq!(
+            eval_binop(Value::Null, BinaryOperator::Or, Value::Null).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_comparison_null_propagation() {
+        // Any comparison with NULL returns NULL
+        assert_eq!(
+            eval_binop(Value::Int64(1), BinaryOperator::Eq, Value::Null).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            eval_binop(Value::Null, BinaryOperator::Lt, Value::Int64(1)).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            eval_binop(Value::Null, BinaryOperator::Neq, Value::Null).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_in_list_null_propagation() {
+        let record = Record::new(vec![]);
+        // NULL IN (1, 2) = NULL
+        let expr = BoundExpr::InList {
+            expr: Box::new(BoundExpr::Null),
+            list: vec![BoundExpr::Integer(1), BoundExpr::Integer(2)],
+            negated: false,
+        };
+        assert_eq!(expr.evaluate(&record).unwrap(), Value::Null);
+
+        // 1 IN (1, NULL) = TRUE (found before NULL)
+        let expr = BoundExpr::InList {
+            expr: Box::new(BoundExpr::Integer(1)),
+            list: vec![BoundExpr::Integer(1), BoundExpr::Null],
+            negated: false,
+        };
+        assert_eq!(expr.evaluate(&record).unwrap(), Value::Boolean(true));
+
+        // 3 IN (1, NULL) = NULL (not found, has NULL)
+        let expr = BoundExpr::InList {
+            expr: Box::new(BoundExpr::Integer(3)),
+            list: vec![BoundExpr::Integer(1), BoundExpr::Null],
+            negated: false,
+        };
+        assert_eq!(expr.evaluate(&record).unwrap(), Value::Null);
+
+        // 3 NOT IN (1, 2) = TRUE (not found, no NULL)
+        let expr = BoundExpr::InList {
+            expr: Box::new(BoundExpr::Integer(3)),
+            list: vec![BoundExpr::Integer(1), BoundExpr::Integer(2)],
+            negated: true,
+        };
+        assert_eq!(expr.evaluate(&record).unwrap(), Value::Boolean(true));
+
+        // 3 NOT IN (1, NULL) = NULL (not found, has NULL)
+        let expr = BoundExpr::InList {
+            expr: Box::new(BoundExpr::Integer(3)),
+            list: vec![BoundExpr::Integer(1), BoundExpr::Null],
+            negated: true,
+        };
+        assert_eq!(expr.evaluate(&record).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_between_null_propagation() {
+        let record = Record::new(vec![]);
+        // NULL BETWEEN 1 AND 10 = NULL
+        let expr = BoundExpr::Between {
+            expr: Box::new(BoundExpr::Null),
+            low: Box::new(BoundExpr::Integer(1)),
+            high: Box::new(BoundExpr::Integer(10)),
+            negated: false,
+        };
+        assert_eq!(expr.evaluate(&record).unwrap(), Value::Null);
+
+        // 5 BETWEEN NULL AND 10 = NULL
+        let expr = BoundExpr::Between {
+            expr: Box::new(BoundExpr::Integer(5)),
+            low: Box::new(BoundExpr::Null),
+            high: Box::new(BoundExpr::Integer(10)),
+            negated: false,
+        };
+        assert_eq!(expr.evaluate(&record).unwrap(), Value::Null);
+
+        // 5 BETWEEN 1 AND NULL = NULL
+        let expr = BoundExpr::Between {
+            expr: Box::new(BoundExpr::Integer(5)),
+            low: Box::new(BoundExpr::Integer(1)),
+            high: Box::new(BoundExpr::Null),
+            negated: false,
+        };
+        assert_eq!(expr.evaluate(&record).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_is_null_expr() {
+        let record = Record::new(vec![]);
+        // NULL IS NULL = TRUE
+        let expr = BoundExpr::IsNull {
+            expr: Box::new(BoundExpr::Null),
+            negated: false,
+        };
+        assert_eq!(expr.evaluate(&record).unwrap(), Value::Boolean(true));
+
+        // 1 IS NULL = FALSE
+        let expr = BoundExpr::IsNull {
+            expr: Box::new(BoundExpr::Integer(1)),
+            negated: false,
+        };
+        assert_eq!(expr.evaluate(&record).unwrap(), Value::Boolean(false));
+
+        // NULL IS NOT NULL = FALSE
+        let expr = BoundExpr::IsNull {
+            expr: Box::new(BoundExpr::Null),
+            negated: true,
+        };
+        assert_eq!(expr.evaluate(&record).unwrap(), Value::Boolean(false));
+    }
+
+    // --- Cast boundary tests ---
+
+    #[test]
+    fn test_cast_int64_to_int16_truncation() {
+        // Large Int64 value truncates when cast to Int16
+        let result = eval_cast(Value::Int64(70000), &Type::Int2).unwrap();
+        // 70000 = 0x11170, truncated to i16 = 0x1170 = 4464
+        assert!(matches!(result, Value::Int16(_)));
+    }
+
+    #[test]
+    fn test_cast_float_to_int_truncation() {
+        // Float truncates toward zero
+        let result = eval_cast(Value::Float64(3.9), &Type::Int8).unwrap();
+        assert_eq!(result, Value::Int64(3));
+
+        let result = eval_cast(Value::Float64(-3.9), &Type::Int8).unwrap();
+        assert_eq!(result, Value::Int64(-3));
+    }
+
+    #[test]
+    fn test_cast_text_to_numeric() {
+        assert_eq!(
+            eval_cast(Value::Text("42".into()), &Type::Int4).unwrap(),
+            Value::Int32(42)
+        );
+        assert_eq!(
+            eval_cast(Value::Text(" -7 ".into()), &Type::Int8).unwrap(),
+            Value::Int64(-7)
+        );
+        assert_eq!(
+            eval_cast(Value::Text("3.14".into()), &Type::Float8).unwrap(),
+            Value::Float64(3.14)
+        );
+    }
+
+    #[test]
+    fn test_cast_text_to_numeric_invalid() {
+        assert!(matches!(
+            eval_cast(Value::Text("abc".into()), &Type::Int4),
+            Err(ExecutorError::InvalidCast { .. })
+        ));
+        assert!(matches!(
+            eval_cast(Value::Text("".into()), &Type::Int8),
+            Err(ExecutorError::InvalidCast { .. })
+        ));
+    }
+
+    #[test]
+    fn test_cast_null_passthrough() {
+        // CAST(NULL AS <any type>) = NULL
+        for ty in [
+            Type::Bool,
+            Type::Int2,
+            Type::Int4,
+            Type::Int8,
+            Type::Float4,
+            Type::Float8,
+            Type::Text,
+        ] {
+            assert_eq!(eval_cast(Value::Null, &ty).unwrap(), Value::Null);
+        }
+    }
+
+    #[test]
+    fn test_cast_bool_from_text() {
+        for (input, expected) in [
+            ("true", true),
+            ("t", true),
+            ("yes", true),
+            ("1", true),
+            ("on", true),
+            ("false", false),
+            ("f", false),
+            ("no", false),
+            ("0", false),
+            ("off", false),
+        ] {
+            assert_eq!(
+                eval_cast(Value::Text(input.into()), &Type::Bool).unwrap(),
+                Value::Boolean(expected),
+                "CAST('{}' AS BOOL)",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn test_arithmetic_null_propagation() {
+        // Any arithmetic with NULL returns NULL
+        assert_eq!(
+            eval_binop(Value::Int64(1), BinaryOperator::Add, Value::Null).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            eval_binop(Value::Null, BinaryOperator::Mul, Value::Int64(2)).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_concat_null_propagation() {
+        // String concatenation with NULL returns NULL
+        assert_eq!(
+            eval_binop(
+                Value::Text("hello".into()),
+                BinaryOperator::Concat,
+                Value::Null
+            )
+            .unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            eval_binop(
+                Value::Null,
+                BinaryOperator::Concat,
+                Value::Text("world".into())
+            )
+            .unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_like_null_propagation() {
+        let record = Record::new(vec![]);
+        // NULL LIKE '%' = NULL
+        let expr = BoundExpr::Like {
+            expr: Box::new(BoundExpr::Null),
+            pattern: Box::new(BoundExpr::String("%".into())),
+            escape: None,
+            negated: false,
+            case_insensitive: false,
+        };
+        assert_eq!(expr.evaluate(&record).unwrap(), Value::Null);
+
+        // 'abc' LIKE NULL = NULL
+        let expr = BoundExpr::Like {
+            expr: Box::new(BoundExpr::String("abc".into())),
+            pattern: Box::new(BoundExpr::Null),
+            escape: None,
+            negated: false,
+            case_insensitive: false,
+        };
+        assert_eq!(expr.evaluate(&record).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_integer_overflow() {
+        assert!(matches!(
+            eval_binop(Value::Int64(i64::MAX), BinaryOperator::Add, Value::Int64(1)),
+            Err(ExecutorError::Unsupported(_))
+        ));
+        assert!(matches!(
+            eval_binop(Value::Int64(i64::MIN), BinaryOperator::Sub, Value::Int64(1)),
+            Err(ExecutorError::Unsupported(_))
+        ));
+        assert!(matches!(
+            eval_binop(Value::Int64(i64::MAX), BinaryOperator::Mul, Value::Int64(2)),
+            Err(ExecutorError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn test_division_by_zero() {
+        assert!(matches!(
+            eval_binop(Value::Int64(1), BinaryOperator::Div, Value::Int64(0)),
+            Err(ExecutorError::DivisionByZero)
+        ));
+        assert!(matches!(
+            eval_binop(Value::Int64(1), BinaryOperator::Mod, Value::Int64(0)),
+            Err(ExecutorError::DivisionByZero)
+        ));
+        assert!(matches!(
+            eval_binop(Value::Float64(1.0), BinaryOperator::Div, Value::Float64(0.0)),
+            Err(ExecutorError::DivisionByZero)
+        ));
+    }
 }
