@@ -2,8 +2,6 @@
 //!
 //! The [`ExecContext`] trait abstracts storage operations needed by executor
 //! nodes, keeping them decoupled from concrete `Storage`/`Replacer` types.
-//! Each node owns a cloned context (lightweight via `Arc`) and performs I/O
-//! lazily during [`ExecutorNode::next()`](super::node::ExecutorNode::next).
 
 use std::future::Future;
 use std::sync::Arc;
@@ -17,7 +15,7 @@ use super::error::ExecutorError;
 
 /// Execution context providing stateless storage operations to executor nodes.
 ///
-/// Implementations are `Clone` (via `Arc`) so each node can own its own copy.
+/// Implementations are `Clone` so each node can own its own copy.
 /// Methods take `&self` because all mutable state (scan position, buffer) is
 /// managed by the nodes themselves.
 pub trait ExecContext: Send + Clone {
@@ -75,8 +73,7 @@ impl<S: Storage, R: Replacer> ExecContext for ExecContextImpl<S, R> {
         page_id: PageId,
         schema: &[Type],
     ) -> Result<Vec<Tuple>, ExecutorError> {
-        let page_guard = self.pool.fetch_page(page_id).await?;
-        let page = HeapPage::new(page_guard);
+        let page = HeapPage::new(self.pool.fetch_page(page_id).await?);
 
         let mut tuples = Vec::new();
         for (slot_id, header, record) in page.scan(schema) {
@@ -91,47 +88,10 @@ impl<S: Storage, R: Replacer> ExecContext for ExecContextImpl<S, R> {
     }
 }
 
-/// Mock execution context for unit testing executor nodes without real storage.
-#[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct MockContext {
-    /// Pages indexed by page number. Each page is a Vec of tuples.
-    pub pages: Arc<Vec<Vec<Tuple>>>,
-}
-
-#[cfg(test)]
-impl MockContext {
-    /// Creates a mock context with the given pages.
-    pub fn new(pages: Vec<Vec<Tuple>>) -> Self {
-        Self {
-            pages: Arc::new(pages),
-        }
-    }
-
-    /// Creates a mock context with a single page of tuples.
-    pub fn single_page(tuples: Vec<Tuple>) -> Self {
-        Self::new(vec![tuples])
-    }
-}
-
-#[cfg(test)]
-impl ExecContext for MockContext {
-    async fn scan_heap_page(
-        &self,
-        page_id: PageId,
-        _schema: &[Type],
-    ) -> Result<Vec<Tuple>, ExecutorError> {
-        Ok(self
-            .pages
-            .get(page_id.page_num() as usize)
-            .cloned()
-            .unwrap_or_default())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{SystemCatalogTable, TableInfo};
     use crate::datum::Value;
     use crate::db::Database;
     use crate::storage::MemoryStorage;
@@ -142,29 +102,26 @@ mod tests {
         // Bootstrap a database to get catalog tables with data
         let storage = MemoryStorage::new();
         let db = Database::open(storage, 100).await.unwrap();
+
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-
-        let ctx =
-            ExecContextImpl::new(Arc::clone(db.pool()), Arc::clone(db.tx_manager()), snapshot);
-
-        // sys_tables has schema: [Int4, Text, Int4] (table_id, table_name, first_page)
-        let schema = vec![Type::Int4, Type::Text, Type::Int4];
 
         // Scan the first page of sys_tables (page 2 after superblock and catalog pages)
         // We don't know the exact page ID, so we rely on the catalog to tell us.
         // For this test, we just verify the context is functional by scanning page 2
         // (which is the sys_tables heap page in a freshly bootstrapped database).
-        let catalog_snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
         let table_info = db
             .catalog()
-            .get_table(&catalog_snapshot, "sys_tables")
+            .get_table(&snapshot, "sys_tables")
             .await
             .unwrap()
             .unwrap();
 
+        let ctx =
+            ExecContextImpl::new(Arc::clone(db.pool()), Arc::clone(db.tx_manager()), snapshot);
+
         let tuples = ctx
-            .scan_heap_page(table_info.first_page, &schema)
+            .scan_heap_page(table_info.first_page, &TableInfo::SCHEMA)
             .await
             .unwrap();
 

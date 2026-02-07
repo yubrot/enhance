@@ -230,9 +230,40 @@ impl ValuesScan {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use crate::executor::context::MockContext;
     use crate::sql::BinaryOperator;
+
+    /// Mock execution context for unit testing executor nodes without real storage.
+    #[derive(Clone)]
+    struct MockContext {
+        /// Pages indexed by page number. Each page is a Vec of tuples.
+        pages: Arc<Vec<Vec<Tuple>>>,
+    }
+
+    impl MockContext {
+        /// Creates a mock context with a single page of tuples.
+        fn single_page(tuples: Vec<Tuple>) -> Self {
+            Self {
+                pages: Arc::new(vec![tuples]),
+            }
+        }
+    }
+
+    impl ExecContext for MockContext {
+        async fn scan_heap_page(
+            &self,
+            page_id: PageId,
+            _schema: &[Type],
+        ) -> Result<Vec<Tuple>, ExecutorError> {
+            Ok(self
+                .pages
+                .get(page_id.page_num() as usize)
+                .cloned()
+                .unwrap_or_default())
+        }
+    }
 
     fn int_col(name: &str) -> ColumnDesc {
         ColumnDesc {
