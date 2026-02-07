@@ -16,6 +16,7 @@ use super::ColumnDesc;
 use super::context::ExecContext;
 use super::error::ExecutorError;
 use super::expr::BoundExpr;
+use super::plan::Plan;
 
 /// A query executor node.
 ///
@@ -35,6 +36,41 @@ pub enum ExecutorNode<C: ExecContext> {
 }
 
 impl<C: ExecContext> ExecutorNode<C> {
+    /// Materializes a logical [`Plan`] into a physical `ExecutorNode` tree.
+    ///
+    /// This is a synchronous function — no I/O happens here. All storage access
+    /// is deferred to [`ExecutorNode::next()`] via the [`ExecContext`].
+    pub fn build(plan: Plan, ctx: &C) -> Self {
+        match plan {
+            Plan::SeqScan {
+                table_name,
+                first_page,
+                schema,
+                columns,
+                ..
+            } => ExecutorNode::SeqScan(SeqScan::new(
+                table_name,
+                columns,
+                ctx.clone(),
+                schema,
+                first_page,
+            )),
+            Plan::Filter { input, predicate } => {
+                let child = Self::build(*input, ctx);
+                ExecutorNode::Filter(Filter::new(child, predicate))
+            }
+            Plan::Projection {
+                input,
+                exprs,
+                columns,
+            } => {
+                let child = Self::build(*input, ctx);
+                ExecutorNode::Projection(Projection::new(child, exprs, columns))
+            }
+            Plan::ValuesScan => ExecutorNode::ValuesScan(ValuesScan::new()),
+        }
+    }
+
     /// Returns the next tuple, or `None` if exhausted.
     ///
     /// This method follows the Volcano iterator model naming convention,
@@ -407,6 +443,132 @@ mod tests {
         let tuple = node.next().await.unwrap().unwrap();
         assert!(tuple.record.values.is_empty());
         assert!(tuple.tid.is_none());
+        assert!(node.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_seq_scan() {
+        let plan = Plan::SeqScan {
+            table_name: "test".to_string(),
+            table_id: 1,
+            first_page: PageId::new(0),
+            schema: vec![Type::Int8],
+            columns: vec![int_col("id")],
+        };
+
+        let tuples = make_tuples(vec![vec![Value::Int64(10)], vec![Value::Int64(20)]]);
+        let ctx = MockContext::single_page(tuples);
+        let mut node = ExecutorNode::build(plan, &ctx);
+
+        assert_eq!(
+            node.next().await.unwrap().unwrap().record.values,
+            vec![Value::Int64(10)]
+        );
+        assert_eq!(
+            node.next().await.unwrap().unwrap().record.values,
+            vec![Value::Int64(20)]
+        );
+        assert!(node.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_filter() {
+        let plan = Plan::Filter {
+            input: Box::new(Plan::SeqScan {
+                table_name: "test".to_string(),
+                table_id: 1,
+                first_page: PageId::new(0),
+                schema: vec![Type::Int8],
+                columns: vec![int_col("id")],
+            }),
+            predicate: BoundExpr::BinaryOp {
+                left: Box::new(BoundExpr::Column {
+                    index: 0,
+                    name: None,
+                }),
+                op: BinaryOperator::Gt,
+                right: Box::new(BoundExpr::Integer(2)),
+            },
+        };
+
+        let tuples = make_tuples(vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+        ]);
+        let ctx = MockContext::single_page(tuples);
+        let mut node = ExecutorNode::build(plan, &ctx);
+
+        assert_eq!(
+            node.next().await.unwrap().unwrap().record.values,
+            vec![Value::Int64(3)]
+        );
+        assert!(node.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_projection() {
+        let plan = Plan::Projection {
+            input: Box::new(Plan::SeqScan {
+                table_name: "test".to_string(),
+                table_id: 1,
+                first_page: PageId::new(0),
+                schema: vec![Type::Int8, Type::Text],
+                columns: vec![
+                    int_col("id"),
+                    ColumnDesc {
+                        name: "name".to_string(),
+                        table_name: None,
+                        table_oid: 0,
+                        column_id: 0,
+                        data_type: Type::Text,
+                    },
+                ],
+            }),
+            exprs: vec![BoundExpr::Column {
+                index: 1,
+                name: Some("name".into()),
+            }],
+            columns: vec![ColumnDesc {
+                name: "name".to_string(),
+                table_name: None,
+                table_oid: 0,
+                column_id: 0,
+                data_type: Type::Text,
+            }],
+        };
+
+        let tuples = make_tuples(vec![
+            vec![Value::Int64(1), Value::Text("alice".into())],
+            vec![Value::Int64(2), Value::Text("bob".into())],
+        ]);
+        let ctx = MockContext::single_page(tuples);
+        let mut node = ExecutorNode::build(plan, &ctx);
+
+        assert_eq!(
+            node.next().await.unwrap().unwrap().record.values,
+            vec![Value::Text("alice".into())]
+        );
+        assert_eq!(
+            node.next().await.unwrap().unwrap().record.values,
+            vec![Value::Text("bob".into())]
+        );
+        assert!(node.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_values_scan() {
+        let plan = Plan::Projection {
+            input: Box::new(Plan::ValuesScan),
+            exprs: vec![BoundExpr::Integer(42)],
+            columns: vec![int_col("?column?")],
+        };
+
+        let ctx = MockContext::single_page(vec![]);
+        let mut node = ExecutorNode::build(plan, &ctx);
+
+        let tuple = node.next().await.unwrap().unwrap();
+        assert_eq!(tuple.record.values, vec![Value::Int64(42)]);
         assert!(node.next().await.unwrap().is_none());
     }
 }

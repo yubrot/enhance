@@ -193,7 +193,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                         Arc::clone(db.tx_manager()),
                         snapshot,
                     );
-                    let mut node = executor::build_executor(plan, &ctx);
+                    let mut node = executor::ExecutorNode::build(plan, &ctx);
                     let mut rows = Vec::new();
                     while let Some(tuple) = node.next().await? {
                         rows.push(tuple.record);

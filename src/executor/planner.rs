@@ -2,8 +2,6 @@
 //!
 //! Transforms a parsed [`SelectStmt`] AST into a logical [`Plan`] tree
 //! by resolving table references via the catalog and binding column names.
-//! The plan is then materialized into an [`ExecutorNode`] tree by
-//! [`build_executor`].
 
 use crate::catalog::ColumnInfo;
 use crate::datum::Type;
@@ -13,10 +11,8 @@ use crate::storage::{Replacer, Storage};
 use crate::tx::Snapshot;
 
 use super::ColumnDesc;
-use super::context::ExecContext;
 use super::error::ExecutorError;
 use super::expr::BoundExpr;
-use super::node::{ExecutorNode, Filter, Projection, SeqScan, ValuesScan};
 use super::plan::Plan;
 
 /// Plans a SELECT statement into a logical [`Plan`] tree.
@@ -83,41 +79,6 @@ pub async fn plan_select<S: Storage, R: Replacer>(
     plan = build_projection_plan(plan, &select.columns)?;
 
     Ok(plan)
-}
-
-/// Materializes a logical [`Plan`] into a physical [`ExecutorNode`] tree.
-///
-/// This is a synchronous function — no I/O happens here. All storage access
-/// is deferred to [`ExecutorNode::next()`] via the [`ExecContext`].
-pub fn build_executor<C: ExecContext>(plan: Plan, ctx: &C) -> ExecutorNode<C> {
-    match plan {
-        Plan::SeqScan {
-            table_name,
-            first_page,
-            schema,
-            columns,
-            ..
-        } => ExecutorNode::SeqScan(SeqScan::new(
-            table_name,
-            columns,
-            ctx.clone(),
-            schema,
-            first_page,
-        )),
-        Plan::Filter { input, predicate } => {
-            let child = build_executor(*input, ctx);
-            ExecutorNode::Filter(Filter::new(child, predicate))
-        }
-        Plan::Projection {
-            input,
-            exprs,
-            columns,
-        } => {
-            let child = build_executor(*input, ctx);
-            ExecutorNode::Projection(Projection::new(child, exprs, columns))
-        }
-        Plan::ValuesScan => ExecutorNode::ValuesScan(ValuesScan::new()),
-    }
 }
 
 /// Builds a plan from a FROM clause.
@@ -346,7 +307,6 @@ mod tests {
     use std::sync::Arc;
 
     use crate::db::Database;
-    use crate::executor::ExecContextImpl;
     use crate::storage::MemoryStorage;
     use crate::tx::CommandId;
 
@@ -385,25 +345,11 @@ mod tests {
 
         let plan = plan_select(&select, &db, &snapshot).await.unwrap();
 
-        // Should have 3 columns (table_id, table_name, first_page)
+        // Projection over SeqScan with 3 columns
         assert_eq!(plan.columns().len(), 3);
         assert_eq!(plan.columns()[0].name, "table_id");
         assert_eq!(plan.columns()[1].name, "table_name");
         assert_eq!(plan.columns()[2].name, "first_page");
-
-        // Materialize and verify rows
-        let ctx =
-            ExecContextImpl::new(Arc::clone(db.pool()), Arc::clone(db.tx_manager()), snapshot);
-        let mut node = build_executor(plan, &ctx);
-        let mut count = 0;
-        while node.next().await.unwrap().is_some() {
-            count += 1;
-        }
-        assert!(
-            count >= 3,
-            "expected at least 3 catalog tables, got {}",
-            count
-        );
     }
 
     #[tokio::test]
@@ -427,14 +373,10 @@ mod tests {
         };
 
         let plan = plan_select(&select, &db, &snapshot).await.unwrap();
-        let ctx =
-            ExecContextImpl::new(Arc::clone(db.pool()), Arc::clone(db.tx_manager()), snapshot);
-        let mut node = build_executor(plan, &ctx);
 
-        let tuple = node.next().await.unwrap().unwrap();
-        assert_eq!(tuple.record.values.len(), 1);
-        assert_eq!(tuple.record.values[0], crate::datum::Value::Int64(42));
-        assert!(node.next().await.unwrap().is_none());
+        // Projection over ValuesScan with 1 expression column
+        assert_eq!(plan.columns().len(), 1);
+        assert_eq!(plan.columns()[0].name, "?column?");
     }
 
     #[tokio::test]
@@ -500,16 +442,9 @@ mod tests {
         };
 
         let plan = plan_select(&select, &db, &snapshot).await.unwrap();
-        let ctx =
-            ExecContextImpl::new(Arc::clone(db.pool()), Arc::clone(db.tx_manager()), snapshot);
-        let mut node = build_executor(plan, &ctx);
 
-        let tuple = node.next().await.unwrap().unwrap();
-        assert_eq!(tuple.record.values.len(), 1);
-        assert_eq!(
-            tuple.record.values[0],
-            crate::datum::Value::Text("sys_tables".to_string())
-        );
-        assert!(node.next().await.unwrap().is_none());
+        // Projection over Filter over SeqScan, output has 1 column
+        assert_eq!(plan.columns().len(), 1);
+        assert_eq!(plan.columns()[0].name, "table_name");
     }
 }

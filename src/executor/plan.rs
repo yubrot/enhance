@@ -2,7 +2,7 @@
 //!
 //! A [`Plan`] describes *what* to execute without loading any data.
 //! It is produced by the planner and then materialized into an
-//! [`ExecutorNode`](super::node::ExecutorNode) by [`build_executor`](super::planner::build_executor).
+//! [`ExecutorNode`](super::node::ExecutorNode) by [`ExecutorNode::build`](super::node::ExecutorNode::build).
 
 use crate::datum::Type;
 use crate::storage::PageId;

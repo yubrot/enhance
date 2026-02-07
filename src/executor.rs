@@ -15,7 +15,7 @@
 //!     └── Filter
 //!           └── SeqScan
 //!       |
-//! [build_executor] -- materializes Plan into ExecutorNode
+//! [ExecutorNode::build] -- materializes Plan into ExecutorNode
 //!       |
 //! ExecutorNode tree (with data):
 //!   Projection
@@ -26,7 +26,7 @@
 //! # Components
 //!
 //! - [`planner::plan_select`]: Transforms a SELECT AST into a logical Plan
-//! - [`planner::build_executor`]: Materializes a Plan into an ExecutorNode tree
+//! - [`ExecutorNode::build`]: Materializes a Plan into an ExecutorNode tree
 //! - [`Plan`]: Logical query plan (no data)
 //! - [`ExecutorNode`]: Physical executor nodes with async `next()` (Volcano model)
 //! - [`Plan::explain`]: EXPLAIN output from logical Plan
@@ -48,7 +48,7 @@ pub use error::ExecutorError;
 pub use expr::BoundExpr;
 pub use node::ExecutorNode;
 pub use plan::Plan;
-pub use planner::{build_executor, plan_select};
+pub use planner::plan_select;
 
 /// Metadata describing a result column.
 #[derive(Debug, Clone)]
