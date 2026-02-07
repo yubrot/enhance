@@ -118,8 +118,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let ctx =
-            ExecContextImpl::new(Arc::clone(db.pool()), Arc::clone(db.tx_manager()), snapshot);
+        let ctx = db.exec_context(snapshot);
 
         let tuples = ctx
             .scan_heap_page(table_info.first_page, &TableInfo::SCHEMA)
