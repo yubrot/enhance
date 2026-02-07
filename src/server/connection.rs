@@ -11,10 +11,11 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::{Database, QueryResult, Session};
+use crate::datum::Value;
 use crate::protocol::{
-    BackendMessage, BindMessage, CloseMessage, CloseTarget, DescribeMessage, DescribeTarget,
-    ErrorInfo, ExecuteMessage, FrontendMessage, ParseMessage, PostgresCodec, TransactionStatus,
-    sql_state,
+    BackendMessage, BindMessage, CloseMessage, CloseTarget, DataValue, DescribeMessage,
+    DescribeTarget, ErrorInfo, ExecuteMessage, FieldDescription, FormatCode, FrontendMessage,
+    ParseMessage, PostgresCodec, TransactionStatus, sql_state,
 };
 use crate::sql::Parser;
 use crate::storage::{Replacer, Storage};
@@ -131,20 +132,34 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
                 self.framed.send(BackendMessage::EmptyQueryResponse).await?;
             }
             Ok(Some(QueryResult::Command { tag })) => {
-                // For SELECT, send RowDescription before CommandComplete
-                // NOTE: Real row data will be sent in Step 10 (Basic Executor)
-                if tag.starts_with("SELECT") {
-                    self.framed
-                        .send(BackendMessage::RowDescription { fields: vec![] })
-                        .await?;
-                }
                 self.framed
                     .send(BackendMessage::CommandComplete { tag })
+                    .await?;
+            }
+            Ok(Some(QueryResult::Rows { columns, rows })) => {
+                self.send_rows(&columns, &rows).await?;
+                self.framed
+                    .send(BackendMessage::CommandComplete {
+                        tag: format!("SELECT {}", rows.len()),
+                    })
                     .await?;
             }
             Err(crate::db::DatabaseError::Parse(err)) => {
                 let error = ErrorInfo::new(sql_state::SYNTAX_ERROR, &err.message)
                     .with_position(err.position());
+                self.framed.send(error.into()).await?;
+            }
+            Err(crate::db::DatabaseError::Executor(ref exec_err)) => {
+                let sql_code = match exec_err {
+                    crate::executor::ExecutorError::TableNotFound { .. } => {
+                        sql_state::UNDEFINED_TABLE
+                    }
+                    crate::executor::ExecutorError::ColumnNotFound { .. } => {
+                        sql_state::UNDEFINED_COLUMN
+                    }
+                    _ => sql_state::INTERNAL_ERROR,
+                };
+                let error = ErrorInfo::new(sql_code, exec_err.to_string());
                 self.framed.send(error.into()).await?;
             }
             Err(e) => {
@@ -302,6 +317,14 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
                     .send(BackendMessage::CommandComplete { tag })
                     .await?;
             }
+            Ok(QueryResult::Rows { columns, rows }) => {
+                self.send_rows(&columns, &rows).await?;
+                self.framed
+                    .send(BackendMessage::CommandComplete {
+                        tag: format!("SELECT {}", rows.len()),
+                    })
+                    .await?;
+            }
             Err(e) => {
                 let error = ErrorInfo::new(sql_state::INTERNAL_ERROR, e.to_string());
                 return self.send_error(error, true).await;
@@ -352,6 +375,51 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
     ) -> Result<(), ConnectionError> {
         self.framed.send(error.into()).await?;
         self.state.in_error = into_error_state;
+        Ok(())
+    }
+
+    /// Sends RowDescription and DataRow messages for a result set.
+    async fn send_rows(
+        &mut self,
+        columns: &[crate::db::ColumnDesc],
+        rows: &[crate::db::Row],
+    ) -> Result<(), ConnectionError> {
+        // Send RowDescription
+        let fields: Vec<FieldDescription> = columns
+            .iter()
+            .map(|col| {
+                let type_size = col
+                    .data_type
+                    .fixed_size()
+                    .map(|s| s as i16)
+                    .unwrap_or(-1);
+                FieldDescription {
+                    name: col.name.clone(),
+                    table_oid: col.table_oid,
+                    column_id: col.column_id,
+                    type_oid: col.data_type.oid(),
+                    type_size,
+                    type_modifier: -1,
+                    format_code: FormatCode::Text,
+                }
+            })
+            .collect();
+        self.framed
+            .send(BackendMessage::RowDescription { fields })
+            .await?;
+
+        // Send DataRow for each row
+        for row in rows {
+            let values: Vec<DataValue> = row
+                .iter()
+                .map(|v| match v {
+                    Value::Null => DataValue::Null,
+                    _ => DataValue::Binary(v.to_text().into_bytes()),
+                })
+                .collect();
+            self.framed.send(BackendMessage::DataRow { values }).await?;
+        }
+
         Ok(())
     }
 

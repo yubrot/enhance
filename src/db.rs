@@ -48,3 +48,6 @@ mod session;
 pub use database::Database;
 pub use error::DatabaseError;
 pub use session::{QueryResult, Session, TransactionState};
+
+// Re-export executor types used in QueryResult
+pub use crate::executor::{ColumnDesc, Row};

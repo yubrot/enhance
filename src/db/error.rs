@@ -1,6 +1,7 @@
 //! Database-level errors.
 
 use crate::catalog::CatalogError;
+use crate::executor::ExecutorError;
 use crate::sql::SyntaxError;
 use crate::storage::BufferPoolError;
 use crate::tx::TxError;
@@ -16,6 +17,8 @@ pub enum DatabaseError {
     BufferPool(BufferPoolError),
     /// Transaction error.
     Transaction(TxError),
+    /// Executor error.
+    Executor(ExecutorError),
 }
 
 impl std::fmt::Display for DatabaseError {
@@ -25,6 +28,7 @@ impl std::fmt::Display for DatabaseError {
             DatabaseError::Catalog(e) => write!(f, "catalog error: {}", e),
             DatabaseError::BufferPool(e) => write!(f, "buffer pool error: {}", e),
             DatabaseError::Transaction(e) => write!(f, "transaction error: {}", e),
+            DatabaseError::Executor(e) => write!(f, "{}", e),
         }
     }
 }
@@ -36,6 +40,7 @@ impl std::error::Error for DatabaseError {
             DatabaseError::Catalog(e) => Some(e),
             DatabaseError::BufferPool(e) => Some(e),
             DatabaseError::Transaction(e) => Some(e),
+            DatabaseError::Executor(e) => Some(e),
         }
     }
 }
@@ -61,5 +66,11 @@ impl From<SyntaxError> for DatabaseError {
 impl From<TxError> for DatabaseError {
     fn from(e: TxError) -> Self {
         DatabaseError::Transaction(e)
+    }
+}
+
+impl From<ExecutorError> for DatabaseError {
+    fn from(e: ExecutorError) -> Self {
+        DatabaseError::Executor(e)
     }
 }

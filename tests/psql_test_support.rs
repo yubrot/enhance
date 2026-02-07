@@ -86,6 +86,32 @@ impl PsqlTestServer {
         }
     }
 
+    /// Runs psql with the given query using -c flag (handles quoting correctly).
+    ///
+    /// Use this instead of `run_psql` when the SQL contains single quotes.
+    pub fn run_psql_direct(&self, query: &str) -> PsqlOutput {
+        let output = Command::new("psql")
+            .args([
+                "-h", "127.0.0.1",
+                "-p", &self.port.to_string(),
+                "-U", "postgres",
+                "-c", query,
+            ])
+            .output()
+            .expect("Failed to execute psql");
+
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        PsqlOutput {
+            output: combined,
+            exit_code: output.status.code().unwrap_or(-1),
+        }
+    }
+
     /// Connects to the test server using a `TcpStream`.
     pub async fn connect(&self) -> tokio::net::TcpStream {
         tokio::net::TcpStream::connect(format!("127.0.0.1:{}", self.port))

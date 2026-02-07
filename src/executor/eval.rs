@@ -1,0 +1,1325 @@
+//! Expression evaluator for SQL expressions.
+//!
+//! Evaluates [`Expr`] AST nodes against a row of values, producing a single
+//! [`Value`] result. Supports arithmetic, comparison, logical, string, NULL,
+//! LIKE, CASE, and CAST operations.
+
+use crate::datum::Value;
+use crate::sql::{BinaryOperator, DataType, Expr, UnaryOperator};
+
+use super::error::ExecutorError;
+use super::types::{ColumnDesc, Row};
+
+/// Evaluates an expression against a row of values.
+///
+/// # Arguments
+///
+/// * `expr` - The expression to evaluate
+/// * `row` - The current row data
+/// * `columns` - Column descriptors for resolving column references
+///
+/// # Errors
+///
+/// Returns [`ExecutorError`] for type mismatches, division by zero,
+/// unresolvable column references, and unsupported operations.
+pub fn eval_expr(
+    expr: &Expr,
+    row: &Row,
+    columns: &[ColumnDesc],
+) -> Result<Value, ExecutorError> {
+    match expr {
+        Expr::Null => Ok(Value::Null),
+        Expr::Boolean(b) => Ok(Value::Boolean(*b)),
+        Expr::Integer(n) => Ok(Value::Int64(*n)),
+        Expr::Float(f) => Ok(Value::Float64(*f)),
+        Expr::String(s) => Ok(Value::Text(s.clone())),
+
+        Expr::ColumnRef { table, column } => resolve_column(table.as_deref(), column, row, columns),
+
+        Expr::BinaryOp { left, op, right } => {
+            let l = eval_expr(left, row, columns)?;
+            let r = eval_expr(right, row, columns)?;
+            eval_binary_op(&l, *op, &r)
+        }
+
+        Expr::UnaryOp { op, operand } => {
+            let v = eval_expr(operand, row, columns)?;
+            eval_unary_op(*op, &v)
+        }
+
+        Expr::IsNull { expr, negated } => {
+            let v = eval_expr(expr, row, columns)?;
+            let is_null = v.is_null();
+            Ok(Value::Boolean(if *negated { !is_null } else { is_null }))
+        }
+
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let v = eval_expr(expr, row, columns)?;
+            if v.is_null() {
+                return Ok(Value::Null);
+            }
+            let mut found = false;
+            let mut has_null = false;
+            for item in list {
+                let item_val = eval_expr(item, row, columns)?;
+                if item_val.is_null() {
+                    has_null = true;
+                    continue;
+                }
+                if compare_values(&v, &item_val)? == std::cmp::Ordering::Equal {
+                    found = true;
+                    break;
+                }
+            }
+            let result = if found {
+                Value::Boolean(!*negated)
+            } else if has_null {
+                Value::Null
+            } else {
+                Value::Boolean(*negated)
+            };
+            Ok(result)
+        }
+
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let v = eval_expr(expr, row, columns)?;
+            let lo = eval_expr(low, row, columns)?;
+            let hi = eval_expr(high, row, columns)?;
+            if v.is_null() || lo.is_null() || hi.is_null() {
+                return Ok(Value::Null);
+            }
+            let ge_low = compare_values(&v, &lo)? != std::cmp::Ordering::Less;
+            let le_high = compare_values(&v, &hi)? != std::cmp::Ordering::Greater;
+            let in_range = ge_low && le_high;
+            Ok(Value::Boolean(if *negated { !in_range } else { in_range }))
+        }
+
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            negated,
+            case_insensitive,
+        } => {
+            let v = eval_expr(expr, row, columns)?;
+            let p = eval_expr(pattern, row, columns)?;
+            if v.is_null() || p.is_null() {
+                return Ok(Value::Null);
+            }
+            let escape_char = match escape {
+                Some(e) => {
+                    let e_val = eval_expr(e, row, columns)?;
+                    match e_val {
+                        Value::Text(s) if s.len() == 1 => Some(s.chars().next().unwrap()),
+                        _ => {
+                            return Err(ExecutorError::Unsupported(
+                                "ESCAPE must be a single character".to_string(),
+                            ))
+                        }
+                    }
+                }
+                None => None,
+            };
+            let (s, pat) = match (&v, &p) {
+                (Value::Text(s), Value::Text(p)) => (s.as_str(), p.as_str()),
+                _ => {
+                    return Err(ExecutorError::TypeMismatch {
+                        expected: "text".to_string(),
+                        found: format!("{:?}", v),
+                    })
+                }
+            };
+            let matched = like_match(s, pat, escape_char, *case_insensitive);
+            Ok(Value::Boolean(if *negated { !matched } else { matched }))
+        }
+
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                // Simple CASE: CASE operand WHEN value THEN result ...
+                let op_val = eval_expr(op, row, columns)?;
+                for clause in when_clauses {
+                    let when_val = eval_expr(&clause.condition, row, columns)?;
+                    if !op_val.is_null()
+                        && !when_val.is_null()
+                        && compare_values(&op_val, &when_val)? == std::cmp::Ordering::Equal
+                    {
+                        return eval_expr(&clause.result, row, columns);
+                    }
+                }
+            } else {
+                // Searched CASE: CASE WHEN condition THEN result ...
+                for clause in when_clauses {
+                    let cond = eval_expr(&clause.condition, row, columns)?;
+                    if matches!(cond, Value::Boolean(true)) {
+                        return eval_expr(&clause.result, row, columns);
+                    }
+                }
+            }
+            match else_result {
+                Some(e) => eval_expr(e, row, columns),
+                None => Ok(Value::Null),
+            }
+        }
+
+        Expr::Cast { expr, data_type } => {
+            let v = eval_expr(expr, row, columns)?;
+            eval_cast(v, data_type)
+        }
+
+        Expr::Parameter(_) => Err(ExecutorError::Unsupported(
+            "parameter placeholders are not yet supported".to_string(),
+        )),
+
+        Expr::Function { .. } => Err(ExecutorError::Unsupported(
+            "function calls are not yet supported".to_string(),
+        )),
+
+        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::Subquery(_) => {
+            Err(ExecutorError::Unsupported(
+                "subqueries are not yet supported".to_string(),
+            ))
+        }
+    }
+}
+
+/// Formats an expression as a human-readable SQL-like string for EXPLAIN output.
+pub fn format_expr(expr: &Expr) -> String {
+    match expr {
+        Expr::Null => "NULL".to_string(),
+        Expr::Boolean(b) => b.to_string(),
+        Expr::Integer(n) => n.to_string(),
+        Expr::Float(f) => f.to_string(),
+        Expr::String(s) => format!("'{}'", s),
+        Expr::ColumnRef { table, column } => match table {
+            Some(t) => format!("{}.{}", t, column),
+            None => column.clone(),
+        },
+        Expr::Parameter(n) => format!("${}", n),
+        Expr::BinaryOp { left, op, right } => {
+            format!("({} {} {})", format_expr(left), op.as_str(), format_expr(right))
+        }
+        Expr::UnaryOp { op, operand } => match op {
+            UnaryOperator::Not => format!("(NOT {})", format_expr(operand)),
+            _ => format!("({}{})", op.as_str(), format_expr(operand)),
+        },
+        Expr::IsNull { expr, negated } => {
+            if *negated {
+                format!("({} IS NOT NULL)", format_expr(expr))
+            } else {
+                format!("({} IS NULL)", format_expr(expr))
+            }
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let items: Vec<String> = list.iter().map(format_expr).collect();
+            let neg = if *negated { " NOT" } else { "" };
+            format!("({}{} IN ({}))", format_expr(expr), neg, items.join(", "))
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let neg = if *negated { " NOT" } else { "" };
+            format!(
+                "({}{} BETWEEN {} AND {})",
+                format_expr(expr),
+                neg,
+                format_expr(low),
+                format_expr(high)
+            )
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+            case_insensitive,
+            ..
+        } => {
+            let op = if *case_insensitive { "ILIKE" } else { "LIKE" };
+            let neg = if *negated { " NOT" } else { "" };
+            format!(
+                "({}{} {} {})",
+                format_expr(expr),
+                neg,
+                op,
+                format_expr(pattern)
+            )
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_result,
+        } => {
+            let mut s = "CASE".to_string();
+            if let Some(op) = operand {
+                s.push_str(&format!(" {}", format_expr(op)));
+            }
+            for clause in when_clauses {
+                s.push_str(&format!(
+                    " WHEN {} THEN {}",
+                    format_expr(&clause.condition),
+                    format_expr(&clause.result)
+                ));
+            }
+            if let Some(e) = else_result {
+                s.push_str(&format!(" ELSE {}", format_expr(e)));
+            }
+            s.push_str(" END");
+            s
+        }
+        Expr::Cast { expr, data_type } => {
+            format!("CAST({} AS {})", format_expr(expr), data_type.display_name())
+        }
+        Expr::Function { name, args, .. } => {
+            let arg_strs: Vec<String> = args.iter().map(format_expr).collect();
+            format!("{}({})", name, arg_strs.join(", "))
+        }
+        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::Subquery(_) => {
+            "(subquery)".to_string()
+        }
+    }
+}
+
+/// Resolves a column reference to a value from the current row.
+fn resolve_column(
+    table: Option<&str>,
+    column: &str,
+    row: &Row,
+    columns: &[ColumnDesc],
+) -> Result<Value, ExecutorError> {
+    let mut matched_idx = None;
+    for (i, desc) in columns.iter().enumerate() {
+        let name_matches = desc.name.eq_ignore_ascii_case(column);
+        let table_matches = match table {
+            Some(_t) => {
+                // For now, we match by checking if the column name matches.
+                // Table qualification is validated at planning time, but we still
+                // need to handle it here for correctness.
+                name_matches
+            }
+            None => name_matches,
+        };
+        if table_matches {
+            if matched_idx.is_some() && table.is_none() {
+                return Err(ExecutorError::AmbiguousColumn {
+                    name: column.to_string(),
+                });
+            }
+            matched_idx = Some(i);
+            if table.is_some() {
+                break;
+            }
+        }
+    }
+    match matched_idx {
+        Some(i) => Ok(row[i].clone()),
+        None => Err(ExecutorError::ColumnNotFound {
+            name: column.to_string(),
+        }),
+    }
+}
+
+/// Evaluates a binary operation.
+fn eval_binary_op(
+    left: &Value,
+    op: BinaryOperator,
+    right: &Value,
+) -> Result<Value, ExecutorError> {
+    // Logical operators with 3-value NULL logic
+    match op {
+        BinaryOperator::And => return eval_and(left, right),
+        BinaryOperator::Or => return eval_or(left, right),
+        _ => {}
+    }
+
+    // String concatenation
+    if op == BinaryOperator::Concat {
+        return eval_concat(left, right);
+    }
+
+    // NULL propagation for all other operators
+    if left.is_null() || right.is_null() {
+        return Ok(Value::Null);
+    }
+
+    // Comparison operators
+    match op {
+        BinaryOperator::Eq => {
+            return Ok(Value::Boolean(
+                compare_values(left, right)? == std::cmp::Ordering::Equal,
+            ));
+        }
+        BinaryOperator::Neq => {
+            return Ok(Value::Boolean(
+                compare_values(left, right)? != std::cmp::Ordering::Equal,
+            ));
+        }
+        BinaryOperator::Lt => {
+            return Ok(Value::Boolean(
+                compare_values(left, right)? == std::cmp::Ordering::Less,
+            ));
+        }
+        BinaryOperator::LtEq => {
+            return Ok(Value::Boolean(
+                compare_values(left, right)? != std::cmp::Ordering::Greater,
+            ));
+        }
+        BinaryOperator::Gt => {
+            return Ok(Value::Boolean(
+                compare_values(left, right)? == std::cmp::Ordering::Greater,
+            ));
+        }
+        BinaryOperator::GtEq => {
+            return Ok(Value::Boolean(
+                compare_values(left, right)? != std::cmp::Ordering::Less,
+            ));
+        }
+        _ => {}
+    }
+
+    // Arithmetic operators
+    eval_arithmetic(left, op, right)
+}
+
+/// Evaluates AND with 3-value NULL logic.
+fn eval_and(left: &Value, right: &Value) -> Result<Value, ExecutorError> {
+    let l = value_to_bool_nullable(left)?;
+    let r = value_to_bool_nullable(right)?;
+    match (l, r) {
+        (Some(false), _) | (_, Some(false)) => Ok(Value::Boolean(false)),
+        (Some(true), Some(true)) => Ok(Value::Boolean(true)),
+        _ => Ok(Value::Null),
+    }
+}
+
+/// Evaluates OR with 3-value NULL logic.
+fn eval_or(left: &Value, right: &Value) -> Result<Value, ExecutorError> {
+    let l = value_to_bool_nullable(left)?;
+    let r = value_to_bool_nullable(right)?;
+    match (l, r) {
+        (Some(true), _) | (_, Some(true)) => Ok(Value::Boolean(true)),
+        (Some(false), Some(false)) => Ok(Value::Boolean(false)),
+        _ => Ok(Value::Null),
+    }
+}
+
+/// Converts a Value to an optional boolean (None for NULL).
+fn value_to_bool_nullable(v: &Value) -> Result<Option<bool>, ExecutorError> {
+    match v {
+        Value::Null => Ok(None),
+        Value::Boolean(b) => Ok(Some(*b)),
+        _ => Err(ExecutorError::TypeMismatch {
+            expected: "boolean".to_string(),
+            found: value_type_name(v),
+        }),
+    }
+}
+
+/// Evaluates string concatenation (||).
+fn eval_concat(left: &Value, right: &Value) -> Result<Value, ExecutorError> {
+    if left.is_null() || right.is_null() {
+        return Ok(Value::Null);
+    }
+    let l = left.to_text();
+    let r = right.to_text();
+    Ok(Value::Text(format!("{}{}", l, r)))
+}
+
+/// Evaluates arithmetic operators (+, -, *, /, %).
+fn eval_arithmetic(
+    left: &Value,
+    op: BinaryOperator,
+    right: &Value,
+) -> Result<Value, ExecutorError> {
+    // Promote to common numeric type
+    let (l, r) = promote_numeric(left, right)?;
+
+    match (&l, &r) {
+        (Value::Int64(a), Value::Int64(b)) => {
+            let result = match op {
+                BinaryOperator::Add => a.checked_add(*b).ok_or(ExecutorError::Unsupported(
+                    "integer overflow".to_string(),
+                ))?,
+                BinaryOperator::Sub => a.checked_sub(*b).ok_or(ExecutorError::Unsupported(
+                    "integer overflow".to_string(),
+                ))?,
+                BinaryOperator::Mul => a.checked_mul(*b).ok_or(ExecutorError::Unsupported(
+                    "integer overflow".to_string(),
+                ))?,
+                BinaryOperator::Div => {
+                    if *b == 0 {
+                        return Err(ExecutorError::DivisionByZero);
+                    }
+                    a / b
+                }
+                BinaryOperator::Mod => {
+                    if *b == 0 {
+                        return Err(ExecutorError::DivisionByZero);
+                    }
+                    a % b
+                }
+                _ => unreachable!(),
+            };
+            Ok(Value::Int64(result))
+        }
+        (Value::Float64(a), Value::Float64(b)) => {
+            let result = match op {
+                BinaryOperator::Add => a + b,
+                BinaryOperator::Sub => a - b,
+                BinaryOperator::Mul => a * b,
+                BinaryOperator::Div => {
+                    if *b == 0.0 {
+                        return Err(ExecutorError::DivisionByZero);
+                    }
+                    a / b
+                }
+                BinaryOperator::Mod => {
+                    if *b == 0.0 {
+                        return Err(ExecutorError::DivisionByZero);
+                    }
+                    a % b
+                }
+                _ => unreachable!(),
+            };
+            Ok(Value::Float64(result))
+        }
+        _ => Err(ExecutorError::TypeMismatch {
+            expected: "numeric".to_string(),
+            found: format!("{:?}", left),
+        }),
+    }
+}
+
+/// Promotes two numeric values to a common type for arithmetic.
+///
+/// - Int16/Int32 are promoted to Int64.
+/// - If either operand is Float, both are promoted to Float64.
+fn promote_numeric(left: &Value, right: &Value) -> Result<(Value, Value), ExecutorError> {
+    let l = promote_to_int64(left)?;
+    let r = promote_to_int64(right)?;
+
+    // If either is float, promote both to float
+    match (&l, &r) {
+        (Value::Float64(_), Value::Float64(_)) => Ok((l, r)),
+        (Value::Float64(_), Value::Int64(n)) => Ok((l, Value::Float64(*n as f64))),
+        (Value::Int64(n), Value::Float64(_)) => Ok((Value::Float64(*n as f64), r)),
+        (Value::Int64(_), Value::Int64(_)) => Ok((l, r)),
+        _ => Err(ExecutorError::TypeMismatch {
+            expected: "numeric".to_string(),
+            found: format!("{}, {}", value_type_name(left), value_type_name(right)),
+        }),
+    }
+}
+
+/// Promotes Int16/Int32 to Int64, passes Float32 to Float64.
+fn promote_to_int64(v: &Value) -> Result<Value, ExecutorError> {
+    match v {
+        Value::Int16(n) => Ok(Value::Int64(*n as i64)),
+        Value::Int32(n) => Ok(Value::Int64(*n as i64)),
+        Value::Int64(_) => Ok(v.clone()),
+        Value::Float32(n) => Ok(Value::Float64(*n as f64)),
+        Value::Float64(_) => Ok(v.clone()),
+        _ => Err(ExecutorError::TypeMismatch {
+            expected: "numeric".to_string(),
+            found: value_type_name(v),
+        }),
+    }
+}
+
+/// Compares two values, returning their ordering.
+///
+/// Values are promoted to a common type before comparison.
+/// Boolean ordering: false < true.
+fn compare_values(
+    left: &Value,
+    right: &Value,
+) -> Result<std::cmp::Ordering, ExecutorError> {
+    match (left, right) {
+        (Value::Boolean(a), Value::Boolean(b)) => Ok(a.cmp(b)),
+        (Value::Text(a), Value::Text(b)) => Ok(a.cmp(b)),
+        (Value::Bytea(a), Value::Bytea(b)) => Ok(a.cmp(b)),
+        _ => {
+            // Try numeric comparison
+            let l = promote_to_int64(left)?;
+            let r = promote_to_int64(right)?;
+            match (&l, &r) {
+                (Value::Int64(a), Value::Int64(b)) => Ok(a.cmp(b)),
+                (Value::Float64(a), Value::Float64(b)) => {
+                    Ok(a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                }
+                (Value::Float64(a), Value::Int64(b)) => {
+                    let b_f = *b as f64;
+                    Ok(a.partial_cmp(&b_f).unwrap_or(std::cmp::Ordering::Equal))
+                }
+                (Value::Int64(a), Value::Float64(b)) => {
+                    let a_f = *a as f64;
+                    Ok(a_f.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                }
+                _ => Err(ExecutorError::TypeMismatch {
+                    expected: "comparable types".to_string(),
+                    found: format!("{}, {}", value_type_name(left), value_type_name(right)),
+                }),
+            }
+        }
+    }
+}
+
+/// Evaluates a unary operation.
+fn eval_unary_op(op: UnaryOperator, val: &Value) -> Result<Value, ExecutorError> {
+    if val.is_null() {
+        return Ok(Value::Null);
+    }
+    match op {
+        UnaryOperator::Not => match val {
+            Value::Boolean(b) => Ok(Value::Boolean(!b)),
+            _ => Err(ExecutorError::TypeMismatch {
+                expected: "boolean".to_string(),
+                found: value_type_name(val),
+            }),
+        },
+        UnaryOperator::Minus => match val {
+            Value::Int16(n) => Ok(Value::Int64(-(*n as i64))),
+            Value::Int32(n) => Ok(Value::Int64(-(*n as i64))),
+            Value::Int64(n) => Ok(Value::Int64(-n)),
+            Value::Float32(n) => Ok(Value::Float64(-(*n as f64))),
+            Value::Float64(n) => Ok(Value::Float64(-n)),
+            _ => Err(ExecutorError::TypeMismatch {
+                expected: "numeric".to_string(),
+                found: value_type_name(val),
+            }),
+        },
+        UnaryOperator::Plus => match val {
+            Value::Int16(_) | Value::Int32(_) | Value::Int64(_)
+            | Value::Float32(_) | Value::Float64(_) => Ok(val.clone()),
+            _ => Err(ExecutorError::TypeMismatch {
+                expected: "numeric".to_string(),
+                found: value_type_name(val),
+            }),
+        },
+    }
+}
+
+/// Evaluates a type cast (CAST(expr AS type)).
+fn eval_cast(v: Value, target: &DataType) -> Result<Value, ExecutorError> {
+    if v.is_null() {
+        return Ok(Value::Null);
+    }
+    match target {
+        DataType::Boolean => match &v {
+            Value::Boolean(_) => Ok(v),
+            Value::Text(s) => match s.to_lowercase().as_str() {
+                "true" | "t" | "yes" | "y" | "1" | "on" => Ok(Value::Boolean(true)),
+                "false" | "f" | "no" | "n" | "0" | "off" => Ok(Value::Boolean(false)),
+                _ => Err(ExecutorError::InvalidCast {
+                    from: format!("'{}'", s),
+                    to: "boolean".to_string(),
+                }),
+            },
+            Value::Int16(n) => Ok(Value::Boolean(*n != 0)),
+            Value::Int32(n) => Ok(Value::Boolean(*n != 0)),
+            Value::Int64(n) => Ok(Value::Boolean(*n != 0)),
+            _ => Err(ExecutorError::InvalidCast {
+                from: value_type_name(&v),
+                to: "boolean".to_string(),
+            }),
+        },
+        DataType::Smallint => match &v {
+            Value::Int16(_) => Ok(v),
+            Value::Int32(n) => Ok(Value::Int16(*n as i16)),
+            Value::Int64(n) => Ok(Value::Int16(*n as i16)),
+            Value::Float32(n) => Ok(Value::Int16(*n as i16)),
+            Value::Float64(n) => Ok(Value::Int16(*n as i16)),
+            Value::Text(s) => s
+                .trim()
+                .parse::<i16>()
+                .map(Value::Int16)
+                .map_err(|_| ExecutorError::InvalidCast {
+                    from: format!("'{}'", s),
+                    to: "smallint".to_string(),
+                }),
+            Value::Boolean(b) => Ok(Value::Int16(if *b { 1 } else { 0 })),
+            _ => Err(ExecutorError::InvalidCast {
+                from: value_type_name(&v),
+                to: "smallint".to_string(),
+            }),
+        },
+        DataType::Integer | DataType::Serial => match &v {
+            Value::Int32(_) => Ok(v),
+            Value::Int16(n) => Ok(Value::Int32(*n as i32)),
+            Value::Int64(n) => Ok(Value::Int32(*n as i32)),
+            Value::Float32(n) => Ok(Value::Int32(*n as i32)),
+            Value::Float64(n) => Ok(Value::Int32(*n as i32)),
+            Value::Text(s) => s
+                .trim()
+                .parse::<i32>()
+                .map(Value::Int32)
+                .map_err(|_| ExecutorError::InvalidCast {
+                    from: format!("'{}'", s),
+                    to: "integer".to_string(),
+                }),
+            Value::Boolean(b) => Ok(Value::Int32(if *b { 1 } else { 0 })),
+            _ => Err(ExecutorError::InvalidCast {
+                from: value_type_name(&v),
+                to: "integer".to_string(),
+            }),
+        },
+        DataType::Bigint => match &v {
+            Value::Int64(_) => Ok(v),
+            Value::Int16(n) => Ok(Value::Int64(*n as i64)),
+            Value::Int32(n) => Ok(Value::Int64(*n as i64)),
+            Value::Float32(n) => Ok(Value::Int64(*n as i64)),
+            Value::Float64(n) => Ok(Value::Int64(*n as i64)),
+            Value::Text(s) => s
+                .trim()
+                .parse::<i64>()
+                .map(Value::Int64)
+                .map_err(|_| ExecutorError::InvalidCast {
+                    from: format!("'{}'", s),
+                    to: "bigint".to_string(),
+                }),
+            Value::Boolean(b) => Ok(Value::Int64(if *b { 1 } else { 0 })),
+            _ => Err(ExecutorError::InvalidCast {
+                from: value_type_name(&v),
+                to: "bigint".to_string(),
+            }),
+        },
+        DataType::Real => match &v {
+            Value::Float32(_) => Ok(v),
+            Value::Float64(n) => Ok(Value::Float32(*n as f32)),
+            Value::Int16(n) => Ok(Value::Float32(*n as f32)),
+            Value::Int32(n) => Ok(Value::Float32(*n as f32)),
+            Value::Int64(n) => Ok(Value::Float32(*n as f32)),
+            Value::Text(s) => s
+                .trim()
+                .parse::<f32>()
+                .map(Value::Float32)
+                .map_err(|_| ExecutorError::InvalidCast {
+                    from: format!("'{}'", s),
+                    to: "real".to_string(),
+                }),
+            _ => Err(ExecutorError::InvalidCast {
+                from: value_type_name(&v),
+                to: "real".to_string(),
+            }),
+        },
+        DataType::DoublePrecision => match &v {
+            Value::Float64(_) => Ok(v),
+            Value::Float32(n) => Ok(Value::Float64(*n as f64)),
+            Value::Int16(n) => Ok(Value::Float64(*n as f64)),
+            Value::Int32(n) => Ok(Value::Float64(*n as f64)),
+            Value::Int64(n) => Ok(Value::Float64(*n as f64)),
+            Value::Text(s) => s
+                .trim()
+                .parse::<f64>()
+                .map(Value::Float64)
+                .map_err(|_| ExecutorError::InvalidCast {
+                    from: format!("'{}'", s),
+                    to: "double precision".to_string(),
+                }),
+            _ => Err(ExecutorError::InvalidCast {
+                from: value_type_name(&v),
+                to: "double precision".to_string(),
+            }),
+        },
+        DataType::Text | DataType::Varchar(_) => Ok(Value::Text(v.to_text())),
+        DataType::Bytea => match &v {
+            Value::Bytea(_) => Ok(v),
+            Value::Text(s) => Ok(Value::Bytea(s.as_bytes().to_vec())),
+            _ => Err(ExecutorError::InvalidCast {
+                from: value_type_name(&v),
+                to: "bytea".to_string(),
+            }),
+        },
+    }
+}
+
+/// Returns a human-readable type name for a value.
+fn value_type_name(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Boolean(_) => "boolean".to_string(),
+        Value::Int16(_) => "smallint".to_string(),
+        Value::Int32(_) => "integer".to_string(),
+        Value::Int64(_) => "bigint".to_string(),
+        Value::Float32(_) => "real".to_string(),
+        Value::Float64(_) => "double precision".to_string(),
+        Value::Text(_) => "text".to_string(),
+        Value::Bytea(_) => "bytea".to_string(),
+    }
+}
+
+/// LIKE pattern matching with support for % and _ wildcards.
+fn like_match(s: &str, pattern: &str, escape: Option<char>, case_insensitive: bool) -> bool {
+    let s_chars: Vec<char> = if case_insensitive {
+        s.to_lowercase().chars().collect()
+    } else {
+        s.chars().collect()
+    };
+    let p_chars: Vec<char> = if case_insensitive {
+        pattern.to_lowercase().chars().collect()
+    } else {
+        pattern.chars().collect()
+    };
+    like_match_recursive(&s_chars, &p_chars, escape)
+}
+
+/// Recursive LIKE matching implementation.
+fn like_match_recursive(s: &[char], p: &[char], escape: Option<char>) -> bool {
+    if p.is_empty() {
+        return s.is_empty();
+    }
+
+    // Check for escape character
+    if let Some(esc) = escape
+        && p[0] == esc
+        && p.len() > 1
+    {
+        // Next character is literal
+        if s.is_empty() || s[0] != p[1] {
+            return false;
+        }
+        return like_match_recursive(&s[1..], &p[2..], escape);
+    }
+
+    match p[0] {
+        '%' => {
+            // % matches zero or more characters
+            // Try matching rest of pattern starting from each position
+            for i in 0..=s.len() {
+                if like_match_recursive(&s[i..], &p[1..], escape) {
+                    return true;
+                }
+            }
+            false
+        }
+        '_' => {
+            // _ matches exactly one character
+            if s.is_empty() {
+                return false;
+            }
+            like_match_recursive(&s[1..], &p[1..], escape)
+        }
+        c => {
+            if s.is_empty() || s[0] != c {
+                return false;
+            }
+            like_match_recursive(&s[1..], &p[1..], escape)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::datum::Type;
+
+    // Helper to create an empty context (no columns, no row)
+    fn empty_ctx() -> (Row, Vec<ColumnDesc>) {
+        (vec![], vec![])
+    }
+
+    // Helper to create a row with columns
+    fn make_ctx(cols: &[(&str, Value)]) -> (Row, Vec<ColumnDesc>) {
+        let row: Vec<Value> = cols.iter().map(|(_, v)| v.clone()).collect();
+        let descs: Vec<ColumnDesc> = cols
+            .iter()
+            .map(|(name, v)| ColumnDesc {
+                name: name.to_string(),
+                table_oid: 0,
+                column_id: 0,
+                data_type: v.data_type().unwrap_or(Type::Text),
+            })
+            .collect();
+        (row, descs)
+    }
+
+    #[test]
+    fn test_eval_literals() {
+        let (row, cols) = empty_ctx();
+        assert_eq!(eval_expr(&Expr::Null, &row, &cols).unwrap(), Value::Null);
+        assert_eq!(
+            eval_expr(&Expr::Boolean(true), &row, &cols).unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            eval_expr(&Expr::Integer(42), &row, &cols).unwrap(),
+            Value::Int64(42)
+        );
+        assert_eq!(
+            eval_expr(&Expr::Float(3.14), &row, &cols).unwrap(),
+            Value::Float64(3.14)
+        );
+        assert_eq!(
+            eval_expr(&Expr::String("hello".into()), &row, &cols).unwrap(),
+            Value::Text("hello".into())
+        );
+    }
+
+    #[test]
+    fn test_eval_column_ref() {
+        let (row, cols) = make_ctx(&[
+            ("id", Value::Int32(1)),
+            ("name", Value::Text("alice".into())),
+        ]);
+        let expr = Expr::ColumnRef {
+            table: None,
+            column: "name".to_string(),
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Text("alice".into())
+        );
+    }
+
+    #[test]
+    fn test_eval_column_ref_not_found() {
+        let (row, cols) = make_ctx(&[("id", Value::Int32(1))]);
+        let expr = Expr::ColumnRef {
+            table: None,
+            column: "missing".to_string(),
+        };
+        assert!(matches!(
+            eval_expr(&expr, &row, &cols),
+            Err(ExecutorError::ColumnNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn test_eval_arithmetic_int() {
+        let (row, cols) = empty_ctx();
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Integer(10)),
+            op: BinaryOperator::Add,
+            right: Box::new(Expr::Integer(3)),
+        };
+        assert_eq!(eval_expr(&expr, &row, &cols).unwrap(), Value::Int64(13));
+
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Integer(10)),
+            op: BinaryOperator::Mod,
+            right: Box::new(Expr::Integer(3)),
+        };
+        assert_eq!(eval_expr(&expr, &row, &cols).unwrap(), Value::Int64(1));
+    }
+
+    #[test]
+    fn test_eval_arithmetic_float_promotion() {
+        let (row, cols) = empty_ctx();
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Integer(5)),
+            op: BinaryOperator::Add,
+            right: Box::new(Expr::Float(2.5)),
+        };
+        assert_eq!(eval_expr(&expr, &row, &cols).unwrap(), Value::Float64(7.5));
+    }
+
+    #[test]
+    fn test_eval_division_by_zero() {
+        let (row, cols) = empty_ctx();
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Integer(10)),
+            op: BinaryOperator::Div,
+            right: Box::new(Expr::Integer(0)),
+        };
+        assert!(matches!(
+            eval_expr(&expr, &row, &cols),
+            Err(ExecutorError::DivisionByZero)
+        ));
+    }
+
+    #[test]
+    fn test_eval_null_arithmetic() {
+        let (row, cols) = empty_ctx();
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Integer(5)),
+            op: BinaryOperator::Add,
+            right: Box::new(Expr::Null),
+        };
+        assert_eq!(eval_expr(&expr, &row, &cols).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_eval_comparison() {
+        let (row, cols) = empty_ctx();
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Integer(5)),
+            op: BinaryOperator::Gt,
+            right: Box::new(Expr::Integer(3)),
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Boolean(true)
+        );
+
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::String("abc".into())),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::String("abc".into())),
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn test_eval_null_comparison() {
+        let (row, cols) = empty_ctx();
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Null),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::Null),
+        };
+        assert_eq!(eval_expr(&expr, &row, &cols).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_eval_and_or_null_logic() {
+        let (row, cols) = empty_ctx();
+
+        // FALSE AND NULL = FALSE
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Boolean(false)),
+            op: BinaryOperator::And,
+            right: Box::new(Expr::Null),
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Boolean(false)
+        );
+
+        // TRUE AND NULL = NULL
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Boolean(true)),
+            op: BinaryOperator::And,
+            right: Box::new(Expr::Null),
+        };
+        assert_eq!(eval_expr(&expr, &row, &cols).unwrap(), Value::Null);
+
+        // TRUE OR NULL = TRUE
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Boolean(true)),
+            op: BinaryOperator::Or,
+            right: Box::new(Expr::Null),
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Boolean(true)
+        );
+
+        // FALSE OR NULL = NULL
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Boolean(false)),
+            op: BinaryOperator::Or,
+            right: Box::new(Expr::Null),
+        };
+        assert_eq!(eval_expr(&expr, &row, &cols).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_eval_concat() {
+        let (row, cols) = empty_ctx();
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::String("hello".into())),
+            op: BinaryOperator::Concat,
+            right: Box::new(Expr::String(" world".into())),
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Text("hello world".into())
+        );
+    }
+
+    #[test]
+    fn test_eval_unary() {
+        let (row, cols) = empty_ctx();
+        let expr = Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            operand: Box::new(Expr::Integer(42)),
+        };
+        assert_eq!(eval_expr(&expr, &row, &cols).unwrap(), Value::Int64(-42));
+
+        let expr = Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            operand: Box::new(Expr::Boolean(true)),
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn test_eval_is_null() {
+        let (row, cols) = empty_ctx();
+        let expr = Expr::IsNull {
+            expr: Box::new(Expr::Null),
+            negated: false,
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Boolean(true)
+        );
+
+        let expr = Expr::IsNull {
+            expr: Box::new(Expr::Integer(1)),
+            negated: false,
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Boolean(false)
+        );
+
+        let expr = Expr::IsNull {
+            expr: Box::new(Expr::Null),
+            negated: true,
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn test_eval_in_list() {
+        let (row, cols) = empty_ctx();
+        let expr = Expr::InList {
+            expr: Box::new(Expr::Integer(2)),
+            list: vec![Expr::Integer(1), Expr::Integer(2), Expr::Integer(3)],
+            negated: false,
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Boolean(true)
+        );
+
+        let expr = Expr::InList {
+            expr: Box::new(Expr::Integer(4)),
+            list: vec![Expr::Integer(1), Expr::Integer(2), Expr::Integer(3)],
+            negated: false,
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn test_eval_between() {
+        let (row, cols) = empty_ctx();
+        let expr = Expr::Between {
+            expr: Box::new(Expr::Integer(5)),
+            low: Box::new(Expr::Integer(1)),
+            high: Box::new(Expr::Integer(10)),
+            negated: false,
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Boolean(true)
+        );
+
+        let expr = Expr::Between {
+            expr: Box::new(Expr::Integer(15)),
+            low: Box::new(Expr::Integer(1)),
+            high: Box::new(Expr::Integer(10)),
+            negated: false,
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn test_eval_like() {
+        let (row, cols) = empty_ctx();
+        let expr = Expr::Like {
+            expr: Box::new(Expr::String("hello world".into())),
+            pattern: Box::new(Expr::String("hello%".into())),
+            escape: None,
+            negated: false,
+            case_insensitive: false,
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Boolean(true)
+        );
+
+        let expr = Expr::Like {
+            expr: Box::new(Expr::String("hello".into())),
+            pattern: Box::new(Expr::String("h_llo".into())),
+            escape: None,
+            negated: false,
+            case_insensitive: false,
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Boolean(true)
+        );
+
+        // Case insensitive
+        let expr = Expr::Like {
+            expr: Box::new(Expr::String("HELLO".into())),
+            pattern: Box::new(Expr::String("hello".into())),
+            escape: None,
+            negated: false,
+            case_insensitive: true,
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn test_eval_case_searched() {
+        let (row, cols) = empty_ctx();
+        let expr = Expr::Case {
+            operand: None,
+            when_clauses: vec![
+                crate::sql::WhenClause {
+                    condition: Expr::Boolean(false),
+                    result: Expr::String("no".into()),
+                },
+                crate::sql::WhenClause {
+                    condition: Expr::Boolean(true),
+                    result: Expr::String("yes".into()),
+                },
+            ],
+            else_result: Some(Box::new(Expr::String("else".into()))),
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Text("yes".into())
+        );
+    }
+
+    #[test]
+    fn test_eval_case_simple() {
+        let (row, cols) = empty_ctx();
+        let expr = Expr::Case {
+            operand: Some(Box::new(Expr::Integer(2))),
+            when_clauses: vec![
+                crate::sql::WhenClause {
+                    condition: Expr::Integer(1),
+                    result: Expr::String("one".into()),
+                },
+                crate::sql::WhenClause {
+                    condition: Expr::Integer(2),
+                    result: Expr::String("two".into()),
+                },
+            ],
+            else_result: None,
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Text("two".into())
+        );
+    }
+
+    #[test]
+    fn test_eval_case_else() {
+        let (row, cols) = empty_ctx();
+        let expr = Expr::Case {
+            operand: None,
+            when_clauses: vec![crate::sql::WhenClause {
+                condition: Expr::Boolean(false),
+                result: Expr::String("no".into()),
+            }],
+            else_result: Some(Box::new(Expr::String("default".into()))),
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Text("default".into())
+        );
+    }
+
+    #[test]
+    fn test_eval_cast_int_to_text() {
+        let (row, cols) = empty_ctx();
+        let expr = Expr::Cast {
+            expr: Box::new(Expr::Integer(42)),
+            data_type: DataType::Text,
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Text("42".into())
+        );
+    }
+
+    #[test]
+    fn test_eval_cast_text_to_int() {
+        let (row, cols) = empty_ctx();
+        let expr = Expr::Cast {
+            expr: Box::new(Expr::String("123".into())),
+            data_type: DataType::Integer,
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Int32(123)
+        );
+    }
+
+    #[test]
+    fn test_eval_cast_text_to_bool() {
+        let (row, cols) = empty_ctx();
+        let expr = Expr::Cast {
+            expr: Box::new(Expr::String("true".into())),
+            data_type: DataType::Boolean,
+        };
+        assert_eq!(
+            eval_expr(&expr, &row, &cols).unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn test_eval_cast_null() {
+        let (row, cols) = empty_ctx();
+        let expr = Expr::Cast {
+            expr: Box::new(Expr::Null),
+            data_type: DataType::Integer,
+        };
+        assert_eq!(eval_expr(&expr, &row, &cols).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_format_expr_basic() {
+        assert_eq!(format_expr(&Expr::Integer(42)), "42");
+        assert_eq!(format_expr(&Expr::String("hello".into())), "'hello'");
+        assert_eq!(
+            format_expr(&Expr::ColumnRef {
+                table: Some("t".into()),
+                column: "id".into()
+            }),
+            "t.id"
+        );
+        assert_eq!(
+            format_expr(&Expr::BinaryOp {
+                left: Box::new(Expr::Integer(1)),
+                op: BinaryOperator::Add,
+                right: Box::new(Expr::Integer(2)),
+            }),
+            "(1 + 2)"
+        );
+    }
+
+}

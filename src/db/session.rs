@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use super::Database;
 use super::error::DatabaseError;
+use crate::executor::{self, ColumnDesc, Row};
 use crate::sql::{Parser, Statement};
 use crate::storage::{Replacer, Storage};
 use crate::tx::{CommandId, TxId};
@@ -21,8 +22,13 @@ pub enum QueryResult {
         /// Command completion tag (e.g., "CREATE TABLE", "INSERT 0 1").
         tag: String,
     },
-    // NOTE: Rows variant will be added in Step 10 (Basic Executor) for SELECT results.
-    // Rows { columns: Vec<ColumnDesc>, rows: Vec<Row> }
+    /// Query returned rows (SELECT, EXPLAIN).
+    Rows {
+        /// Column metadata for the result set.
+        columns: Vec<ColumnDesc>,
+        /// Result rows.
+        rows: Vec<Row>,
+    },
 }
 
 /// Transaction state for a session.
@@ -176,11 +182,19 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 })
                 .await
             }
-            // NOTE: Other statements are stubbed for now.
-            // They will use within_transaction when implemented in future steps.
-            Statement::Select(_) => Ok(QueryResult::Command {
-                tag: "SELECT 0".to_string(),
-            }),
+            Statement::Select(select_stmt) => {
+                self.within_transaction(|db, txid, cid| async move {
+                    let snapshot = db.tx_manager().snapshot(txid, cid);
+                    let mut node = executor::plan_select(select_stmt, &db, &snapshot).await?;
+                    let columns = node.columns().to_vec();
+                    let mut rows = Vec::new();
+                    while let Some(row) = node.next()? {
+                        rows.push(row);
+                    }
+                    Ok(QueryResult::Rows { columns, rows })
+                })
+                .await
+            }
             Statement::Insert(_) => Ok(QueryResult::Command {
                 tag: "INSERT 0 0".to_string(),
             }),
@@ -202,9 +216,33 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::Set(_) => Ok(QueryResult::Command {
                 tag: "SET".to_string(),
             }),
-            Statement::Explain(_) => Ok(QueryResult::Command {
-                tag: "EXPLAIN".to_string(),
-            }),
+            Statement::Explain(inner_stmt) => match inner_stmt.as_ref() {
+                Statement::Select(select_stmt) => {
+                    self.within_transaction(|db, txid, cid| async move {
+                        let snapshot = db.tx_manager().snapshot(txid, cid);
+                        let node =
+                            executor::plan_select(select_stmt, &db, &snapshot).await?;
+                        let explain_text = node.explain(0);
+                        let columns = vec![ColumnDesc {
+                            name: "QUERY PLAN".to_string(),
+                            table_oid: 0,
+                            column_id: 0,
+                            data_type: crate::datum::Type::Text,
+                        }];
+                        let rows: Vec<Row> = explain_text
+                            .lines()
+                            .map(|line| vec![crate::datum::Value::Text(line.to_string())])
+                            .collect();
+                        Ok(QueryResult::Rows { columns, rows })
+                    })
+                    .await
+                }
+                _ => Err(DatabaseError::Executor(
+                    crate::executor::ExecutorError::Unsupported(
+                        "EXPLAIN for non-SELECT statements".to_string(),
+                    ),
+                )),
+            },
         }
     }
 
@@ -369,5 +407,194 @@ mod tests {
 
         let result = session.execute_query("INVALID SQL").await;
         assert!(matches!(result, Err(DatabaseError::Parse(_))));
+    }
+
+    #[tokio::test]
+    async fn test_select_from_sys_tables() {
+        let storage = Arc::new(MemoryStorage::new());
+        let db = Arc::new(Database::open(storage, 100).await.unwrap());
+        let mut session = Session::new(db);
+
+        let result = session
+            .execute_query("SELECT * FROM sys_tables")
+            .await
+            .unwrap()
+            .unwrap();
+
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns.len(), 3);
+                assert_eq!(columns[0].name, "table_id");
+                assert_eq!(columns[1].name, "table_name");
+                assert_eq!(columns[2].name, "first_page");
+                // At least sys_tables, sys_columns, sys_sequences
+                assert!(rows.len() >= 3);
+            }
+            _ => panic!("expected Rows result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_select_with_where_filter() {
+        let storage = Arc::new(MemoryStorage::new());
+        let db = Arc::new(Database::open(storage, 100).await.unwrap());
+        let mut session = Session::new(db);
+
+        let result = session
+            .execute_query("SELECT table_name FROM sys_tables WHERE table_id = 1")
+            .await
+            .unwrap()
+            .unwrap();
+
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns.len(), 1);
+                assert_eq!(columns[0].name, "table_name");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0][0],
+                    crate::datum::Value::Text("sys_tables".to_string())
+                );
+            }
+            _ => panic!("expected Rows result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_select_with_column_list() {
+        let storage = Arc::new(MemoryStorage::new());
+        let db = Arc::new(Database::open(storage, 100).await.unwrap());
+        let mut session = Session::new(db);
+
+        let result = session
+            .execute_query("SELECT table_id, table_name FROM sys_tables")
+            .await
+            .unwrap()
+            .unwrap();
+
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns.len(), 2);
+                assert_eq!(columns[0].name, "table_id");
+                assert_eq!(columns[1].name, "table_name");
+                assert!(rows.len() >= 3);
+            }
+            _ => panic!("expected Rows result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_select_no_from() {
+        let storage = Arc::new(MemoryStorage::new());
+        let db = Arc::new(Database::open(storage, 100).await.unwrap());
+        let mut session = Session::new(db);
+
+        let result = session
+            .execute_query("SELECT 1 + 1")
+            .await
+            .unwrap()
+            .unwrap();
+
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns.len(), 1);
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], crate::datum::Value::Int64(2));
+            }
+            _ => panic!("expected Rows result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_select_expressions() {
+        let storage = Arc::new(MemoryStorage::new());
+        let db = Arc::new(Database::open(storage, 100).await.unwrap());
+        let mut session = Session::new(db);
+
+        // Arithmetic
+        let result = session
+            .execute_query("SELECT 2 * 3 + 1")
+            .await
+            .unwrap()
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], crate::datum::Value::Int64(7));
+            }
+            _ => panic!("expected Rows result"),
+        }
+
+        // String concatenation
+        let result = session
+            .execute_query("SELECT 'hello' || ' world'")
+            .await
+            .unwrap()
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(
+                    rows[0][0],
+                    crate::datum::Value::Text("hello world".to_string())
+                );
+            }
+            _ => panic!("expected Rows result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_explain_select() {
+        let storage = Arc::new(MemoryStorage::new());
+        let db = Arc::new(Database::open(storage, 100).await.unwrap());
+        let mut session = Session::new(db);
+
+        let result = session
+            .execute_query("EXPLAIN SELECT * FROM sys_tables")
+            .await
+            .unwrap()
+            .unwrap();
+
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns.len(), 1);
+                assert_eq!(columns[0].name, "QUERY PLAN");
+                assert!(!rows.is_empty());
+                // Should contain at least a Projection and SeqScan
+                let plan_text: String = rows
+                    .iter()
+                    .map(|r| match &r[0] {
+                        crate::datum::Value::Text(s) => s.as_str(),
+                        _ => "",
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(plan_text.contains("SeqScan"));
+                assert!(plan_text.contains("Projection"));
+            }
+            _ => panic!("expected Rows result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_select_table_not_found() {
+        let storage = Arc::new(MemoryStorage::new());
+        let db = Arc::new(Database::open(storage, 100).await.unwrap());
+        let mut session = Session::new(db);
+
+        let result = session
+            .execute_query("SELECT * FROM nonexistent")
+            .await;
+        assert!(matches!(result, Err(DatabaseError::Executor(_))));
+    }
+
+    #[tokio::test]
+    async fn test_select_column_not_found() {
+        let storage = Arc::new(MemoryStorage::new());
+        let db = Arc::new(Database::open(storage, 100).await.unwrap());
+        let mut session = Session::new(db);
+
+        let result = session
+            .execute_query("SELECT nonexistent_col FROM sys_tables")
+            .await;
+        assert!(matches!(result, Err(DatabaseError::Executor(_))));
     }
 }

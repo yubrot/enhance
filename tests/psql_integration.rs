@@ -228,13 +228,75 @@ LINE 1: SELECT FROM "users";
 async fn test_psql_complex_select() {
     let server = PsqlTestServer::start().await;
 
-    // Test that complex SELECT statements parse correctly
+    // ORDER BY is not yet supported (Step 12), so this should return an error
     let result = server.run_psql(
         "SELECT id, name, age FROM users WHERE active = TRUE AND age >= 18 ORDER BY name ASC LIMIT 10;",
     );
-    // psql shows "(0 rows)" for empty result sets
+    result.assert_output_contains("unsupported");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_select_from_catalog() {
+    let server = PsqlTestServer::start().await;
+
+    // Test SELECT * FROM sys_tables returns actual catalog data
+    let result = server.run_psql("SELECT * FROM sys_tables;\\q");
     result.assert_success();
-    result.assert_output_contains("(0 rows)");
+    result.assert_output_contains("sys_tables");
+    result.assert_output_contains("sys_columns");
+    result.assert_output_contains("sys_sequences");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_select_with_where() {
+    let server = PsqlTestServer::start().await;
+
+    // Test SELECT with WHERE filter
+    let result = server.run_psql("SELECT table_name FROM sys_tables WHERE table_id = 1;\\q");
+    result.assert_success();
+    result.assert_output_contains("sys_tables");
+    result.assert_output_contains("(1 row)");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_select_expression() {
+    let server = PsqlTestServer::start().await;
+
+    // Test SELECT with arithmetic expression (no FROM)
+    let result = server.run_psql("SELECT 1 + 2;\\q");
+    result.assert_success();
+    result.assert_output_contains("3");
+    result.assert_output_contains("(1 row)");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_select_concat() {
+    let server = PsqlTestServer::start().await;
+
+    // Test string concatenation using CAST to avoid shell quoting issues with echo
+    // Use psql -c instead to handle the query directly
+    let result = server.run_psql_direct("SELECT 'hello' || ' world';");
+    result.assert_success();
+    result.assert_output_contains("hello world");
+    result.assert_output_contains("(1 row)");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_explain_select() {
+    let server = PsqlTestServer::start().await;
+
+    // Test EXPLAIN output
+    let result = server.run_psql("EXPLAIN SELECT * FROM sys_tables;\\q");
+    result.assert_success();
+    result.assert_output_contains("SeqScan");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_select_table_not_found() {
+    let server = PsqlTestServer::start().await;
+
+    let result = server.run_psql("SELECT * FROM nonexistent;\\q");
+    result.assert_output_contains("does not exist");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -242,7 +304,8 @@ async fn test_psql_comments() {
     let server = PsqlTestServer::start().await;
 
     // Test that SQL comments are handled correctly
+    // SELECT 1+2 evaluates to 3
     let result = server.run_psql("SELECT 1 /* this is a comment */ + 2; -- line comment");
     result.assert_success();
-    result.assert_output_contains("(0 rows)");
+    result.assert_output_contains("(1 row)");
 }
