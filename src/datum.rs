@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use crate::protocol::types::type_oid;
+
 /// Errors from data serialization/deserialization.
 #[derive(Debug)]
 pub enum SerializationError {
@@ -57,40 +59,35 @@ macro_rules! ensure_buf_len {
 
 /// Database data type identifier.
 ///
-/// Each variant corresponds to a PostgreSQL type OID for psql compatibility.
-/// Using an enum ensures type-safe handling throughout the codebase,
-/// replacing raw `i32` OID constants.
+/// Each variant maps to a PostgreSQL type OID defined in
+/// [`protocol::types::type_oid`](crate::protocol::types::type_oid).
+/// The OID mapping is provided by [`oid()`](Type::oid) and
+/// [`TryFrom<i32>`](Type#impl-TryFrom<i32>-for-Type).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(i32)]
 pub enum Type {
     /// Boolean type.
-    Bool = 16,
+    Bool,
     /// Variable-length binary string.
-    Bytea = 17,
+    Bytea,
     /// 2-byte integer.
-    Int2 = 21,
+    Int2,
     /// 4-byte integer.
-    Int4 = 23,
+    Int4,
     /// 8-byte integer.
-    Int8 = 20,
+    Int8,
     /// Single-precision floating-point.
-    Float4 = 700,
+    Float4,
     /// Double-precision floating-point.
-    Float8 = 701,
+    Float8,
     /// Variable-length string.
-    Text = 25,
+    Text,
     /// Variable-length string with limit.
-    Varchar = 1043,
+    Varchar,
     /// Fixed-length string.
-    Bpchar = 1042,
+    Bpchar,
 }
 
 impl Type {
-    /// Returns the wire-protocol OID value.
-    pub const fn oid(self) -> i32 {
-        self as i32
-    }
-
     /// Returns the SQL display name for this type (e.g., `"BOOLEAN"`, `"INTEGER"`).
     pub const fn display_name(self) -> &'static str {
         match self {
@@ -119,24 +116,39 @@ impl Type {
             Type::Text | Type::Varchar | Type::Bpchar | Type::Bytea => None,
         }
     }
-}
 
-impl TryFrom<i32> for Type {
-    type Error = i32;
+    /// Returns the wire-protocol OID value.
+    pub const fn oid(self) -> i32 {
+        match self {
+            Type::Bool => type_oid::BOOL,
+            Type::Bytea => type_oid::BYTEA,
+            Type::Int2 => type_oid::INT2,
+            Type::Int4 => type_oid::INT4,
+            Type::Int8 => type_oid::INT8,
+            Type::Float4 => type_oid::FLOAT4,
+            Type::Float8 => type_oid::FLOAT8,
+            Type::Text => type_oid::TEXT,
+            Type::Varchar => type_oid::VARCHAR,
+            Type::Bpchar => type_oid::BPCHAR,
+        }
+    }
 
-    fn try_from(oid: i32) -> Result<Self, Self::Error> {
+    /// Converts a wire-protocol OID value into a [`Type`].
+    ///
+    /// Returns `None` if the OID does not correspond to a known type.
+    pub const fn from_oid(oid: i32) -> Option<Self> {
         match oid {
-            16 => Ok(Type::Bool),
-            17 => Ok(Type::Bytea),
-            20 => Ok(Type::Int8),
-            21 => Ok(Type::Int2),
-            23 => Ok(Type::Int4),
-            25 => Ok(Type::Text),
-            700 => Ok(Type::Float4),
-            701 => Ok(Type::Float8),
-            1042 => Ok(Type::Bpchar),
-            1043 => Ok(Type::Varchar),
-            _ => Err(oid),
+            type_oid::BOOL => Some(Type::Bool),
+            type_oid::BYTEA => Some(Type::Bytea),
+            type_oid::INT8 => Some(Type::Int8),
+            type_oid::INT2 => Some(Type::Int2),
+            type_oid::INT4 => Some(Type::Int4),
+            type_oid::TEXT => Some(Type::Text),
+            type_oid::FLOAT4 => Some(Type::Float4),
+            type_oid::FLOAT8 => Some(Type::Float8),
+            type_oid::BPCHAR => Some(Type::Bpchar),
+            type_oid::VARCHAR => Some(Type::Varchar),
+            _ => None,
         }
     }
 }
@@ -346,6 +358,10 @@ impl Value {
     }
 
     /// Converts this value to its text representation.
+    ///
+    /// The output follows PostgreSQL text format conventions for wire protocol
+    /// compatibility: booleans as `"t"`/`"f"`, bytea as hex with `"\\x"` prefix,
+    /// and floats via [`format_float()`].
     pub fn to_text(&self) -> String {
         match self {
             Value::Null => String::new(),
@@ -365,6 +381,9 @@ impl Value {
 }
 
 /// Formats a float value matching PostgreSQL output conventions.
+///
+/// Special values (`Infinity`, `-Infinity`, `NaN`) use PostgreSQL's
+/// canonical text representation for wire protocol compatibility.
 fn format_float(n: f64) -> String {
     if n.is_infinite() {
         if n.is_sign_positive() {
@@ -400,15 +419,15 @@ mod tests {
         ];
         for ty in types {
             let oid = ty.oid();
-            let parsed = Type::try_from(oid).unwrap();
+            let parsed = Type::from_oid(oid).unwrap();
             assert_eq!(parsed, ty);
         }
     }
 
     #[test]
-    fn test_type_try_from_invalid() {
-        assert_eq!(Type::try_from(9999), Err(9999));
-        assert_eq!(Type::try_from(0), Err(0));
+    fn test_type_from_oid_invalid() {
+        assert_eq!(Type::from_oid(9999), None);
+        assert_eq!(Type::from_oid(0), None);
     }
 
     #[test]

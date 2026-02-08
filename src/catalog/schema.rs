@@ -168,7 +168,7 @@ impl ColumnInfo {
             _ => return None,
         };
         let data_type = match record.values.get(Self::COL_DATA_TYPE)? {
-            Value::Int32(oid) => Type::try_from(*oid).ok()?,
+            Value::Int32(oid) => Type::from_oid(*oid)?,
             _ => return None,
         };
         let seq_id = match record.values.get(Self::COL_SEQ_ID)? {
