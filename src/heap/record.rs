@@ -39,7 +39,7 @@ use crate::ensure_buf_len;
 /// use enhance::heap::Record;
 ///
 /// let record = Record::new(vec![
-///     Value::Int32(42),
+///     Value::Integer(42),
 ///     Value::Text("hello".to_string()),
 ///     Value::Null,
 /// ]);
@@ -47,7 +47,7 @@ use crate::ensure_buf_len;
 /// let mut buf = vec![0u8; record.serialized_size()];
 /// record.serialize(&mut buf).unwrap();
 ///
-/// let schema = [Type::Int4, Type::Text, Type::Int4];
+/// let schema = [Type::Integer, Type::Text, Type::Integer];
 /// let parsed = Record::deserialize(&buf, &schema).unwrap();
 /// assert_eq!(parsed, record);
 /// ```
@@ -196,16 +196,16 @@ mod tests {
 
     #[test]
     fn test_single_value_record() {
-        let record = Record::new(vec![Value::Int32(42)]);
+        let record = Record::new(vec![Value::Integer(42)]);
         assert_eq!(record.len(), 1);
-        // 1 byte null bitmap + 4 bytes int32
+        // 1 byte null bitmap + 4 bytes Integer
         assert_eq!(record.serialized_size(), 1 + 4);
 
         let mut buf = vec![0u8; record.serialized_size()];
         let written = record.serialize(&mut buf).unwrap();
         assert_eq!(written, 5);
 
-        let schema = [Type::Int4];
+        let schema = [Type::Integer];
         let parsed = Record::deserialize(&buf, &schema).unwrap();
         assert_eq!(parsed, record);
     }
@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn test_multiple_values_record() {
         let record = Record::new(vec![
-            Value::Int32(42),
+            Value::Integer(42),
             Value::Text("hello".to_string()),
             Value::Boolean(true),
         ]);
@@ -221,7 +221,7 @@ mod tests {
         let mut buf = vec![0u8; record.serialized_size()];
         record.serialize(&mut buf).unwrap();
 
-        let schema = [Type::Int4, Type::Text, Type::Bool];
+        let schema = [Type::Integer, Type::Text, Type::Bool];
         let parsed = Record::deserialize(&buf, &schema).unwrap();
         assert_eq!(parsed, record);
     }
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn test_record_with_nulls() {
         let record = Record::new(vec![
-            Value::Int32(42),
+            Value::Integer(42),
             Value::Null,
             Value::Text("hello".to_string()),
             Value::Null,
@@ -238,7 +238,7 @@ mod tests {
         let mut buf = vec![0u8; record.serialized_size()];
         record.serialize(&mut buf).unwrap();
 
-        let schema = [Type::Int4, Type::Text, Type::Text, Type::Int4];
+        let schema = [Type::Integer, Type::Text, Type::Text, Type::Integer];
         let parsed = Record::deserialize(&buf, &schema).unwrap();
         assert_record_eq(&parsed, &record);
     }
@@ -252,7 +252,7 @@ mod tests {
         let mut buf = vec![0u8; record.serialized_size()];
         record.serialize(&mut buf).unwrap();
 
-        let schema = [Type::Int4, Type::Text, Type::Bool];
+        let schema = [Type::Integer, Type::Text, Type::Bool];
         let parsed = Record::deserialize(&buf, &schema).unwrap();
         assert_record_eq(&parsed, &record);
     }
@@ -261,15 +261,15 @@ mod tests {
     fn test_null_bitmap_multiple_bytes() {
         // 9 columns require 2 bytes for null bitmap, with mixed nulls
         let record = Record::new(vec![
-            Value::Int32(1),
+            Value::Integer(1),
             Value::Null,
-            Value::Int32(3),
+            Value::Integer(3),
             Value::Null,
-            Value::Int32(5),
+            Value::Integer(5),
             Value::Null,
-            Value::Int32(7),
+            Value::Integer(7),
             Value::Null,
-            Value::Int32(9),
+            Value::Integer(9),
         ]);
 
         // 2 bytes bitmap + 5 * 4 bytes = 22 bytes
@@ -278,7 +278,7 @@ mod tests {
         let mut buf = vec![0u8; record.serialized_size()];
         record.serialize(&mut buf).unwrap();
 
-        let schema = vec![Type::Int4; 9];
+        let schema = vec![Type::Integer; 9];
         let parsed = Record::deserialize(&buf, &schema).unwrap();
         assert_record_eq(&parsed, &record);
     }
@@ -287,11 +287,11 @@ mod tests {
     fn test_all_types() {
         let record = Record::new(vec![
             Value::Boolean(true),
-            Value::Int16(i16::MAX),
-            Value::Int32(i32::MAX),
-            Value::Int64(i64::MAX),
-            Value::Float32(std::f32::consts::PI),
-            Value::Float64(std::f64::consts::PI),
+            Value::Smallint(i16::MAX),
+            Value::Integer(i32::MAX),
+            Value::Bigint(i64::MAX),
+            Value::Real(std::f32::consts::PI),
+            Value::DoublePrecision(std::f64::consts::PI),
             Value::Text("hello".to_string()),
             Value::Bytea(vec![1, 2, 3]),
         ]);
@@ -301,11 +301,11 @@ mod tests {
 
         let schema = [
             Type::Bool,
-            Type::Int2,
-            Type::Int4,
-            Type::Int8,
-            Type::Float4,
-            Type::Float8,
+            Type::Smallint,
+            Type::Integer,
+            Type::Bigint,
+            Type::Real,
+            Type::DoublePrecision,
             Type::Text,
             Type::Bytea,
         ];
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_buffer_too_small_for_record() {
-        let record = Record::new(vec![Value::Int32(42)]);
+        let record = Record::new(vec![Value::Integer(42)]);
         let mut buf = vec![0u8; 2]; // Need 5 bytes
 
         let result = record.serialize(&mut buf);
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn test_deserialize_buffer_too_small() {
         let buf = vec![0u8; 0];
-        let schema = [Type::Int4];
+        let schema = [Type::Integer];
 
         let result = Record::deserialize(&buf, &schema);
         assert!(matches!(

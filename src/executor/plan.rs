@@ -120,7 +120,7 @@ mod tests {
         ColumnDesc {
             name: name.to_string(),
             source: None,
-            data_type: Type::Int8,
+            data_type: Type::Bigint,
         }
     }
 
@@ -139,7 +139,7 @@ mod tests {
             table_name: "users".to_string(),
             table_id: 1,
             first_page: PageId::new(10),
-            schema: vec![Type::Int8, Type::Text],
+            schema: vec![Type::Bigint, Type::Text],
             columns: vec![int_col("id"), int_col("name")],
         };
         assert_eq!(plan.explain(), "SeqScan on users (cols: id, name)");
@@ -151,7 +151,7 @@ mod tests {
             table_name: "users".to_string(),
             table_id: 1,
             first_page: PageId::new(10),
-            schema: vec![Type::Int8],
+            schema: vec![Type::Bigint],
             columns: vec![int_col("id")],
         };
         let plan = Plan::Filter {
@@ -170,7 +170,7 @@ mod tests {
             table_name: "users".to_string(),
             table_id: 1,
             first_page: PageId::new(10),
-            schema: vec![Type::Int8, Type::Text],
+            schema: vec![Type::Bigint, Type::Text],
             columns: vec![int_col("id"), int_col("name")],
         };
         let plan = Plan::Projection {

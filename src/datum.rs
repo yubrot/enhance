@@ -87,15 +87,15 @@ pub enum Type {
     /// Variable-length binary string.
     Bytea,
     /// 2-byte integer.
-    Int2,
+    Smallint,
     /// 4-byte integer.
-    Int4,
+    Integer,
     /// 8-byte integer.
-    Int8,
+    Bigint,
     /// Single-precision floating-point.
-    Float4,
+    Real,
     /// Double-precision floating-point.
-    Float8,
+    DoublePrecision,
     /// Variable-length string.
     Text,
     /// Variable-length string with limit.
@@ -110,11 +110,11 @@ impl Type {
         match self {
             Type::Bool => "BOOLEAN",
             Type::Bytea => "BYTEA",
-            Type::Int2 => "SMALLINT",
-            Type::Int4 => "INTEGER",
-            Type::Int8 => "BIGINT",
-            Type::Float4 => "REAL",
-            Type::Float8 => "DOUBLE PRECISION",
+            Type::Smallint => "SMALLINT",
+            Type::Integer => "INTEGER",
+            Type::Bigint => "BIGINT",
+            Type::Real => "REAL",
+            Type::DoublePrecision => "DOUBLE PRECISION",
             Type::Text => "TEXT",
             Type::Varchar => "VARCHAR",
             Type::Bpchar => "CHAR",
@@ -125,11 +125,11 @@ impl Type {
     pub const fn fixed_size(self) -> Option<usize> {
         match self {
             Type::Bool => Some(1),
-            Type::Int2 => Some(2),
-            Type::Int4 => Some(4),
-            Type::Int8 => Some(8),
-            Type::Float4 => Some(4),
-            Type::Float8 => Some(8),
+            Type::Smallint => Some(2),
+            Type::Integer => Some(4),
+            Type::Bigint => Some(8),
+            Type::Real => Some(4),
+            Type::DoublePrecision => Some(8),
             Type::Text | Type::Varchar | Type::Bpchar | Type::Bytea => None,
         }
     }
@@ -139,11 +139,11 @@ impl Type {
         match self {
             Type::Bool => type_oid::BOOL,
             Type::Bytea => type_oid::BYTEA,
-            Type::Int2 => type_oid::INT2,
-            Type::Int4 => type_oid::INT4,
-            Type::Int8 => type_oid::INT8,
-            Type::Float4 => type_oid::FLOAT4,
-            Type::Float8 => type_oid::FLOAT8,
+            Type::Smallint => type_oid::INT2,
+            Type::Integer => type_oid::INT4,
+            Type::Bigint => type_oid::INT8,
+            Type::Real => type_oid::FLOAT4,
+            Type::DoublePrecision => type_oid::FLOAT8,
             Type::Text => type_oid::TEXT,
             Type::Varchar => type_oid::VARCHAR,
             Type::Bpchar => type_oid::BPCHAR,
@@ -157,12 +157,12 @@ impl Type {
         match oid {
             type_oid::BOOL => Some(Type::Bool),
             type_oid::BYTEA => Some(Type::Bytea),
-            type_oid::INT8 => Some(Type::Int8),
-            type_oid::INT2 => Some(Type::Int2),
-            type_oid::INT4 => Some(Type::Int4),
+            type_oid::INT8 => Some(Type::Bigint),
+            type_oid::INT2 => Some(Type::Smallint),
+            type_oid::INT4 => Some(Type::Integer),
             type_oid::TEXT => Some(Type::Text),
-            type_oid::FLOAT4 => Some(Type::Float4),
-            type_oid::FLOAT8 => Some(Type::Float8),
+            type_oid::FLOAT4 => Some(Type::Real),
+            type_oid::FLOAT8 => Some(Type::DoublePrecision),
             type_oid::BPCHAR => Some(Type::Bpchar),
             type_oid::VARCHAR => Some(Type::Varchar),
             _ => None,
@@ -175,11 +175,11 @@ impl fmt::Display for Type {
         let name = match self {
             Type::Bool => "boolean",
             Type::Bytea => "bytea",
-            Type::Int2 => "smallint",
-            Type::Int4 => "integer",
-            Type::Int8 => "bigint",
-            Type::Float4 => "real",
-            Type::Float8 => "double precision",
+            Type::Smallint => "smallint",
+            Type::Integer => "integer",
+            Type::Bigint => "bigint",
+            Type::Real => "real",
+            Type::DoublePrecision => "double precision",
             Type::Text => "text",
             Type::Varchar => "character varying",
             Type::Bpchar => "character",
@@ -190,10 +190,10 @@ impl fmt::Display for Type {
 
 /// Widened numeric representation for cross-type numeric operations.
 pub enum WideNumeric {
-    /// 64-bit integer (widened from Int16, Int32, or Int64).
-    Int64(i64),
-    /// 64-bit float (widened from Float32 or Float64).
-    Float64(f64),
+    /// 64-bit integer (widened from Smallint, Integer, or Bigint).
+    Bigint(i64),
+    /// 64-bit float (widened from Real or DoublePrecision).
+    DoublePrecision(f64),
 }
 
 /// A typed database value.
@@ -212,15 +212,15 @@ pub enum Value {
     /// Boolean (true/false).
     Boolean(bool),
     /// 16-bit signed integer (SMALLINT).
-    Int16(i16),
+    Smallint(i16),
     /// 32-bit signed integer (INTEGER).
-    Int32(i32),
+    Integer(i32),
     /// 64-bit signed integer (BIGINT).
-    Int64(i64),
+    Bigint(i64),
     /// 32-bit floating point (REAL).
-    Float32(f32),
+    Real(f32),
     /// 64-bit floating point (DOUBLE PRECISION).
-    Float64(f64),
+    DoublePrecision(f64),
     /// Variable-length text (TEXT, VARCHAR).
     Text(String),
     /// Variable-length binary (BYTEA).
@@ -238,11 +238,11 @@ impl Value {
         match self {
             Value::Null => None,
             Value::Boolean(_) => Some(Type::Bool),
-            Value::Int16(_) => Some(Type::Int2),
-            Value::Int32(_) => Some(Type::Int4),
-            Value::Int64(_) => Some(Type::Int8),
-            Value::Float32(_) => Some(Type::Float4),
-            Value::Float64(_) => Some(Type::Float8),
+            Value::Smallint(_) => Some(Type::Smallint),
+            Value::Integer(_) => Some(Type::Integer),
+            Value::Bigint(_) => Some(Type::Bigint),
+            Value::Real(_) => Some(Type::Real),
+            Value::DoublePrecision(_) => Some(Type::DoublePrecision),
             Value::Text(_) => Some(Type::Text),
             Value::Bytea(_) => Some(Type::Bytea),
         }
@@ -270,11 +270,11 @@ impl Value {
         match self {
             Value::Null => 0,
             Value::Boolean(_) => 1,
-            Value::Int16(_) => 2,
-            Value::Int32(_) => 4,
-            Value::Int64(_) => 8,
-            Value::Float32(_) => 4,
-            Value::Float64(_) => 8,
+            Value::Smallint(_) => 2,
+            Value::Integer(_) => 4,
+            Value::Bigint(_) => 8,
+            Value::Real(_) => 4,
+            Value::DoublePrecision(_) => 8,
             Value::Text(s) => 4 + s.len(),
             Value::Bytea(b) => 4 + b.len(),
         }
@@ -295,27 +295,27 @@ impl Value {
                 buf[0] = if *b { 1 } else { 0 };
                 Ok(1)
             }
-            Value::Int16(n) => {
+            Value::Smallint(n) => {
                 ensure_buf_len!(buf, 2);
                 buf[0..2].copy_from_slice(&n.to_le_bytes());
                 Ok(2)
             }
-            Value::Int32(n) => {
+            Value::Integer(n) => {
                 ensure_buf_len!(buf, 4);
                 buf[0..4].copy_from_slice(&n.to_le_bytes());
                 Ok(4)
             }
-            Value::Int64(n) => {
+            Value::Bigint(n) => {
                 ensure_buf_len!(buf, 8);
                 buf[0..8].copy_from_slice(&n.to_le_bytes());
                 Ok(8)
             }
-            Value::Float32(n) => {
+            Value::Real(n) => {
                 ensure_buf_len!(buf, 4);
                 buf[0..4].copy_from_slice(&n.to_le_bytes());
                 Ok(4)
             }
-            Value::Float64(n) => {
+            Value::DoublePrecision(n) => {
                 ensure_buf_len!(buf, 8);
                 buf[0..8].copy_from_slice(&n.to_le_bytes());
                 Ok(8)
@@ -352,30 +352,30 @@ impl Value {
                 ensure_buf_len!(buf, 1);
                 Ok((Value::Boolean(buf[0] != 0), 1))
             }
-            Type::Int2 => {
+            Type::Smallint => {
                 ensure_buf_len!(buf, 2);
                 let n = i16::from_le_bytes([buf[0], buf[1]]);
-                Ok((Value::Int16(n), 2))
+                Ok((Value::Smallint(n), 2))
             }
-            Type::Int4 => {
+            Type::Integer => {
                 ensure_buf_len!(buf, 4);
                 let n = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                Ok((Value::Int32(n), 4))
+                Ok((Value::Integer(n), 4))
             }
-            Type::Int8 => {
+            Type::Bigint => {
                 ensure_buf_len!(buf, 8);
                 let n = i64::from_le_bytes(buf[0..8].try_into().unwrap());
-                Ok((Value::Int64(n), 8))
+                Ok((Value::Bigint(n), 8))
             }
-            Type::Float4 => {
+            Type::Real => {
                 ensure_buf_len!(buf, 4);
                 let n = f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                Ok((Value::Float32(n), 4))
+                Ok((Value::Real(n), 4))
             }
-            Type::Float8 => {
+            Type::DoublePrecision => {
                 ensure_buf_len!(buf, 8);
                 let n = f64::from_le_bytes(buf[0..8].try_into().unwrap());
-                Ok((Value::Float64(n), 8))
+                Ok((Value::DoublePrecision(n), 8))
             }
             Type::Text | Type::Varchar | Type::Bpchar => {
                 ensure_buf_len!(buf, 4);
@@ -405,11 +405,11 @@ impl Value {
         match self {
             Value::Null => String::new(),
             Value::Boolean(b) => (if *b { "t" } else { "f" }).to_string(),
-            Value::Int16(n) => n.to_string(),
-            Value::Int32(n) => n.to_string(),
-            Value::Int64(n) => n.to_string(),
-            Value::Float32(n) => format_float(*n as f64),
-            Value::Float64(n) => format_float(*n),
+            Value::Smallint(n) => n.to_string(),
+            Value::Integer(n) => n.to_string(),
+            Value::Bigint(n) => n.to_string(),
+            Value::Real(n) => format_float(*n as f64),
+            Value::DoublePrecision(n) => format_float(*n),
             Value::Text(s) => s.clone(),
             Value::Bytea(b) => {
                 let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
@@ -423,11 +423,11 @@ impl Value {
     /// Returns `None` for non-numeric types (Boolean, Text, Bytea, Null).
     pub fn to_wide_numeric(&self) -> Option<WideNumeric> {
         match self {
-            Value::Int16(n) => Some(WideNumeric::Int64(*n as i64)),
-            Value::Int32(n) => Some(WideNumeric::Int64(*n as i64)),
-            Value::Int64(n) => Some(WideNumeric::Int64(*n)),
-            Value::Float32(n) => Some(WideNumeric::Float64(*n as f64)),
-            Value::Float64(n) => Some(WideNumeric::Float64(*n)),
+            Value::Smallint(n) => Some(WideNumeric::Bigint(*n as i64)),
+            Value::Integer(n) => Some(WideNumeric::Bigint(*n as i64)),
+            Value::Bigint(n) => Some(WideNumeric::Bigint(*n)),
+            Value::Real(n) => Some(WideNumeric::DoublePrecision(*n as f64)),
+            Value::DoublePrecision(n) => Some(WideNumeric::DoublePrecision(*n)),
             _ => None,
         }
     }
@@ -453,95 +453,95 @@ impl Value {
                     "false" | "f" | "no" | "n" | "0" | "off" => Ok(Value::Boolean(false)),
                     _ => Err((Value::Text(s), CastError::Invalid)),
                 },
-                Value::Int16(n) => Ok(Value::Boolean(n != 0)),
-                Value::Int32(n) => Ok(Value::Boolean(n != 0)),
-                Value::Int64(n) => Ok(Value::Boolean(n != 0)),
+                Value::Smallint(n) => Ok(Value::Boolean(n != 0)),
+                Value::Integer(n) => Ok(Value::Boolean(n != 0)),
+                Value::Bigint(n) => Ok(Value::Boolean(n != 0)),
                 other => Err((other, CastError::Invalid)),
             },
-            Type::Int2 => match self {
-                Value::Int16(_) => Ok(self),
-                Value::Int32(n) => i16::try_from(n)
-                    .map(Value::Int16)
-                    .map_err(|_| (Value::Int32(n), CastError::NumericOutOfRange)),
-                Value::Int64(n) => i16::try_from(n)
-                    .map(Value::Int16)
-                    .map_err(|_| (Value::Int64(n), CastError::NumericOutOfRange)),
-                Value::Float32(n) => cast_float_to_int(n as f64, i16::MIN as i64, i16::MAX as i64)
-                    .map(|i| Value::Int16(i as i16))
-                    .map_err(|e| (Value::Float32(n), e)),
-                Value::Float64(n) => cast_float_to_int(n, i16::MIN as i64, i16::MAX as i64)
-                    .map(|i| Value::Int16(i as i16))
-                    .map_err(|e| (Value::Float64(n), e)),
+            Type::Smallint => match self {
+                Value::Smallint(_) => Ok(self),
+                Value::Integer(n) => i16::try_from(n)
+                    .map(Value::Smallint)
+                    .map_err(|_| (Value::Integer(n), CastError::NumericOutOfRange)),
+                Value::Bigint(n) => i16::try_from(n)
+                    .map(Value::Smallint)
+                    .map_err(|_| (Value::Bigint(n), CastError::NumericOutOfRange)),
+                Value::Real(n) => cast_float_to_int(n as f64, i16::MIN as i64, i16::MAX as i64)
+                    .map(|i| Value::Smallint(i as i16))
+                    .map_err(|e| (Value::Real(n), e)),
+                Value::DoublePrecision(n) => cast_float_to_int(n, i16::MIN as i64, i16::MAX as i64)
+                    .map(|i| Value::Smallint(i as i16))
+                    .map_err(|e| (Value::DoublePrecision(n), e)),
                 Value::Text(s) => match s.trim().parse::<i16>() {
-                    Ok(n) => Ok(Value::Int16(n)),
+                    Ok(n) => Ok(Value::Smallint(n)),
                     Err(_) => Err((Value::Text(s), CastError::Invalid)),
                 },
-                Value::Boolean(b) => Ok(Value::Int16(if b { 1 } else { 0 })),
+                Value::Boolean(b) => Ok(Value::Smallint(if b { 1 } else { 0 })),
                 other => Err((other, CastError::Invalid)),
             },
-            Type::Int4 => match self {
-                Value::Int32(_) => Ok(self),
-                Value::Int16(n) => Ok(Value::Int32(n as i32)),
-                Value::Int64(n) => i32::try_from(n)
-                    .map(Value::Int32)
-                    .map_err(|_| (Value::Int64(n), CastError::NumericOutOfRange)),
-                Value::Float32(n) => cast_float_to_int(n as f64, i32::MIN as i64, i32::MAX as i64)
-                    .map(|i| Value::Int32(i as i32))
-                    .map_err(|e| (Value::Float32(n), e)),
-                Value::Float64(n) => cast_float_to_int(n, i32::MIN as i64, i32::MAX as i64)
-                    .map(|i| Value::Int32(i as i32))
-                    .map_err(|e| (Value::Float64(n), e)),
+            Type::Integer => match self {
+                Value::Integer(_) => Ok(self),
+                Value::Smallint(n) => Ok(Value::Integer(n as i32)),
+                Value::Bigint(n) => i32::try_from(n)
+                    .map(Value::Integer)
+                    .map_err(|_| (Value::Bigint(n), CastError::NumericOutOfRange)),
+                Value::Real(n) => cast_float_to_int(n as f64, i32::MIN as i64, i32::MAX as i64)
+                    .map(|i| Value::Integer(i as i32))
+                    .map_err(|e| (Value::Real(n), e)),
+                Value::DoublePrecision(n) => cast_float_to_int(n, i32::MIN as i64, i32::MAX as i64)
+                    .map(|i| Value::Integer(i as i32))
+                    .map_err(|e| (Value::DoublePrecision(n), e)),
                 Value::Text(s) => match s.trim().parse::<i32>() {
-                    Ok(n) => Ok(Value::Int32(n)),
+                    Ok(n) => Ok(Value::Integer(n)),
                     Err(_) => Err((Value::Text(s), CastError::Invalid)),
                 },
-                Value::Boolean(b) => Ok(Value::Int32(if b { 1 } else { 0 })),
+                Value::Boolean(b) => Ok(Value::Integer(if b { 1 } else { 0 })),
                 other => Err((other, CastError::Invalid)),
             },
-            Type::Int8 => match self {
-                Value::Int64(_) => Ok(self),
-                Value::Int16(n) => Ok(Value::Int64(n as i64)),
-                Value::Int32(n) => Ok(Value::Int64(n as i64)),
-                Value::Float32(n) => cast_float_to_int(n as f64, i64::MIN, i64::MAX)
-                    .map(Value::Int64)
-                    .map_err(|e| (Value::Float32(n), e)),
-                Value::Float64(n) => cast_float_to_int(n, i64::MIN, i64::MAX)
-                    .map(Value::Int64)
-                    .map_err(|e| (Value::Float64(n), e)),
+            Type::Bigint => match self {
+                Value::Bigint(_) => Ok(self),
+                Value::Smallint(n) => Ok(Value::Bigint(n as i64)),
+                Value::Integer(n) => Ok(Value::Bigint(n as i64)),
+                Value::Real(n) => cast_float_to_int(n as f64, i64::MIN, i64::MAX)
+                    .map(Value::Bigint)
+                    .map_err(|e| (Value::Real(n), e)),
+                Value::DoublePrecision(n) => cast_float_to_int(n, i64::MIN, i64::MAX)
+                    .map(Value::Bigint)
+                    .map_err(|e| (Value::DoublePrecision(n), e)),
                 Value::Text(s) => match s.trim().parse::<i64>() {
-                    Ok(n) => Ok(Value::Int64(n)),
+                    Ok(n) => Ok(Value::Bigint(n)),
                     Err(_) => Err((Value::Text(s), CastError::Invalid)),
                 },
-                Value::Boolean(b) => Ok(Value::Int64(if b { 1 } else { 0 })),
+                Value::Boolean(b) => Ok(Value::Bigint(if b { 1 } else { 0 })),
                 other => Err((other, CastError::Invalid)),
             },
-            Type::Float4 => match self {
-                Value::Float32(_) => Ok(self),
-                Value::Float64(n) => {
+            Type::Real => match self {
+                Value::Real(_) => Ok(self),
+                Value::DoublePrecision(n) => {
                     let result = n as f32;
                     if result.is_infinite() && !n.is_infinite() {
-                        Err((Value::Float64(n), CastError::NumericOutOfRange))
+                        Err((Value::DoublePrecision(n), CastError::NumericOutOfRange))
                     } else {
-                        Ok(Value::Float32(result))
+                        Ok(Value::Real(result))
                     }
                 }
-                Value::Int16(n) => Ok(Value::Float32(n as f32)),
-                Value::Int32(n) => Ok(Value::Float32(n as f32)),
-                Value::Int64(n) => Ok(Value::Float32(n as f32)),
+                Value::Smallint(n) => Ok(Value::Real(n as f32)),
+                Value::Integer(n) => Ok(Value::Real(n as f32)),
+                Value::Bigint(n) => Ok(Value::Real(n as f32)),
                 Value::Text(s) => match s.trim().parse::<f32>() {
-                    Ok(n) => Ok(Value::Float32(n)),
+                    Ok(n) => Ok(Value::Real(n)),
                     Err(_) => Err((Value::Text(s), CastError::Invalid)),
                 },
                 other => Err((other, CastError::Invalid)),
             },
-            Type::Float8 => match self {
-                Value::Float64(_) => Ok(self),
-                Value::Float32(n) => Ok(Value::Float64(n as f64)),
-                Value::Int16(n) => Ok(Value::Float64(n as f64)),
-                Value::Int32(n) => Ok(Value::Float64(n as f64)),
-                Value::Int64(n) => Ok(Value::Float64(n as f64)),
+            Type::DoublePrecision => match self {
+                Value::DoublePrecision(_) => Ok(self),
+                Value::Real(n) => Ok(Value::DoublePrecision(n as f64)),
+                Value::Smallint(n) => Ok(Value::DoublePrecision(n as f64)),
+                Value::Integer(n) => Ok(Value::DoublePrecision(n as f64)),
+                Value::Bigint(n) => Ok(Value::DoublePrecision(n as f64)),
                 Value::Text(s) => match s.trim().parse::<f64>() {
-                    Ok(n) => Ok(Value::Float64(n)),
+                    Ok(n) => Ok(Value::DoublePrecision(n)),
                     Err(_) => Err((Value::Text(s), CastError::Invalid)),
                 },
                 other => Err((other, CastError::Invalid)),
@@ -630,8 +630,8 @@ impl PartialOrd for Value {
     /// comparison involving NULL.
     ///
     /// Numeric types are promoted to a common wide type before comparison:
-    /// Int16/Int32 → Int64, Float32 → Float64, and if either operand is float
-    /// both are compared as Float64.
+    /// Smallint/Integer → Bigint, Real → DoublePrecision, and if either operand
+    /// s float both are compared as DoublePrecision.
     ///
     /// Float ordering follows NaN-aware total ordering: NaN is greater than all
     /// non-NaN values, and NaN == NaN.
@@ -647,10 +647,16 @@ impl PartialOrd for Value {
                 let l = self.to_wide_numeric()?;
                 let r = other.to_wide_numeric()?;
                 Some(match (l, r) {
-                    (WideNumeric::Int64(a), WideNumeric::Int64(b)) => a.cmp(&b),
-                    (WideNumeric::Float64(a), WideNumeric::Float64(b)) => compare_f64(a, b),
-                    (WideNumeric::Float64(a), WideNumeric::Int64(b)) => compare_f64(a, b as f64),
-                    (WideNumeric::Int64(a), WideNumeric::Float64(b)) => compare_f64(a as f64, b),
+                    (WideNumeric::Bigint(a), WideNumeric::Bigint(b)) => a.cmp(&b),
+                    (WideNumeric::DoublePrecision(a), WideNumeric::DoublePrecision(b)) => {
+                        compare_f64(a, b)
+                    }
+                    (WideNumeric::DoublePrecision(a), WideNumeric::Bigint(b)) => {
+                        compare_f64(a, b as f64)
+                    }
+                    (WideNumeric::Bigint(a), WideNumeric::DoublePrecision(b)) => {
+                        compare_f64(a as f64, b)
+                    }
                 })
             }
         }
@@ -666,11 +672,11 @@ mod tests {
         let types = [
             Type::Bool,
             Type::Bytea,
-            Type::Int2,
-            Type::Int4,
-            Type::Int8,
-            Type::Float4,
-            Type::Float8,
+            Type::Smallint,
+            Type::Integer,
+            Type::Bigint,
+            Type::Real,
+            Type::DoublePrecision,
             Type::Text,
             Type::Varchar,
             Type::Bpchar,
@@ -691,11 +697,11 @@ mod tests {
     #[test]
     fn test_type_fixed_size() {
         assert_eq!(Type::Bool.fixed_size(), Some(1));
-        assert_eq!(Type::Int2.fixed_size(), Some(2));
-        assert_eq!(Type::Int4.fixed_size(), Some(4));
-        assert_eq!(Type::Int8.fixed_size(), Some(8));
-        assert_eq!(Type::Float4.fixed_size(), Some(4));
-        assert_eq!(Type::Float8.fixed_size(), Some(8));
+        assert_eq!(Type::Smallint.fixed_size(), Some(2));
+        assert_eq!(Type::Integer.fixed_size(), Some(4));
+        assert_eq!(Type::Bigint.fixed_size(), Some(8));
+        assert_eq!(Type::Real.fixed_size(), Some(4));
+        assert_eq!(Type::DoublePrecision.fixed_size(), Some(8));
         assert_eq!(Type::Text.fixed_size(), None);
         assert_eq!(Type::Varchar.fixed_size(), None);
         assert_eq!(Type::Bpchar.fixed_size(), None);
@@ -705,20 +711,23 @@ mod tests {
     #[test]
     fn test_type_display() {
         assert_eq!(Type::Bool.to_string(), "boolean");
-        assert_eq!(Type::Int4.to_string(), "integer");
+        assert_eq!(Type::Integer.to_string(), "integer");
         assert_eq!(Type::Text.to_string(), "text");
-        assert_eq!(Type::Float8.to_string(), "double precision");
+        assert_eq!(Type::DoublePrecision.to_string(), "double precision");
     }
 
     #[test]
     fn test_value_data_type() {
         assert_eq!(Value::Null.ty(), None);
         assert_eq!(Value::Boolean(true).ty(), Some(Type::Bool));
-        assert_eq!(Value::Int16(0).ty(), Some(Type::Int2));
-        assert_eq!(Value::Int32(0).ty(), Some(Type::Int4));
-        assert_eq!(Value::Int64(0).ty(), Some(Type::Int8));
-        assert_eq!(Value::Float32(0.0).ty(), Some(Type::Float4));
-        assert_eq!(Value::Float64(0.0).ty(), Some(Type::Float8));
+        assert_eq!(Value::Smallint(0).ty(), Some(Type::Smallint));
+        assert_eq!(Value::Integer(0).ty(), Some(Type::Integer));
+        assert_eq!(Value::Bigint(0).ty(), Some(Type::Bigint));
+        assert_eq!(Value::Real(0.0).ty(), Some(Type::Real));
+        assert_eq!(
+            Value::DoublePrecision(0.0).ty(),
+            Some(Type::DoublePrecision)
+        );
         assert_eq!(Value::Text(String::new()).ty(), Some(Type::Text));
         assert_eq!(Value::Bytea(vec![]).ty(), Some(Type::Bytea));
     }
@@ -728,19 +737,19 @@ mod tests {
         let values = [
             Value::Boolean(true),
             Value::Boolean(false),
-            Value::Int16(0),
-            Value::Int16(i16::MIN),
-            Value::Int16(i16::MAX),
-            Value::Int32(0),
-            Value::Int32(i32::MIN),
-            Value::Int32(i32::MAX),
-            Value::Int64(0),
-            Value::Int64(i64::MIN),
-            Value::Int64(i64::MAX),
-            Value::Float32(0.0),
-            Value::Float32(std::f32::consts::PI),
-            Value::Float64(0.0),
-            Value::Float64(std::f64::consts::E),
+            Value::Smallint(0),
+            Value::Smallint(i16::MIN),
+            Value::Smallint(i16::MAX),
+            Value::Integer(0),
+            Value::Integer(i32::MIN),
+            Value::Integer(i32::MAX),
+            Value::Bigint(0),
+            Value::Bigint(i64::MIN),
+            Value::Bigint(i64::MAX),
+            Value::Real(0.0),
+            Value::Real(std::f32::consts::PI),
+            Value::DoublePrecision(0.0),
+            Value::DoublePrecision(std::f64::consts::E),
             Value::Text(String::new()),
             Value::Text("hello 日本語 🎉".into()),
             Value::Bytea(vec![]),
@@ -759,7 +768,7 @@ mod tests {
     #[test]
     fn test_null() {
         assert!(Value::Null.is_null());
-        assert!(!Value::Int32(0).is_null());
+        assert!(!Value::Integer(0).is_null());
         assert_eq!(Value::Null.serialized_size(), 0);
         assert_eq!(Value::Null.ty(), None);
         assert_eq!(Value::Null.serialize(&mut [0u8; 1]).unwrap(), 0);
@@ -781,7 +790,7 @@ mod tests {
     fn test_buffer_too_small() {
         let mut buf = [0u8; 2];
         assert!(matches!(
-            Value::Int32(42).serialize(&mut buf),
+            Value::Integer(42).serialize(&mut buf),
             Err(SerializationError::BufferTooSmall {
                 required: 4,
                 available: 2
@@ -804,8 +813,8 @@ mod tests {
     fn test_to_text() {
         assert_eq!(Value::Boolean(true).to_text(), "t");
         assert_eq!(Value::Boolean(false).to_text(), "f");
-        assert_eq!(Value::Int32(42).to_text(), "42");
-        assert_eq!(Value::Int64(100).to_text(), "100");
+        assert_eq!(Value::Integer(42).to_text(), "42");
+        assert_eq!(Value::Bigint(100).to_text(), "100");
         assert_eq!(Value::Text("hello".into()).to_text(), "hello");
         assert_eq!(Value::Bytea(vec![0xDE, 0xAD]).to_text(), "\\xdead");
     }
@@ -818,15 +827,15 @@ mod tests {
     fn test_ordering_same_type_integers() {
         use std::cmp::Ordering;
         assert_eq!(
-            Value::Int64(5).partial_cmp(&Value::Int64(5)),
+            Value::Bigint(5).partial_cmp(&Value::Bigint(5)),
             Some(Ordering::Equal)
         );
         assert_eq!(
-            Value::Int64(3).partial_cmp(&Value::Int64(5)),
+            Value::Bigint(3).partial_cmp(&Value::Bigint(5)),
             Some(Ordering::Less)
         );
         assert_eq!(
-            Value::Int64(5).partial_cmp(&Value::Int64(3)),
+            Value::Bigint(5).partial_cmp(&Value::Bigint(3)),
             Some(Ordering::Greater)
         );
     }
@@ -874,15 +883,15 @@ mod tests {
     fn test_ordering_mixed_int_float() {
         use std::cmp::Ordering;
         assert_eq!(
-            Value::Int64(5).partial_cmp(&Value::Float64(5.0)),
+            Value::Bigint(5).partial_cmp(&Value::DoublePrecision(5.0)),
             Some(Ordering::Equal)
         );
         assert_eq!(
-            Value::Int64(5).partial_cmp(&Value::Float64(5.5)),
+            Value::Bigint(5).partial_cmp(&Value::DoublePrecision(5.5)),
             Some(Ordering::Less)
         );
         assert_eq!(
-            Value::Float64(5.5).partial_cmp(&Value::Int64(5)),
+            Value::DoublePrecision(5.5).partial_cmp(&Value::Bigint(5)),
             Some(Ordering::Greater)
         );
     }
@@ -891,11 +900,11 @@ mod tests {
     fn test_ordering_cross_int_widths() {
         use std::cmp::Ordering;
         assert_eq!(
-            Value::Int16(5).partial_cmp(&Value::Int64(5)),
+            Value::Smallint(5).partial_cmp(&Value::Bigint(5)),
             Some(Ordering::Equal)
         );
         assert_eq!(
-            Value::Int32(3).partial_cmp(&Value::Int64(5)),
+            Value::Integer(3).partial_cmp(&Value::Bigint(5)),
             Some(Ordering::Less)
         );
     }
@@ -903,10 +912,10 @@ mod tests {
     #[test]
     fn test_ordering_nan() {
         use std::cmp::Ordering;
-        let nan = Value::Float64(f64::NAN);
-        let inf = Value::Float64(f64::INFINITY);
-        let neg_inf = Value::Float64(f64::NEG_INFINITY);
-        let zero = Value::Float64(0.0);
+        let nan = Value::DoublePrecision(f64::NAN);
+        let inf = Value::DoublePrecision(f64::INFINITY);
+        let neg_inf = Value::DoublePrecision(f64::NEG_INFINITY);
+        let zero = Value::DoublePrecision(0.0);
 
         // NaN > any non-NaN value
         assert_eq!(nan.partial_cmp(&zero), Some(Ordering::Greater));
@@ -922,26 +931,29 @@ mod tests {
         assert_eq!(nan.partial_cmp(&nan), Some(Ordering::Equal));
 
         // Cross-type: NaN > integer (promotion)
-        assert_eq!(nan.partial_cmp(&Value::Int64(100)), Some(Ordering::Greater));
-        assert_eq!(Value::Int64(100).partial_cmp(&nan), Some(Ordering::Less));
+        assert_eq!(
+            nan.partial_cmp(&Value::Bigint(100)),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(Value::Bigint(100).partial_cmp(&nan), Some(Ordering::Less));
     }
 
     #[test]
     fn test_ordering_null() {
         // NULL is not comparable to anything
         assert_eq!(Value::Null.partial_cmp(&Value::Null), None);
-        assert_eq!(Value::Null.partial_cmp(&Value::Int64(1)), None);
-        assert_eq!(Value::Int64(1).partial_cmp(&Value::Null), None);
+        assert_eq!(Value::Null.partial_cmp(&Value::Bigint(1)), None);
+        assert_eq!(Value::Bigint(1).partial_cmp(&Value::Null), None);
     }
 
     #[test]
     fn test_ordering_incompatible_types() {
         // Different type families are not comparable
         assert_eq!(
-            Value::Text("abc".into()).partial_cmp(&Value::Int64(1)),
+            Value::Text("abc".into()).partial_cmp(&Value::Bigint(1)),
             None
         );
-        assert_eq!(Value::Boolean(true).partial_cmp(&Value::Int64(1)), None);
+        assert_eq!(Value::Boolean(true).partial_cmp(&Value::Bigint(1)), None);
         assert_eq!(
             Value::Boolean(true).partial_cmp(&Value::Text("true".into())),
             None
@@ -956,11 +968,11 @@ mod tests {
     fn test_cast_null_passthrough() {
         for ty in [
             Type::Bool,
-            Type::Int2,
-            Type::Int4,
-            Type::Int8,
-            Type::Float4,
-            Type::Float8,
+            Type::Smallint,
+            Type::Integer,
+            Type::Bigint,
+            Type::Real,
+            Type::DoublePrecision,
             Type::Text,
         ] {
             assert!(
@@ -995,42 +1007,46 @@ mod tests {
 
     #[test]
     fn test_cast_int_narrowing_overflow() {
-        // Int64 → Int16: out of range
+        // Bigint → Smallint: out of range
         assert!(matches!(
-            Value::Int64(70000).cast(&Type::Int2),
+            Value::Bigint(70000).cast(&Type::Smallint),
             Err((_, CastError::NumericOutOfRange))
         ));
         assert!(matches!(
-            Value::Int64(-70000).cast(&Type::Int2),
+            Value::Bigint(-70000).cast(&Type::Smallint),
             Err((_, CastError::NumericOutOfRange))
         ));
-        // Int32 → Int16: out of range
+        // Integer → Smallint: out of range
         assert!(matches!(
-            Value::Int32(70000).cast(&Type::Int2),
+            Value::Integer(70000).cast(&Type::Smallint),
             Err((_, CastError::NumericOutOfRange))
         ));
-        // Int64 → Int32: out of range
+        // Bigint → Integer: out of range
         assert!(matches!(
-            Value::Int64(3_000_000_000).cast(&Type::Int4),
+            Value::Bigint(3_000_000_000).cast(&Type::Integer),
             Err((_, CastError::NumericOutOfRange))
         ));
 
         // Boundary values should succeed
         assert_eq!(
-            Value::Int64(i16::MAX as i64).cast(&Type::Int2).unwrap(),
-            Value::Int16(i16::MAX)
+            Value::Bigint(i16::MAX as i64)
+                .cast(&Type::Smallint)
+                .unwrap(),
+            Value::Smallint(i16::MAX)
         );
         assert_eq!(
-            Value::Int64(i16::MIN as i64).cast(&Type::Int2).unwrap(),
-            Value::Int16(i16::MIN)
+            Value::Bigint(i16::MIN as i64)
+                .cast(&Type::Smallint)
+                .unwrap(),
+            Value::Smallint(i16::MIN)
         );
         assert_eq!(
-            Value::Int64(i32::MAX as i64).cast(&Type::Int4).unwrap(),
-            Value::Int32(i32::MAX)
+            Value::Bigint(i32::MAX as i64).cast(&Type::Integer).unwrap(),
+            Value::Integer(i32::MAX)
         );
         assert_eq!(
-            Value::Int64(i32::MIN as i64).cast(&Type::Int4).unwrap(),
-            Value::Int32(i32::MIN)
+            Value::Bigint(i32::MIN as i64).cast(&Type::Integer).unwrap(),
+            Value::Integer(i32::MIN)
         );
     }
 
@@ -1038,24 +1054,24 @@ mod tests {
     fn test_cast_float_to_int_rounds() {
         // Float rounds to nearest integer (ties away from zero)
         assert_eq!(
-            Value::Float64(3.9).cast(&Type::Int8).unwrap(),
-            Value::Int64(4)
+            Value::DoublePrecision(3.9).cast(&Type::Bigint).unwrap(),
+            Value::Bigint(4)
         );
         assert_eq!(
-            Value::Float64(-3.9).cast(&Type::Int8).unwrap(),
-            Value::Int64(-4)
+            Value::DoublePrecision(-3.9).cast(&Type::Bigint).unwrap(),
+            Value::Bigint(-4)
         );
         assert_eq!(
-            Value::Float64(0.5).cast(&Type::Int8).unwrap(),
-            Value::Int64(1)
+            Value::DoublePrecision(0.5).cast(&Type::Bigint).unwrap(),
+            Value::Bigint(1)
         );
         assert_eq!(
-            Value::Float64(-0.5).cast(&Type::Int8).unwrap(),
-            Value::Int64(-1)
+            Value::DoublePrecision(-0.5).cast(&Type::Bigint).unwrap(),
+            Value::Bigint(-1)
         );
         assert_eq!(
-            Value::Float64(2.4).cast(&Type::Int4).unwrap(),
-            Value::Int32(2)
+            Value::DoublePrecision(2.4).cast(&Type::Integer).unwrap(),
+            Value::Integer(2)
         );
     }
 
@@ -1063,64 +1079,68 @@ mod tests {
     fn test_cast_float_to_int_overflow() {
         // Float too large for integer type
         assert!(matches!(
-            Value::Float64(1e100).cast(&Type::Int8),
+            Value::DoublePrecision(1e100).cast(&Type::Bigint),
             Err((_, CastError::NumericOutOfRange))
         ));
         assert!(matches!(
-            Value::Float64(f64::INFINITY).cast(&Type::Int8),
+            Value::DoublePrecision(f64::INFINITY).cast(&Type::Bigint),
             Err((_, CastError::NumericOutOfRange))
         ));
         assert!(matches!(
-            Value::Float64(f64::NAN).cast(&Type::Int4),
+            Value::DoublePrecision(f64::NAN).cast(&Type::Integer),
             Err((_, CastError::NumericOutOfRange))
         ));
         assert!(matches!(
-            Value::Float64(40000.0).cast(&Type::Int2),
+            Value::DoublePrecision(40000.0).cast(&Type::Smallint),
             Err((_, CastError::NumericOutOfRange))
         ));
     }
 
     #[test]
-    fn test_cast_float64_to_float32_overflow() {
-        // Float64 value too large for Float32
+    fn test_cast_double_precision_to_real_overflow() {
+        // DoublePrecision value too large for Real
         assert!(matches!(
-            Value::Float64(1.7976931348623157e308).cast(&Type::Float4),
+            Value::DoublePrecision(1.7976931348623157e308).cast(&Type::Real),
             Err((_, CastError::NumericOutOfRange))
         ));
         // Infinity is preserved (not an overflow)
         assert_eq!(
-            Value::Float64(f64::INFINITY).cast(&Type::Float4).unwrap(),
-            Value::Float32(f32::INFINITY)
+            Value::DoublePrecision(f64::INFINITY)
+                .cast(&Type::Real)
+                .unwrap(),
+            Value::Real(f32::INFINITY)
         );
         // NaN is preserved
-        let result = Value::Float64(f64::NAN).cast(&Type::Float4).unwrap();
-        assert!(matches!(result, Value::Float32(n) if n.is_nan()));
+        let result = Value::DoublePrecision(f64::NAN).cast(&Type::Real).unwrap();
+        assert!(matches!(result, Value::Real(n) if n.is_nan()));
     }
 
     #[test]
     fn test_cast_text_to_numeric() {
         assert_eq!(
-            Value::Text("42".into()).cast(&Type::Int4).unwrap(),
-            Value::Int32(42)
+            Value::Text("42".into()).cast(&Type::Integer).unwrap(),
+            Value::Integer(42)
         );
         assert_eq!(
-            Value::Text(" -7 ".into()).cast(&Type::Int8).unwrap(),
-            Value::Int64(-7)
+            Value::Text(" -7 ".into()).cast(&Type::Bigint).unwrap(),
+            Value::Bigint(-7)
         );
         assert_eq!(
-            Value::Text("3.14".into()).cast(&Type::Float8).unwrap(),
-            Value::Float64(3.14)
+            Value::Text("3.14".into())
+                .cast(&Type::DoublePrecision)
+                .unwrap(),
+            Value::DoublePrecision(3.14)
         );
     }
 
     #[test]
     fn test_cast_text_to_numeric_invalid() {
         assert!(matches!(
-            Value::Text("abc".into()).cast(&Type::Int4),
+            Value::Text("abc".into()).cast(&Type::Integer),
             Err((_, CastError::Invalid))
         ));
         assert!(matches!(
-            Value::Text("".into()).cast(&Type::Int8),
+            Value::Text("".into()).cast(&Type::Bigint),
             Err((_, CastError::Invalid))
         ));
     }
@@ -1128,7 +1148,7 @@ mod tests {
     #[test]
     fn test_cast_to_text() {
         assert_eq!(
-            Value::Int64(42).cast(&Type::Text).unwrap(),
+            Value::Bigint(42).cast(&Type::Text).unwrap(),
             Value::Text("42".into())
         );
         assert_eq!(
@@ -1136,7 +1156,7 @@ mod tests {
             Value::Text("t".into())
         );
         assert_eq!(
-            Value::Float64(3.14).cast(&Type::Text).unwrap(),
+            Value::DoublePrecision(3.14).cast(&Type::Text).unwrap(),
             Value::Text("3.14".into())
         );
     }
@@ -1144,14 +1164,14 @@ mod tests {
     #[test]
     fn test_cast_to_varchar() {
         assert_eq!(
-            Value::Int64(42).cast(&Type::Varchar).unwrap(),
+            Value::Bigint(42).cast(&Type::Varchar).unwrap(),
             Value::Text("42".into())
         );
     }
 
     #[test]
     fn test_cast_returns_original_value_on_error() {
-        let Err((original, err)) = Value::Text("not_a_number".into()).cast(&Type::Int4) else {
+        let Err((original, err)) = Value::Text("not_a_number".into()).cast(&Type::Integer) else {
             panic!("expected error");
         };
         assert_eq!(original, Value::Text("not_a_number".into()));

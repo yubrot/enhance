@@ -371,7 +371,7 @@ mod tests {
                     table_oid: 1,
                     column_id: 1,
                 }),
-                data_type: Type::Int8,
+                data_type: Type::Bigint,
             },
             ColumnDesc {
                 name: "name".to_string(),
@@ -389,7 +389,7 @@ mod tests {
                     table_oid: 2,
                     column_id: 1,
                 }),
-                data_type: Type::Int8,
+                data_type: Type::Bigint,
             },
             ColumnDesc {
                 name: "user_id".to_string(),
@@ -398,7 +398,7 @@ mod tests {
                     table_oid: 2,
                     column_id: 2,
                 }),
-                data_type: Type::Int8,
+                data_type: Type::Bigint,
             },
         ]
     }

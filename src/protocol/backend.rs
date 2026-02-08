@@ -484,7 +484,7 @@ mod tests {
                     name: "col".to_string(),
                     table_oid: 0,
                     column_id: 0,
-                    type_oid: Type::Int4.oid(),
+                    type_oid: Type::Integer.oid(),
                     type_size: 4,
                     type_modifier: -1,
                     format_code: FormatCode::Text,
@@ -521,7 +521,7 @@ mod tests {
             values: vec![
                 DataValue::Data(b"hello".to_vec()), // non-empty value
                 DataValue::Data(vec![]),            // empty value
-                DataValue::Null,                      // NULL
+                DataValue::Null,                    // NULL
             ],
         };
         let buf = encode_message(msg);
@@ -593,14 +593,14 @@ mod tests {
     #[test]
     fn test_write_parameter_description() {
         let msg = BackendMessage::ParameterDescription {
-            param_types: vec![Type::Int4.oid(), Type::Text.oid(), Type::Varchar.oid()],
+            param_types: vec![Type::Integer.oid(), Type::Text.oid(), Type::Varchar.oid()],
         };
         let buf = encode_message(msg);
 
         assert_eq!(buf[0], b't');
         assert_eq!(read_i32(&buf, 1), 18); // 4 + 2 + 3*4
         assert_eq!(read_i16(&buf, 5), 3); // param count
-        assert_eq!(read_i32(&buf, 7), Type::Int4.oid());
+        assert_eq!(read_i32(&buf, 7), Type::Integer.oid());
         assert_eq!(read_i32(&buf, 11), Type::Text.oid());
         assert_eq!(read_i32(&buf, 15), Type::Varchar.oid());
     }

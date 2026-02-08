@@ -280,20 +280,20 @@ impl DataType {
 
     /// Converts this SQL data type to the corresponding database [`Type`].
     ///
-    /// SERIAL columns are stored as INT4 with a linked sequence.
+    /// SERIAL columns are stored as INTEGER with a linked sequence.
     pub fn to_type(&self) -> Type {
         match self {
             DataType::Boolean => Type::Bool,
-            DataType::Smallint => Type::Int2,
-            DataType::Integer => Type::Int4,
-            DataType::Bigint => Type::Int8,
-            DataType::Real => Type::Float4,
-            DataType::DoublePrecision => Type::Float8,
+            DataType::Smallint => Type::Smallint,
+            DataType::Integer => Type::Integer,
+            DataType::Bigint => Type::Bigint,
+            DataType::Real => Type::Real,
+            DataType::DoublePrecision => Type::DoublePrecision,
             DataType::Text => Type::Text,
             DataType::Varchar(_) => Type::Varchar,
             DataType::Bytea => Type::Bytea,
-            // SERIAL is stored as INT4 internally; sequence handles auto-increment
-            DataType::Serial => Type::Int4,
+            // SERIAL is stored as INTEGER internally; sequence handles auto-increment
+            DataType::Serial => Type::Integer,
         }
     }
 }
@@ -591,16 +591,16 @@ mod tests {
     #[test]
     fn test_data_type_to_type() {
         assert_eq!(DataType::Boolean.to_type(), Type::Bool);
-        assert_eq!(DataType::Smallint.to_type(), Type::Int2);
-        assert_eq!(DataType::Integer.to_type(), Type::Int4);
-        assert_eq!(DataType::Bigint.to_type(), Type::Int8);
-        assert_eq!(DataType::Real.to_type(), Type::Float4);
-        assert_eq!(DataType::DoublePrecision.to_type(), Type::Float8);
+        assert_eq!(DataType::Smallint.to_type(), Type::Smallint);
+        assert_eq!(DataType::Integer.to_type(), Type::Integer);
+        assert_eq!(DataType::Bigint.to_type(), Type::Bigint);
+        assert_eq!(DataType::Real.to_type(), Type::Real);
+        assert_eq!(DataType::DoublePrecision.to_type(), Type::DoublePrecision);
         assert_eq!(DataType::Text.to_type(), Type::Text);
         assert_eq!(DataType::Varchar(Some(255)).to_type(), Type::Varchar);
         assert_eq!(DataType::Bytea.to_type(), Type::Bytea);
         // SERIAL is stored as INT4
-        assert_eq!(DataType::Serial.to_type(), Type::Int4);
+        assert_eq!(DataType::Serial.to_type(), Type::Integer);
     }
 
     #[test]

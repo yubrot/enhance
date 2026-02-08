@@ -295,10 +295,7 @@ mod tests {
         else {
             panic!("expected CreateTable");
         };
-        db.catalog()
-            .create_table(txid, cid, &stmt)
-            .await
-            .unwrap();
+        db.catalog().create_table(txid, cid, &stmt).await.unwrap();
         db.tx_manager().commit(txid).unwrap();
 
         let txid = db.tx_manager().begin();
@@ -315,7 +312,7 @@ mod tests {
             let page = db.pool().fetch_page_mut(first_page, true).await.unwrap();
             let mut heap = HeapPage::new(page);
             for v in values {
-                heap.insert(&Record::new(vec![Value::Int64(v)]), txid, cid)
+                heap.insert(&Record::new(vec![Value::Bigint(v)]), txid, cid)
                     .unwrap();
             }
         }
@@ -338,10 +335,7 @@ mod tests {
         else {
             panic!("expected CreateTable");
         };
-        db.catalog()
-            .create_table(txid, cid, &stmt)
-            .await
-            .unwrap();
+        db.catalog().create_table(txid, cid, &stmt).await.unwrap();
         db.tx_manager().commit(txid).unwrap();
 
         let txid = db.tx_manager().begin();
@@ -358,7 +352,7 @@ mod tests {
             let page = db.pool().fetch_page_mut(first_page, true).await.unwrap();
             let mut heap = HeapPage::new(page);
             for (id, name) in rows {
-                let record = Record::new(vec![Value::Int64(id), Value::Text(name.into())]);
+                let record = Record::new(vec![Value::Bigint(id), Value::Text(name.into())]);
                 heap.insert(&record, txid, cid).unwrap();
             }
         }
@@ -378,7 +372,7 @@ mod tests {
         ColumnDesc {
             name: name.to_string(),
             source: None,
-            data_type: Type::Int8,
+            data_type: Type::Bigint,
         }
     }
 
@@ -399,21 +393,21 @@ mod tests {
             "test".to_string(),
             vec![int_col("id")],
             ctx,
-            vec![Type::Int8],
+            vec![Type::Bigint],
             first_page,
         ));
 
         assert_eq!(
             node.next().await.unwrap().unwrap().record.values,
-            vec![Value::Int64(1)]
+            vec![Value::Bigint(1)]
         );
         assert_eq!(
             node.next().await.unwrap().unwrap().record.values,
-            vec![Value::Int64(2)]
+            vec![Value::Bigint(2)]
         );
         assert_eq!(
             node.next().await.unwrap().unwrap().record.values,
-            vec![Value::Int64(3)]
+            vec![Value::Bigint(3)]
         );
         assert!(node.next().await.unwrap().is_none());
         assert!(node.next().await.unwrap().is_none()); // Idempotent
@@ -427,7 +421,7 @@ mod tests {
             "test".to_string(),
             vec![int_col("id")],
             ctx,
-            vec![Type::Int8],
+            vec![Type::Bigint],
             first_page,
         ));
 
@@ -437,11 +431,11 @@ mod tests {
 
         assert_eq!(
             node.next().await.unwrap().unwrap().record.values,
-            vec![Value::Int64(3)]
+            vec![Value::Bigint(3)]
         );
         assert_eq!(
             node.next().await.unwrap().unwrap().record.values,
-            vec![Value::Int64(4)]
+            vec![Value::Bigint(4)]
         );
         assert!(node.next().await.unwrap().is_none());
     }
@@ -454,7 +448,7 @@ mod tests {
             "test".to_string(),
             vec![int_col("id")],
             ctx,
-            vec![Type::Int8],
+            vec![Type::Bigint],
             first_page,
         ));
 
@@ -482,7 +476,7 @@ mod tests {
                 },
             ],
             ctx,
-            vec![Type::Int8, Type::Text],
+            vec![Type::Bigint, Type::Text],
             first_page,
         ));
 
@@ -524,7 +518,7 @@ mod tests {
             table_name: "test".to_string(),
             table_id: 1,
             first_page,
-            schema: vec![Type::Int8],
+            schema: vec![Type::Bigint],
             columns: vec![int_col("id")],
         };
 
@@ -532,11 +526,11 @@ mod tests {
 
         assert_eq!(
             node.next().await.unwrap().unwrap().record.values,
-            vec![Value::Int64(10)]
+            vec![Value::Bigint(10)]
         );
         assert_eq!(
             node.next().await.unwrap().unwrap().record.values,
-            vec![Value::Int64(20)]
+            vec![Value::Bigint(20)]
         );
         assert!(node.next().await.unwrap().is_none());
     }
@@ -551,7 +545,7 @@ mod tests {
                 table_name: "test".to_string(),
                 table_id: 1,
                 first_page,
-                schema: vec![Type::Int8],
+                schema: vec![Type::Bigint],
                 columns: vec![int_col("id")],
             }),
             predicate: bind_expr("id > 2", &[int_col("id")]),
@@ -561,7 +555,7 @@ mod tests {
 
         assert_eq!(
             node.next().await.unwrap().unwrap().record.values,
-            vec![Value::Int64(3)]
+            vec![Value::Bigint(3)]
         );
         assert!(node.next().await.unwrap().is_none());
     }
@@ -576,7 +570,7 @@ mod tests {
                 table_name: "test".to_string(),
                 table_id: 1,
                 first_page,
-                schema: vec![Type::Int8, Type::Text],
+                schema: vec![Type::Bigint, Type::Text],
                 columns: vec![
                     int_col("id"),
                     ColumnDesc {
@@ -621,7 +615,7 @@ mod tests {
         let mut node = plan.prepare_for_execute(&ctx);
 
         let tuple = node.next().await.unwrap().unwrap();
-        assert_eq!(tuple.record.values, vec![Value::Int64(42)]);
+        assert_eq!(tuple.record.values, vec![Value::Bigint(42)]);
         assert!(node.next().await.unwrap().is_none());
     }
 }

@@ -781,7 +781,7 @@ mod tests {
         use crate::tx::{CommandId, TxId};
 
         let mut page = create_heap_page();
-        let record = Record::new(vec![Value::Int32(42), Value::Text("hello".to_string())]);
+        let record = Record::new(vec![Value::Integer(42), Value::Text("hello".to_string())]);
 
         let slot = page
             .insert(&record, TxId::new(1), CommandId::FIRST)
@@ -789,7 +789,7 @@ mod tests {
         assert_eq!(slot, 0);
 
         // Verify we can read it back
-        let schema = [Type::Int4, Type::Text];
+        let schema = [Type::Integer, Type::Text];
         let (header, read_record) = page.get(slot, &schema).unwrap();
 
         assert_eq!(header.xmin, TxId::new(1));
@@ -804,7 +804,7 @@ mod tests {
         use crate::datum::Type;
 
         let page = create_heap_page();
-        let schema = [Type::Int4];
+        let schema = [Type::Integer];
 
         // Slot doesn't exist
         assert!(page.get(0, &schema).is_none());
@@ -817,7 +817,7 @@ mod tests {
         use crate::tx::{CommandId, Infomask, TupleHeader, TxId};
 
         let mut page = create_heap_page();
-        let record = Record::new(vec![Value::Int32(100)]);
+        let record = Record::new(vec![Value::Integer(100)]);
 
         let slot = page
             .insert(&record, TxId::new(1), CommandId::FIRST)
@@ -834,7 +834,7 @@ mod tests {
         page.update_header(slot, new_header).unwrap();
 
         // Read back and verify
-        let schema = [Type::Int4];
+        let schema = [Type::Integer];
         let (header, read_record) = page.get(slot, &schema).unwrap();
 
         assert_eq!(header.xmin, TxId::new(1));
@@ -852,9 +852,9 @@ mod tests {
         let mut page = create_heap_page();
 
         // Insert multiple tuples
-        let record1 = Record::new(vec![Value::Int32(1)]);
-        let record2 = Record::new(vec![Value::Int32(2)]);
-        let record3 = Record::new(vec![Value::Int32(3)]);
+        let record1 = Record::new(vec![Value::Integer(1)]);
+        let record2 = Record::new(vec![Value::Integer(2)]);
+        let record3 = Record::new(vec![Value::Integer(3)]);
 
         page.insert(&record1, TxId::new(1), CommandId::FIRST)
             .unwrap();
@@ -864,7 +864,7 @@ mod tests {
             .unwrap();
 
         // Iterate and collect
-        let schema = [Type::Int4];
+        let schema = [Type::Integer];
         let tuples: Vec<_> = page.scan(&schema).collect();
 
         assert_eq!(tuples.len(), 3);
@@ -889,7 +889,7 @@ mod tests {
 
         let mut page = create_heap_page();
         let record = Record::new(vec![
-            Value::Int32(42),
+            Value::Integer(42),
             Value::Null,
             Value::Text("test".to_string()),
         ]);
@@ -899,7 +899,7 @@ mod tests {
             .unwrap();
 
         // Read back and verify element-by-element (Value::Null != Value::Null)
-        let schema = [Type::Int4, Type::Int4, Type::Text];
+        let schema = [Type::Integer, Type::Integer, Type::Text];
         let (_, read_record) = page.get(slot, &schema).unwrap();
         assert_eq!(read_record.len(), record.len());
         assert_eq!(read_record.values[0], record.values[0]);
@@ -929,17 +929,17 @@ mod tests {
         let mut page = create_heap_page();
 
         // Insert initial record
-        let record = Record::new(vec![Value::Int32(1), Value::Int64(100)]);
+        let record = Record::new(vec![Value::Integer(1), Value::Bigint(100)]);
         let slot = page
             .insert(&record, TxId::new(1), CommandId::FIRST)
             .unwrap();
 
         // Update in-place with same-size record
-        let updated = Record::new(vec![Value::Int32(1), Value::Int64(200)]);
+        let updated = Record::new(vec![Value::Integer(1), Value::Bigint(200)]);
         page.update_record_in_place(slot, &updated).unwrap();
 
         // Verify update
-        let schema = [Type::Int4, Type::Int8];
+        let schema = [Type::Integer, Type::Bigint];
         let (header, read_record) = page.get(slot, &schema).unwrap();
 
         // Header unchanged
@@ -959,13 +959,13 @@ mod tests {
         let mut page = create_heap_page();
 
         // Insert initial record
-        let record = Record::new(vec![Value::Int32(1)]);
+        let record = Record::new(vec![Value::Integer(1)]);
         let slot = page
             .insert(&record, TxId::new(1), CommandId::FIRST)
             .unwrap();
 
         // Try to update with different-size record
-        let updated = Record::new(vec![Value::Int32(1), Value::Int64(200)]);
+        let updated = Record::new(vec![Value::Integer(1), Value::Bigint(200)]);
         let result = page.update_record_in_place(slot, &updated);
 
         assert!(matches!(result, Err(HeapError::RecordSizeMismatch { .. })));

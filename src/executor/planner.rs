@@ -127,9 +127,7 @@ async fn build_seq_scan_plan<S: Storage, R: Replacer>(
         })?;
 
     // Get column metadata
-    let column_infos = catalog
-        .get_columns(snapshot, table_info.table_id)
-        .await?;
+    let column_infos = catalog.get_columns(snapshot, table_info.table_id).await?;
 
     // Build schema (data types) for record deserialization
     let schema: Vec<Type> = column_infos.iter().map(|c| c.data_type).collect();
@@ -295,8 +293,8 @@ fn infer_data_type(expr: &Expr, columns: &[ColumnDesc]) -> Type {
                 Err(_) => Type::Text,
             }
         }
-        Expr::Integer(_) => Type::Int8,
-        Expr::Float(_) => Type::Float8,
+        Expr::Integer(_) => Type::Bigint,
+        Expr::Float(_) => Type::DoublePrecision,
         Expr::Boolean(_) => Type::Bool,
         Expr::String(_) => Type::Text,
         Expr::Null => Type::Text,
@@ -485,39 +483,29 @@ mod tests {
     async fn test_infer_data_type_literals() {
         let (db, snapshot) = setup_test_db().await;
 
-        // Integer literal → Int8
+        // Integer literal → bigint
         let select = parse_select("SELECT 42");
-        let plan = plan_select(&select, db.catalog(), &snapshot)
-            .await
-            .unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::Int8);
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::Bigint);
 
-        // Float literal → Float8
+        // Float literal → DoublePrecision
         let select = parse_select("SELECT 3.14");
-        let plan = plan_select(&select, db.catalog(), &snapshot)
-            .await
-            .unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::Float8);
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::DoublePrecision);
 
         // Boolean literal → Bool
         let select = parse_select("SELECT TRUE");
-        let plan = plan_select(&select, db.catalog(), &snapshot)
-            .await
-            .unwrap();
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
         assert_eq!(plan.columns()[0].data_type, Type::Bool);
 
         // String literal → Text
         let select = parse_select("SELECT 'hello'");
-        let plan = plan_select(&select, db.catalog(), &snapshot)
-            .await
-            .unwrap();
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
         assert_eq!(plan.columns()[0].data_type, Type::Text);
 
         // NULL → Text (fallback)
         let select = parse_select("SELECT NULL");
-        let plan = plan_select(&select, db.catalog(), &snapshot)
-            .await
-            .unwrap();
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
         assert_eq!(plan.columns()[0].data_type, Type::Text);
     }
 
@@ -527,66 +515,48 @@ mod tests {
 
         // Comparison → Bool
         let select = parse_select("SELECT 1 = 1");
-        let plan = plan_select(&select, db.catalog(), &snapshot)
-            .await
-            .unwrap();
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
         assert_eq!(plan.columns()[0].data_type, Type::Bool);
 
-        // Arithmetic → inherits left operand type (Int8)
+        // Arithmetic → inherits left operand type (Bigint)
         let select = parse_select("SELECT 1 + 2");
-        let plan = plan_select(&select, db.catalog(), &snapshot)
-            .await
-            .unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::Int8);
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::Bigint);
 
         // Concatenation → Text
         let select = parse_select("SELECT 'a' || 'b'");
-        let plan = plan_select(&select, db.catalog(), &snapshot)
-            .await
-            .unwrap();
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
         assert_eq!(plan.columns()[0].data_type, Type::Text);
 
         // IS NULL → Bool
         let select = parse_select("SELECT 1 IS NULL");
-        let plan = plan_select(&select, db.catalog(), &snapshot)
-            .await
-            .unwrap();
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
         assert_eq!(plan.columns()[0].data_type, Type::Bool);
 
         // IN list → Bool
         let select = parse_select("SELECT 1 IN (1, 2)");
-        let plan = plan_select(&select, db.catalog(), &snapshot)
-            .await
-            .unwrap();
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
         assert_eq!(plan.columns()[0].data_type, Type::Bool);
 
         // BETWEEN → Bool
         let select = parse_select("SELECT 1 BETWEEN 0 AND 2");
-        let plan = plan_select(&select, db.catalog(), &snapshot)
-            .await
-            .unwrap();
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
         assert_eq!(plan.columns()[0].data_type, Type::Bool);
 
         // LIKE → Bool
         let select = parse_select("SELECT 'a' LIKE '%'");
-        let plan = plan_select(&select, db.catalog(), &snapshot)
-            .await
-            .unwrap();
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
         assert_eq!(plan.columns()[0].data_type, Type::Bool);
 
         // CAST → target type
         let select = parse_select("SELECT CAST(1 AS TEXT)");
-        let plan = plan_select(&select, db.catalog(), &snapshot)
-            .await
-            .unwrap();
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
         assert_eq!(plan.columns()[0].data_type, Type::Text);
 
         // Unary minus → inherits operand type
         let select = parse_select("SELECT -42");
-        let plan = plan_select(&select, db.catalog(), &snapshot)
-            .await
-            .unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::Int8);
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::Bigint);
     }
 
     #[tokio::test]
@@ -595,15 +565,11 @@ mod tests {
 
         // Column reference preserves source type
         let select = parse_select("SELECT table_id FROM sys_tables");
-        let plan = plan_select(&select, db.catalog(), &snapshot)
-            .await
-            .unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::Int4);
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::Integer);
 
         let select = parse_select("SELECT table_name FROM sys_tables");
-        let plan = plan_select(&select, db.catalog(), &snapshot)
-            .await
-            .unwrap();
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
         assert_eq!(plan.columns()[0].data_type, Type::Text);
     }
 

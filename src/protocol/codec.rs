@@ -30,7 +30,7 @@ pub fn get_cstring(src: &mut BytesMut) -> Result<String, ProtocolError> {
 /// Returns None if the value is SQL NULL (length = -1).
 /// Returns Some(Vec<u8>) if the value is present.
 ///
-/// Wire format: Int32 length (-1 for NULL, >= 0 for data), followed by data bytes if length >= 0
+/// Wire format: 4-byte length (-1 for NULL, >= 0 for data), followed by data bytes if length >= 0
 pub fn get_nullable_bytes(src: &mut BytesMut) -> Result<Option<Vec<u8>>, ProtocolError> {
     // Need at least 4 bytes for the length
     if src.len() < 4 {

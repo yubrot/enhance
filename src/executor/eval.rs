@@ -20,8 +20,8 @@ impl BoundExpr {
         match self {
             BoundExpr::Null => Ok(Value::Null),
             BoundExpr::Boolean(b) => Ok(Value::Boolean(*b)),
-            BoundExpr::Integer(n) => Ok(Value::Int64(*n)),
-            BoundExpr::Float(f) => Ok(Value::Float64(*f)),
+            BoundExpr::Integer(n) => Ok(Value::Bigint(*n)),
+            BoundExpr::Float(f) => Ok(Value::DoublePrecision(*f)),
             BoundExpr::String(s) => Ok(Value::Text(s.clone())),
 
             BoundExpr::Column { index, .. } => {
@@ -322,10 +322,16 @@ fn eval_arithmetic(
         });
     };
     Ok(match (left, right) {
-        (WideNumeric::Int64(a), WideNumeric::Int64(b)) => Value::Int64(int_op(a, b)?),
-        (WideNumeric::Float64(a), WideNumeric::Float64(b)) => Value::Float64(float_op(a, b)?),
-        (WideNumeric::Float64(a), WideNumeric::Int64(b)) => Value::Float64(float_op(a, b as f64)?),
-        (WideNumeric::Int64(a), WideNumeric::Float64(b)) => Value::Float64(float_op(a as f64, b)?),
+        (WideNumeric::Bigint(a), WideNumeric::Bigint(b)) => Value::Bigint(int_op(a, b)?),
+        (WideNumeric::DoublePrecision(a), WideNumeric::DoublePrecision(b)) => {
+            Value::DoublePrecision(float_op(a, b)?)
+        }
+        (WideNumeric::DoublePrecision(a), WideNumeric::Bigint(b)) => {
+            Value::DoublePrecision(float_op(a, b as f64)?)
+        }
+        (WideNumeric::Bigint(a), WideNumeric::DoublePrecision(b)) => {
+            Value::DoublePrecision(float_op(a as f64, b)?)
+        }
     })
 }
 
@@ -355,25 +361,25 @@ fn eval_unary_op(op: UnaryOperator, val: &Value) -> Result<Value, ExecutorError>
             }),
         },
         UnaryOperator::Minus => match val {
-            Value::Int16(n) => Ok(Value::Int64(-(*n as i64))),
-            Value::Int32(n) => Ok(Value::Int64(-(*n as i64))),
-            Value::Int64(n) => n
+            Value::Smallint(n) => Ok(Value::Bigint(-(*n as i64))),
+            Value::Integer(n) => Ok(Value::Bigint(-(*n as i64))),
+            Value::Bigint(n) => n
                 .checked_neg()
-                .map(Value::Int64)
+                .map(Value::Bigint)
                 .ok_or(ExecutorError::IntegerOverflow),
-            Value::Float32(n) => Ok(Value::Float64(-(*n as f64))),
-            Value::Float64(n) => Ok(Value::Float64(-n)),
+            Value::Real(n) => Ok(Value::DoublePrecision(-(*n as f64))),
+            Value::DoublePrecision(n) => Ok(Value::DoublePrecision(-n)),
             _ => Err(ExecutorError::TypeMismatch {
                 expected: "numeric".to_string(),
                 found: val.ty(),
             }),
         },
         UnaryOperator::Plus => match val {
-            Value::Int16(_)
-            | Value::Int32(_)
-            | Value::Int64(_)
-            | Value::Float32(_)
-            | Value::Float64(_) => Ok(val.clone()),
+            Value::Smallint(_)
+            | Value::Integer(_)
+            | Value::Bigint(_)
+            | Value::Real(_)
+            | Value::DoublePrecision(_) => Ok(val.clone()),
             _ => Err(ExecutorError::TypeMismatch {
                 expected: "numeric".to_string(),
                 found: val.ty(),
@@ -465,14 +471,14 @@ mod tests {
     #[test]
     fn test_evaluate_literals() {
         assert!(eval("NULL").unwrap().is_null());
-        assert_eq!(eval("42").unwrap(), Value::Int64(42));
+        assert_eq!(eval("42").unwrap(), Value::Bigint(42));
         assert_eq!(eval("TRUE").unwrap(), Value::Boolean(true));
     }
 
     #[test]
     fn test_evaluate_float_literal() {
-        assert_eq!(eval("3.14").unwrap(), Value::Float64(3.14));
-        assert_eq!(eval("0.0").unwrap(), Value::Float64(0.0));
+        assert_eq!(eval("3.14").unwrap(), Value::DoublePrecision(3.14));
+        assert_eq!(eval("0.0").unwrap(), Value::DoublePrecision(0.0));
     }
 
     #[test]
@@ -483,7 +489,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_column() {
-        let record = Record::new(vec![Value::Int64(1), Value::Text("alice".into())]);
+        let record = Record::new(vec![Value::Bigint(1), Value::Text("alice".into())]);
         assert_eq!(
             BoundExpr::Column {
                 index: 0,
@@ -491,7 +497,7 @@ mod tests {
             }
             .evaluate(&record)
             .unwrap(),
-            Value::Int64(1)
+            Value::Bigint(1)
         );
         assert_eq!(
             BoundExpr::Column {
@@ -506,7 +512,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_column_out_of_bounds() {
-        let record = Record::new(vec![Value::Int64(1)]);
+        let record = Record::new(vec![Value::Bigint(1)]);
         assert!(matches!(
             BoundExpr::Column {
                 index: 5,
@@ -619,27 +625,27 @@ mod tests {
 
     #[test]
     fn test_arithmetic_basic() {
-        assert_eq!(eval("3 + 4").unwrap(), Value::Int64(7));
-        assert_eq!(eval("10 - 3").unwrap(), Value::Int64(7));
-        assert_eq!(eval("6 * 7").unwrap(), Value::Int64(42));
-        assert_eq!(eval("15 / 4").unwrap(), Value::Int64(3));
-        assert_eq!(eval("17 % 5").unwrap(), Value::Int64(2));
+        assert_eq!(eval("3 + 4").unwrap(), Value::Bigint(7));
+        assert_eq!(eval("10 - 3").unwrap(), Value::Bigint(7));
+        assert_eq!(eval("6 * 7").unwrap(), Value::Bigint(42));
+        assert_eq!(eval("15 / 4").unwrap(), Value::Bigint(3));
+        assert_eq!(eval("17 % 5").unwrap(), Value::Bigint(2));
     }
 
     #[test]
     fn test_arithmetic_float() {
-        assert_eq!(eval("1.5 + 2.5").unwrap(), Value::Float64(4.0));
-        assert_eq!(eval("5.0 - 1.5").unwrap(), Value::Float64(3.5));
-        assert_eq!(eval("2.0 * 3.0").unwrap(), Value::Float64(6.0));
-        assert_eq!(eval("7.0 / 2.0").unwrap(), Value::Float64(3.5));
+        assert_eq!(eval("1.5 + 2.5").unwrap(), Value::DoublePrecision(4.0));
+        assert_eq!(eval("5.0 - 1.5").unwrap(), Value::DoublePrecision(3.5));
+        assert_eq!(eval("2.0 * 3.0").unwrap(), Value::DoublePrecision(6.0));
+        assert_eq!(eval("7.0 / 2.0").unwrap(), Value::DoublePrecision(3.5));
     }
 
     #[test]
     fn test_arithmetic_mixed_int_float() {
         // int + float promotes to float
-        assert_eq!(eval("1 + 2.5").unwrap(), Value::Float64(3.5));
-        assert_eq!(eval("2.5 + 1").unwrap(), Value::Float64(3.5));
-        assert_eq!(eval("10 * 0.5").unwrap(), Value::Float64(5.0));
+        assert_eq!(eval("1 + 2.5").unwrap(), Value::DoublePrecision(3.5));
+        assert_eq!(eval("2.5 + 1").unwrap(), Value::DoublePrecision(3.5));
+        assert_eq!(eval("10 * 0.5").unwrap(), Value::DoublePrecision(5.0));
     }
 
     #[test]
@@ -697,8 +703,8 @@ mod tests {
 
     #[test]
     fn test_unary_minus() {
-        assert_eq!(eval("-42").unwrap(), Value::Int64(-42));
-        assert_eq!(eval("-3.14").unwrap(), Value::Float64(-3.14));
+        assert_eq!(eval("-42").unwrap(), Value::Bigint(-42));
+        assert_eq!(eval("-3.14").unwrap(), Value::DoublePrecision(-3.14));
         // -NULL = NULL
         assert!(eval("-NULL").unwrap().is_null());
     }
@@ -730,8 +736,8 @@ mod tests {
 
     #[test]
     fn test_unary_plus() {
-        assert_eq!(eval("+42").unwrap(), Value::Int64(42));
-        assert_eq!(eval("+3.14").unwrap(), Value::Float64(3.14));
+        assert_eq!(eval("+42").unwrap(), Value::Bigint(42));
+        assert_eq!(eval("+3.14").unwrap(), Value::DoublePrecision(3.14));
         // +NULL = NULL
         assert!(eval("+NULL").unwrap().is_null());
     }

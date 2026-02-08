@@ -529,7 +529,7 @@ mod tests {
         };
         assert_eq!(columns.len(), 1);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].record.values[0], crate::datum::Value::Int64(7));
+        assert_eq!(rows[0].record.values[0], crate::datum::Value::Bigint(7));
 
         // String concatenation
         let result = session

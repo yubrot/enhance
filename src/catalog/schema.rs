@@ -81,7 +81,7 @@ impl TableInfo {
     /// Returns `None` if the record has invalid or unexpected value types.
     pub fn from_record(record: &Record) -> Option<Self> {
         let table_id = match record.values.get(Self::COL_TABLE_ID)? {
-            Value::Int32(id) => *id as u32,
+            Value::Integer(id) => *id as u32,
             _ => return None,
         };
         let table_name = match record.values.get(Self::COL_TABLE_NAME)? {
@@ -89,7 +89,7 @@ impl TableInfo {
             _ => return None,
         };
         let first_page = match record.values.get(Self::COL_FIRST_PAGE)? {
-            Value::Int64(p) => PageId::new(*p as u64),
+            Value::Bigint(p) => PageId::new(*p as u64),
             _ => return None,
         };
         Some(Self::new(table_id, table_name, first_page))
@@ -98,9 +98,9 @@ impl TableInfo {
     /// Converts this TableInfo into a record for sys_tables.
     pub fn to_record(&self) -> Record {
         Record::new(vec![
-            Value::Int32(self.table_id as i32),
+            Value::Integer(self.table_id as i32),
             Value::Text(self.table_name.clone()),
-            Value::Int64(self.first_page.page_num() as i64),
+            Value::Bigint(self.first_page.page_num() as i64),
         ])
     }
 }
@@ -109,7 +109,7 @@ impl SystemCatalogTable for TableInfo {
     const TABLE_ID: u32 = 1;
     const TABLE_NAME: &'static str = "sys_tables";
     const COLUMN_NAMES: &'static [&'static str] = &["table_id", "table_name", "first_page"];
-    const SCHEMA: &'static [Type] = &[Type::Int4, Type::Text, Type::Int8];
+    const SCHEMA: &'static [Type] = &[Type::Integer, Type::Text, Type::Bigint];
 }
 
 /// Metadata for a column stored in the catalog (sys_columns row).
@@ -156,11 +156,11 @@ impl ColumnInfo {
     /// Returns `None` if the record has invalid or unexpected value types.
     pub fn from_record(record: &Record) -> Option<Self> {
         let table_id = match record.values.get(Self::COL_TABLE_ID)? {
-            Value::Int32(id) => *id as u32,
+            Value::Integer(id) => *id as u32,
             _ => return None,
         };
         let column_num = match record.values.get(Self::COL_COLUMN_NUM)? {
-            Value::Int32(n) => *n as u32,
+            Value::Integer(n) => *n as u32,
             _ => return None,
         };
         let column_name = match record.values.get(Self::COL_COLUMN_NAME)? {
@@ -168,11 +168,11 @@ impl ColumnInfo {
             _ => return None,
         };
         let data_type = match record.values.get(Self::COL_DATA_TYPE)? {
-            Value::Int32(oid) => Type::from_oid(*oid)?,
+            Value::Integer(oid) => Type::from_oid(*oid)?,
             _ => return None,
         };
         let seq_id = match record.values.get(Self::COL_SEQ_ID)? {
-            Value::Int32(id) => *id as u32,
+            Value::Integer(id) => *id as u32,
             _ => return None,
         };
         Some(Self::new(
@@ -187,11 +187,11 @@ impl ColumnInfo {
     /// Converts this ColumnInfo into a record for sys_columns.
     pub fn to_record(&self) -> Record {
         Record::new(vec![
-            Value::Int32(self.table_id as i32),
-            Value::Int32(self.column_num as i32),
+            Value::Integer(self.table_id as i32),
+            Value::Integer(self.column_num as i32),
             Value::Text(self.column_name.clone()),
-            Value::Int32(self.data_type.oid()),
-            Value::Int32(self.seq_id as i32),
+            Value::Integer(self.data_type.oid()),
+            Value::Integer(self.seq_id as i32),
         ])
     }
 
@@ -211,7 +211,13 @@ impl SystemCatalogTable for ColumnInfo {
         "type_oid",
         "seq_id",
     ];
-    const SCHEMA: &'static [Type] = &[Type::Int4, Type::Int4, Type::Text, Type::Int4, Type::Int4];
+    const SCHEMA: &'static [Type] = &[
+        Type::Integer,
+        Type::Integer,
+        Type::Text,
+        Type::Integer,
+        Type::Integer,
+    ];
 }
 
 /// Metadata for a sequence stored in the catalog (sys_sequences row).
@@ -244,7 +250,7 @@ impl SequenceInfo {
     /// Returns `None` if the record has invalid or unexpected value types.
     pub fn from_record(record: &Record) -> Option<Self> {
         let seq_id = match record.values.get(Self::COL_SEQ_ID)? {
-            Value::Int32(id) => *id as u32,
+            Value::Integer(id) => *id as u32,
             _ => return None,
         };
         let seq_name = match record.values.get(Self::COL_SEQ_NAME)? {
@@ -252,7 +258,7 @@ impl SequenceInfo {
             _ => return None,
         };
         let next_val = match record.values.get(Self::COL_NEXT_VAL)? {
-            Value::Int64(v) => *v,
+            Value::Bigint(v) => *v,
             _ => return None,
         };
         Some(Self::new(seq_id, seq_name, next_val))
@@ -261,9 +267,9 @@ impl SequenceInfo {
     /// Converts this SequenceInfo into a record for sys_sequences.
     pub fn to_record(&self) -> Record {
         Record::new(vec![
-            Value::Int32(self.seq_id as i32),
+            Value::Integer(self.seq_id as i32),
             Value::Text(self.seq_name.clone()),
-            Value::Int64(self.next_val),
+            Value::Bigint(self.next_val),
         ])
     }
 }
@@ -272,5 +278,5 @@ impl SystemCatalogTable for SequenceInfo {
     const TABLE_ID: u32 = 3;
     const TABLE_NAME: &'static str = "sys_sequences";
     const COLUMN_NAMES: &'static [&'static str] = &["seq_id", "seq_name", "next_val"];
-    const SCHEMA: &'static [Type] = &[Type::Int4, Type::Text, Type::Int8];
+    const SCHEMA: &'static [Type] = &[Type::Integer, Type::Text, Type::Bigint];
 }
