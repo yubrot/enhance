@@ -21,7 +21,7 @@ impl BoundExpr {
             BoundExpr::Null => Ok(Value::Null),
             BoundExpr::Boolean(b) => Ok(Value::Boolean(*b)),
             BoundExpr::Integer(n) => Ok(Value::Bigint(*n)),
-            BoundExpr::Float(f) => Ok(Value::DoublePrecision(*f)),
+            BoundExpr::Float(f) => Ok(Value::Double(*f)),
             BoundExpr::String(s) => Ok(Value::Text(s.clone())),
 
             BoundExpr::Column { index, .. } => {
@@ -314,15 +314,9 @@ fn eval_arithmetic(
     };
     Ok(match (left, right) {
         (Value::Bigint(a), Value::Bigint(b)) => Value::Bigint(int_op(a, b)?),
-        (Value::DoublePrecision(a), Value::DoublePrecision(b)) => {
-            Value::DoublePrecision(float_op(a, b)?)
-        }
-        (Value::DoublePrecision(a), Value::Bigint(b)) => {
-            Value::DoublePrecision(float_op(a, b as f64)?)
-        }
-        (Value::Bigint(a), Value::DoublePrecision(b)) => {
-            Value::DoublePrecision(float_op(a as f64, b)?)
-        }
+        (Value::Double(a), Value::Double(b)) => Value::Double(float_op(a, b)?),
+        (Value::Double(a), Value::Bigint(b)) => Value::Double(float_op(a, b as f64)?),
+        (Value::Bigint(a), Value::Double(b)) => Value::Double(float_op(a as f64, b)?),
         _ => panic!(), // to_wide_numeric only returns Bigint or Double
     })
 }
@@ -368,8 +362,8 @@ fn eval_unary_op(op: UnaryOperator, val: &Value) -> Result<Value, ExecutorError>
                 .checked_neg()
                 .map(Value::Bigint)
                 .ok_or(ExecutorError::IntegerOverflow),
-            Value::Real(n) => Ok(Value::DoublePrecision(-(*n as f64))),
-            Value::DoublePrecision(n) => Ok(Value::DoublePrecision(-n)),
+            Value::Real(n) => Ok(Value::Double(-(*n as f64))),
+            Value::Double(n) => Ok(Value::Double(-n)),
             _ => Err(ExecutorError::TypeMismatch {
                 expected: "numeric".to_string(),
                 found: val.ty(),
@@ -380,7 +374,7 @@ fn eval_unary_op(op: UnaryOperator, val: &Value) -> Result<Value, ExecutorError>
             | Value::Integer(_)
             | Value::Bigint(_)
             | Value::Real(_)
-            | Value::DoublePrecision(_) => Ok(val.clone()),
+            | Value::Double(_) => Ok(val.clone()),
             _ => Err(ExecutorError::TypeMismatch {
                 expected: "numeric".to_string(),
                 found: val.ty(),
@@ -478,8 +472,8 @@ mod tests {
 
     #[test]
     fn test_evaluate_float_literal() {
-        assert_eq!(eval("3.14").unwrap(), Value::DoublePrecision(3.14));
-        assert_eq!(eval("0.0").unwrap(), Value::DoublePrecision(0.0));
+        assert_eq!(eval("3.14").unwrap(), Value::Double(3.14));
+        assert_eq!(eval("0.0").unwrap(), Value::Double(0.0));
     }
 
     #[test]
@@ -635,18 +629,18 @@ mod tests {
 
     #[test]
     fn test_arithmetic_float() {
-        assert_eq!(eval("1.5 + 2.5").unwrap(), Value::DoublePrecision(4.0));
-        assert_eq!(eval("5.0 - 1.5").unwrap(), Value::DoublePrecision(3.5));
-        assert_eq!(eval("2.0 * 3.0").unwrap(), Value::DoublePrecision(6.0));
-        assert_eq!(eval("7.0 / 2.0").unwrap(), Value::DoublePrecision(3.5));
+        assert_eq!(eval("1.5 + 2.5").unwrap(), Value::Double(4.0));
+        assert_eq!(eval("5.0 - 1.5").unwrap(), Value::Double(3.5));
+        assert_eq!(eval("2.0 * 3.0").unwrap(), Value::Double(6.0));
+        assert_eq!(eval("7.0 / 2.0").unwrap(), Value::Double(3.5));
     }
 
     #[test]
     fn test_arithmetic_mixed_int_float() {
         // int + float promotes to float
-        assert_eq!(eval("1 + 2.5").unwrap(), Value::DoublePrecision(3.5));
-        assert_eq!(eval("2.5 + 1").unwrap(), Value::DoublePrecision(3.5));
-        assert_eq!(eval("10 * 0.5").unwrap(), Value::DoublePrecision(5.0));
+        assert_eq!(eval("1 + 2.5").unwrap(), Value::Double(3.5));
+        assert_eq!(eval("2.5 + 1").unwrap(), Value::Double(3.5));
+        assert_eq!(eval("10 * 0.5").unwrap(), Value::Double(5.0));
     }
 
     #[test]
@@ -705,7 +699,7 @@ mod tests {
     #[test]
     fn test_unary_minus() {
         assert_eq!(eval("-42").unwrap(), Value::Bigint(-42));
-        assert_eq!(eval("-3.14").unwrap(), Value::DoublePrecision(-3.14));
+        assert_eq!(eval("-3.14").unwrap(), Value::Double(-3.14));
         // -NULL = NULL
         assert!(eval("-NULL").unwrap().is_null());
     }
@@ -738,7 +732,7 @@ mod tests {
     #[test]
     fn test_unary_plus() {
         assert_eq!(eval("+42").unwrap(), Value::Bigint(42));
-        assert_eq!(eval("+3.14").unwrap(), Value::DoublePrecision(3.14));
+        assert_eq!(eval("+3.14").unwrap(), Value::Double(3.14));
         // +NULL = NULL
         assert!(eval("+NULL").unwrap().is_null());
     }

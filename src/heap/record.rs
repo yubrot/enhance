@@ -291,7 +291,7 @@ mod tests {
             Value::Integer(i32::MAX),
             Value::Bigint(i64::MAX),
             Value::Real(std::f32::consts::PI),
-            Value::DoublePrecision(std::f64::consts::PI),
+            Value::Double(std::f64::consts::PI),
             Value::Text("hello".to_string()),
             Value::Bytea(vec![1, 2, 3]),
         ]);
@@ -305,7 +305,7 @@ mod tests {
             Type::Integer,
             Type::Bigint,
             Type::Real,
-            Type::DoublePrecision,
+            Type::Double,
             Type::Text,
             Type::Bytea,
         ];

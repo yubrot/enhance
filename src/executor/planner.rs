@@ -294,7 +294,7 @@ fn infer_type(expr: &Expr, columns: &[ColumnDesc]) -> Type {
             }
         }
         Expr::Integer(_) => Type::Bigint,
-        Expr::Float(_) => Type::DoublePrecision,
+        Expr::Float(_) => Type::Double,
         Expr::Boolean(_) => Type::Bool,
         Expr::String(_) => Type::Text,
         Expr::Null => Type::Text,
@@ -335,7 +335,7 @@ fn infer_arithmetic_type(left: Type, right: Type) -> Type {
     };
     match (left, right) {
         (Type::Bigint, Type::Bigint) => Type::Bigint,
-        _ => Type::DoublePrecision,
+        _ => Type::Double,
     }
 }
 
@@ -508,7 +508,7 @@ mod tests {
         // Float literal → Double
         let select = parse_select("SELECT 3.14");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
-        assert_eq!(plan.columns()[0].ty, Type::DoublePrecision);
+        assert_eq!(plan.columns()[0].ty, Type::Double);
 
         // Boolean literal → Bool
         let select = parse_select("SELECT TRUE");
@@ -543,17 +543,17 @@ mod tests {
         // Arithmetic (int + float) → Double via numeric promotion
         let select = parse_select("SELECT 1 + 2.5");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
-        assert_eq!(plan.columns()[0].ty, Type::DoublePrecision);
+        assert_eq!(plan.columns()[0].ty, Type::Double);
 
         // Arithmetic (float + int) → Double via numeric promotion
         let select = parse_select("SELECT 2.5 + 1");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
-        assert_eq!(plan.columns()[0].ty, Type::DoublePrecision);
+        assert_eq!(plan.columns()[0].ty, Type::Double);
 
         // Arithmetic (float + float) → Double
         let select = parse_select("SELECT 1.0 * 2.5");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
-        assert_eq!(plan.columns()[0].ty, Type::DoublePrecision);
+        assert_eq!(plan.columns()[0].ty, Type::Double);
 
         // Concatenation → Text
         let select = parse_select("SELECT 'a' || 'b'");

@@ -288,7 +288,7 @@ impl DataType {
             DataType::Integer => Type::Integer,
             DataType::Bigint => Type::Bigint,
             DataType::Real => Type::Real,
-            DataType::DoublePrecision => Type::DoublePrecision,
+            DataType::DoublePrecision => Type::Double,
             DataType::Text => Type::Text,
             DataType::Varchar(_) => Type::Varchar,
             DataType::Bytea => Type::Bytea,
@@ -595,7 +595,7 @@ mod tests {
         assert_eq!(DataType::Integer.to_type(), Type::Integer);
         assert_eq!(DataType::Bigint.to_type(), Type::Bigint);
         assert_eq!(DataType::Real.to_type(), Type::Real);
-        assert_eq!(DataType::DoublePrecision.to_type(), Type::DoublePrecision);
+        assert_eq!(DataType::DoublePrecision.to_type(), Type::Double);
         assert_eq!(DataType::Text.to_type(), Type::Text);
         assert_eq!(DataType::Varchar(Some(255)).to_type(), Type::Varchar);
         assert_eq!(DataType::Bytea.to_type(), Type::Bytea);
