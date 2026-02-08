@@ -423,7 +423,7 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
                 .iter()
                 .map(|v| match v {
                     Value::Null => DataValue::Null,
-                    _ => DataValue::Binary(v.to_text().into_bytes()),
+                    _ => DataValue::Data(v.to_text().into_bytes()),
                 })
                 .collect();
             self.framed.send(BackendMessage::DataRow { values }).await?;
