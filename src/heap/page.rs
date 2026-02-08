@@ -7,9 +7,11 @@
 //! +------------------+ offset 0
 //! | PageHeader (24B) |
 //! +------------------+ offset 24
+//! | HeapExtra  (4B)  | next_page: u32
+//! +------------------+ offset 28
 //! | Slot Array       | (grows down)
 //! | [0][1][2]...     |
-//! +------------------+ offset header.free_start(SLOT_SIZE)
+//! +------------------+ offset HEAP_DATA_OFFSET + slot_count * SLOT_SIZE
 //! |                  |
 //! | Free Space       |
 //! |                  |
@@ -19,6 +21,9 @@
 //! +------------------+ offset 8192
 //! ```
 //!
+//! The `HeapExtra` region stores heap-specific metadata (page chain linkage)
+//! separately from `PageHeader`, keeping `PageHeader` generic for all page types.
+//!
 //! Tuple data is stored from the bottom of the page upward, while the slot array
 //! grows downward from the header. This allows both to grow toward each other,
 //! maximizing space utilization.
@@ -26,16 +31,28 @@
 use super::error::HeapError;
 use super::record::Record;
 use crate::datum::Type;
-use crate::storage::{PAGE_HEADER_SIZE, PAGE_SIZE, PageHeader};
+use crate::storage::{PAGE_HEADER_SIZE, PAGE_SIZE, PageHeader, PageId};
 use crate::tx::{CommandId, TUPLE_HEADER_SIZE, TupleHeader, TxId};
+
+/// Size of the heap-specific extra header in bytes.
+///
+/// This region (bytes 24..28) stores heap page chain linkage (`next_page: u32`),
+/// keeping `PageHeader` generic for all page types.
+const HEAP_EXTRA_SIZE: usize = 4;
+
+/// Byte offset where heap page data (slot array) begins.
+///
+/// This is `PAGE_HEADER_SIZE + HEAP_EXTRA_SIZE` (24 + 4 = 28).
+const HEAP_DATA_OFFSET: usize = PAGE_HEADER_SIZE + HEAP_EXTRA_SIZE;
 
 /// Maximum size for record (data values only, without tuple header).
 ///
-/// This is the actual space available for user data after accounting for the tuple header.
+/// This is the actual space available for user data after accounting for the
+/// tuple header and the heap-specific extra header.
 pub const MAX_RECORD_SIZE: usize = MAX_SLOT_DATA_SIZE - TUPLE_HEADER_SIZE;
 
 // Maximum size for slot data (raw bytes stored in a slot)
-const MAX_SLOT_DATA_SIZE: usize = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE;
+const MAX_SLOT_DATA_SIZE: usize = PAGE_SIZE - HEAP_DATA_OFFSET - SLOT_SIZE;
 
 /// Size of each slot entry in bytes.
 const SLOT_SIZE: usize = 4;
@@ -114,9 +131,15 @@ impl SlotEntry {
 /// It handles the physical layout of records within a page, managing the slot array
 /// and free space.
 ///
+/// The `data_offset` field specifies where the slot array begins within the page,
+/// allowing different page types (heap, B+tree, etc.) to reserve type-specific
+/// header areas between `PageHeader` and the slot array.
+///
 /// This is an internal implementation detail. Use [`HeapPage`] for MVCC-aware operations.
 struct SlottedPage<T> {
     data: T,
+    /// Byte offset where the slot array begins (after any type-specific headers).
+    data_offset: usize,
 }
 
 impl<T> SlottedPage<T> {
@@ -130,10 +153,13 @@ impl<T> SlottedPage<T> {
 impl<T: AsRef<[u8]>> SlottedPage<T> {
     /// Creates a new slotted page view over the given data.
     ///
+    /// `data_offset` specifies where the slot array begins (after any type-specific
+    /// headers). For heap pages, this is `HEAP_DATA_OFFSET` (28).
+    ///
     /// # Panics
     ///
     /// Panics if `data.as_ref().len() != PAGE_SIZE`.
-    fn new(data: T) -> Self {
+    fn new(data: T, data_offset: usize) -> Self {
         assert_eq!(
             data.as_ref().len(),
             PAGE_SIZE,
@@ -141,7 +167,7 @@ impl<T: AsRef<[u8]>> SlottedPage<T> {
             PAGE_SIZE,
             data.as_ref().len()
         );
-        Self { data }
+        Self { data, data_offset }
     }
 
     /// Returns a reference to the underlying data.
@@ -166,7 +192,7 @@ impl<T: AsRef<[u8]>> SlottedPage<T> {
             slot_id,
             self.header().slot_count
         );
-        let offset = PAGE_HEADER_SIZE + (slot_id as usize) * SLOT_SIZE;
+        let offset = self.data_offset + (slot_id as usize) * SLOT_SIZE;
         SlotEntry::read(&self.data()[offset..offset + SLOT_SIZE])
     }
 
@@ -211,6 +237,33 @@ impl<T: AsRef<[u8]>> SlottedPage<T> {
         let wasted = total_record_area.saturating_sub(used_space);
         wasted as f32 / total_record_area as f32
     }
+
+    /// Returns the offset where free space starts (end of slot array).
+    ///
+    /// Computed as `data_offset + slot_count * SLOT_SIZE`.
+    fn free_start(&self, header: &PageHeader) -> u16 {
+        self.data_offset as u16 + header.slot_count * SLOT_SIZE as u16
+    }
+
+    /// Returns the amount of contiguous free space available.
+    fn free_space(&self, header: &PageHeader) -> u16 {
+        header.free_end.saturating_sub(self.free_start(header))
+    }
+
+    /// Checks if there is enough contiguous free space for the given size.
+    ///
+    /// Returns `HeapError::PageFull` if the space is insufficient.
+    fn ensure_free_space(&self, header: &PageHeader, required: usize) -> Result<(), HeapError> {
+        let available = self.free_space(header) as usize;
+        if available < required {
+            Err(HeapError::PageFull {
+                required,
+                available,
+            })
+        } else {
+            Ok(())
+        }
+    }
 }
 
 // Mutable methods (available for T: AsRef<[u8]> + AsMut<[u8]>)
@@ -234,21 +287,6 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> SlottedPage<T> {
         Some(&mut self.data_mut()[start..end])
     }
 
-    /// Checks if there is enough contiguous free space for the given size.
-    ///
-    /// Returns `HeapError::PageFull` if the space is insufficient.
-    fn ensure_free_space(&self, header: &PageHeader, required: usize) -> Result<(), HeapError> {
-        let available = header.free_space(SLOT_SIZE) as usize;
-        if available < required {
-            Err(HeapError::PageFull {
-                required,
-                available,
-            })
-        } else {
-            Ok(())
-        }
-    }
-
     /// Initializes this page as a new empty heap page.
     ///
     /// This zeroes the page and writes an empty heap page header.
@@ -269,7 +307,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> SlottedPage<T> {
 
     /// Sets the slot entry at the given index.
     fn set_slot(&mut self, slot_id: SlotId, entry: SlotEntry) {
-        let offset = PAGE_HEADER_SIZE + (slot_id as usize) * SLOT_SIZE;
+        let offset = self.data_offset + (slot_id as usize) * SLOT_SIZE;
         entry.write(&mut self.data_mut()[offset..offset + SLOT_SIZE]);
     }
 
@@ -345,7 +383,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> SlottedPage<T> {
     /// 4. Rebuilds the free list
     /// 5. Resets `free_end` to the new boundary
     ///
-    /// After compaction, `header().free_space()` returns the maximum available space.
+    /// After compaction, free space is maximized by removing gaps between records.
     ///
     /// NOTE: This is O(n) in the number of records. Call only when needed,
     /// such as when an insert fails but total space should be sufficient.
@@ -405,13 +443,31 @@ impl<T: AsRef<[u8]>> HeapPage<T> {
     /// Panics if `data.as_ref().len() != PAGE_SIZE`.
     pub fn new(data: T) -> Self {
         Self {
-            page: SlottedPage::new(data),
+            page: SlottedPage::new(data, HEAP_DATA_OFFSET),
         }
     }
 
     /// Returns the page header.
     pub fn header(&self) -> PageHeader {
         self.page.header()
+    }
+
+    /// Returns the next page in the heap page chain.
+    ///
+    /// Returns `None` if this is the last page in the chain (`next_page == 0`).
+    pub fn next_page(&self) -> Option<PageId> {
+        let data = self.page.data();
+        let raw = u32::from_le_bytes([
+            data[PAGE_HEADER_SIZE],
+            data[PAGE_HEADER_SIZE + 1],
+            data[PAGE_HEADER_SIZE + 2],
+            data[PAGE_HEADER_SIZE + 3],
+        ]);
+        if raw == 0 {
+            None
+        } else {
+            Some(PageId::new(raw as u64))
+        }
     }
 
     /// Reads a tuple (header + record) by slot ID.
@@ -452,9 +508,34 @@ impl<T: AsRef<[u8]>> HeapPage<T> {
 impl<T: AsRef<[u8]> + AsMut<[u8]>> HeapPage<T> {
     /// Initializes this page as a new empty heap page.
     ///
-    /// This zeroes the page and writes an empty heap page header.
+    /// This zeroes the page (including the HeapExtra region) and writes an
+    /// empty heap page header. The `next_page` field is set to 0 (no next page).
     pub fn init(&mut self) {
         self.page.init();
+        // HeapExtra is already zeroed by page.init() (which fills with 0),
+        // so next_page = 0 (no next page) is the default.
+    }
+
+    /// Sets the next page in the heap page chain.
+    ///
+    /// Pass `None` to mark this as the last page in the chain.
+    ///
+    /// NOTE: `next_page` is stored as `u32`, limiting the chain to ~4 billion pages
+    /// (32TB at 8KB/page). This is sufficient for this project's scope.
+    pub fn set_next_page(&mut self, next: Option<PageId>) {
+        let raw: u32 = match next {
+            Some(page_id) => {
+                debug_assert!(
+                    page_id.page_num() <= u32::MAX as u64,
+                    "page_num {} exceeds u32 range for next_page",
+                    page_id.page_num()
+                );
+                page_id.page_num() as u32
+            }
+            None => 0,
+        };
+        let data = self.page.data_mut();
+        data[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 4].copy_from_slice(&raw.to_le_bytes());
     }
 
     /// Compacts the page by removing gaps between records.
@@ -466,7 +547,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> HeapPage<T> {
     /// 4. Rebuilds the free list
     /// 5. Resets `free_end` to the new boundary
     ///
-    /// After compaction, `header().free_space()` returns the maximum available space.
+    /// After compaction, free space is maximized by removing gaps between records.
     ///
     /// NOTE: This is O(n) in the number of records. Call only when needed
     /// (e.g., during VACUUM when fragmentation exceeds a threshold).
@@ -568,7 +649,7 @@ mod tests {
     use crate::storage::{PAGE_VERSION, PageType};
 
     fn create_slotted_page() -> SlottedPage<Vec<u8>> {
-        let mut page = SlottedPage::new(vec![0u8; PAGE_SIZE]);
+        let mut page = SlottedPage::new(vec![0u8; PAGE_SIZE], HEAP_DATA_OFFSET);
         page.init();
         page
     }
@@ -583,7 +664,7 @@ mod tests {
         assert_eq!(header.page_version, PAGE_VERSION);
         assert_eq!(header.flags, 0);
         assert_eq!(header.slot_count, 0);
-        assert_eq!(header.free_start(SLOT_SIZE), PAGE_HEADER_SIZE as u16);
+        assert_eq!(page.free_start(&header), HEAP_DATA_OFFSET as u16);
         assert_eq!(header.free_end, PAGE_SIZE as u16);
         assert_eq!(header.first_free_slot, u16::MAX);
     }
@@ -703,21 +784,21 @@ mod tests {
         let slot1 = page.insert(&large_record).unwrap();
         let slot2 = page.insert(&large_record).unwrap();
 
-        let free_before = page.header().free_space(SLOT_SIZE);
+        let free_before = page.free_space(&page.header());
 
         // Delete middle record
         page.delete(slot1).unwrap();
 
         // Should have fragmentation, but free space unchanged
         assert!(page.fragmentation() > 0.0);
-        assert_eq!(page.header().free_space(SLOT_SIZE), free_before);
+        assert_eq!(page.free_space(&page.header()), free_before);
 
         // Compact
         page.compact();
 
         // Fragmentation gone, free space recovered
         assert!(page.fragmentation() <= 0.0);
-        assert!(page.header().free_space(SLOT_SIZE) > free_before);
+        assert!(page.free_space(&page.header()) > free_before);
 
         // Records still readable
         assert!(page.get(slot0).is_some());
@@ -748,8 +829,8 @@ mod tests {
     fn test_slotted_page_free_space_calculation() {
         let mut page = create_slotted_page();
 
-        let initial_free = page.header().free_space(SLOT_SIZE) as usize;
-        assert_eq!(initial_free, PAGE_SIZE - PAGE_HEADER_SIZE);
+        let initial_free = page.free_space(&page.header()) as usize;
+        assert_eq!(initial_free, PAGE_SIZE - HEAP_DATA_OFFSET);
 
         // Insert a record
         let data = b"test data";
@@ -757,7 +838,7 @@ mod tests {
 
         // Free space should decrease by record size + slot size
         let expected_free = initial_free - data.len() - SLOT_SIZE;
-        assert_eq!(page.header().free_space(SLOT_SIZE) as usize, expected_free);
+        assert_eq!(page.free_space(&page.header()) as usize, expected_free);
     }
 
     #[test]
@@ -969,5 +1050,71 @@ mod tests {
         let result = page.update_record_in_place(slot, &updated);
 
         assert!(matches!(result, Err(HeapError::RecordSizeMismatch { .. })));
+    }
+
+    #[test]
+    fn test_heap_page_next_page_roundtrip() {
+        use crate::storage::PageId;
+
+        let mut page = create_heap_page();
+
+        // Initially no next page
+        assert_eq!(page.next_page(), None);
+
+        // Set next page
+        page.set_next_page(Some(PageId::new(42)));
+        assert_eq!(page.next_page(), Some(PageId::new(42)));
+
+        // Change next page
+        page.set_next_page(Some(PageId::new(100)));
+        assert_eq!(page.next_page(), Some(PageId::new(100)));
+
+        // Clear next page
+        page.set_next_page(None);
+        assert_eq!(page.next_page(), None);
+    }
+
+    #[test]
+    fn test_heap_page_init_clears_next_page() {
+        use crate::storage::PageId;
+
+        let mut page = create_heap_page();
+        page.set_next_page(Some(PageId::new(42)));
+        assert_eq!(page.next_page(), Some(PageId::new(42)));
+
+        // Re-init should clear next_page
+        page.init();
+        assert_eq!(page.next_page(), None);
+    }
+
+    #[test]
+    fn test_heap_page_next_page_does_not_interfere_with_tuples() {
+        use crate::datum::{Type, Value};
+        use crate::heap::Record;
+        use crate::storage::PageId;
+        use crate::tx::{CommandId, TxId};
+
+        let mut page = create_heap_page();
+        page.set_next_page(Some(PageId::new(99)));
+
+        // Insert a tuple
+        let record = Record::new(vec![Value::Integer(42)]);
+        let slot = page
+            .insert(&record, TxId::new(1), CommandId::FIRST)
+            .unwrap();
+
+        // Verify both next_page and tuple are correct
+        assert_eq!(page.next_page(), Some(PageId::new(99)));
+        let schema = [Type::Integer];
+        let (header, read_record) = page.get(slot, &schema).unwrap();
+        assert_eq!(header.xmin, TxId::new(1));
+        assert_eq!(read_record, record);
+    }
+
+    #[test]
+    fn test_max_record_size_decreased_by_heap_extra() {
+        // MAX_RECORD_SIZE should be 4 bytes less than it would be without HEAP_EXTRA_SIZE
+        let without_extra = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE - TUPLE_HEADER_SIZE;
+        assert_eq!(MAX_RECORD_SIZE, without_extra - HEAP_EXTRA_SIZE);
     }
 }

@@ -98,11 +98,18 @@ impl PageHeader {
     /// Returns the offset where free space starts (end of slot array).
     ///
     /// Computed as `PAGE_HEADER_SIZE + slot_count * slot_size`.
+    ///
+    /// NOTE: This assumes the slot array starts immediately after `PageHeader`.
+    /// Page types with extra headers (e.g., `HeapPage` with `HeapExtra`) should
+    /// use `SlottedPage::free_start` which accounts for the type-specific offset.
     pub fn free_start(&self, slot_size: usize) -> u16 {
         PAGE_HEADER_SIZE as u16 + self.slot_count * slot_size as u16
     }
 
     /// Returns the amount of contiguous free space available.
+    ///
+    /// NOTE: This assumes no extra header between `PageHeader` and the slot array.
+    /// See [`free_start`](Self::free_start) for details.
     pub fn free_space(&self, slot_size: usize) -> u16 {
         self.free_end.saturating_sub(self.free_start(slot_size))
     }
