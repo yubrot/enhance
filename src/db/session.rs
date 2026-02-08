@@ -163,12 +163,12 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::Select(select_stmt) => {
                 self.within_transaction_ro(|db, txid, cid| async move {
                     let snapshot = db.tx_manager().snapshot(txid, cid);
-                    let plan = executor::plan_select(select_stmt, &db, &snapshot).await?;
+                    let plan = executor::plan_select(select_stmt, db.catalog(), &snapshot).await?;
                     Ok(Some(plan.columns().to_vec()))
                 })
                 .await
             }
-            Statement::Explain(inner) => match inner.as_ref() {
+            Statement::Explain(inner_stmt) => match inner_stmt.as_ref() {
                 Statement::Select(_) => Ok(Some(vec![ColumnDesc::explain()])),
                 _ => Ok(None),
             },
@@ -215,8 +215,9 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::Select(select_stmt) => {
                 self.within_transaction(|db, txid, cid| async move {
                     let snapshot = db.tx_manager().snapshot(txid, cid);
-                    let plan = executor::plan_select(select_stmt, &db, &snapshot).await?;
+                    let plan = executor::plan_select(select_stmt, db.catalog(), &snapshot).await?;
                     let columns = plan.columns().to_vec();
+
                     let ctx = db.exec_context(snapshot);
                     let mut node = executor::ExecutorNode::build(plan, &ctx);
                     let mut rows = Vec::new();
@@ -238,7 +239,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 Statement::Select(select_stmt) => {
                     self.within_transaction(|db, txid, cid| async move {
                         let snapshot = db.tx_manager().snapshot(txid, cid);
-                        let plan = executor::plan_select(select_stmt, &db, &snapshot).await?;
+                        let plan = executor::plan_select(select_stmt, db.catalog(), &snapshot).await?;
                         Ok(QueryResult::Rows {
                             columns: vec![ColumnDesc::explain()],
                             rows: plan.explain().lines().map(Row::explain_line).collect(),

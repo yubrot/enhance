@@ -1,8 +1,7 @@
 //! Query planner.
 
-use crate::catalog::ColumnInfo;
+use crate::catalog::{Catalog, ColumnInfo};
 use crate::datum::Type;
-use crate::db::Database;
 use crate::sql::{Expr, FromClause, SelectItem, SelectStmt, TableRef};
 use crate::storage::{Replacer, Storage};
 use crate::tx::Snapshot;
@@ -21,7 +20,7 @@ use super::{ColumnDesc, ColumnSource};
 /// # Arguments
 ///
 /// * `select` - The parsed SELECT statement
-/// * `database` - Database for catalog access
+/// * `catalog` - Catalog for table/column metadata access
 /// * `snapshot` - MVCC snapshot for catalog visibility checks
 ///
 /// # Errors
@@ -30,7 +29,7 @@ use super::{ColumnDesc, ColumnSource};
 /// features (JOINs, subqueries), or catalog I/O errors.
 pub async fn plan_select<S: Storage, R: Replacer>(
     select: &SelectStmt,
-    database: &Database<S, R>,
+    catalog: &Catalog<S, R>,
     snapshot: &Snapshot,
 ) -> Result<Plan, ExecutorError> {
     // Check for unsupported features
@@ -58,7 +57,7 @@ pub async fn plan_select<S: Storage, R: Replacer>(
 
     // Step 1: FROM clause -> base plan
     let mut plan = match &select.from {
-        Some(from) => build_from_plan(from, database, snapshot).await?,
+        Some(from) => build_from_plan(from, catalog, snapshot).await?,
         None => Plan::ValuesScan,
     };
 
@@ -81,7 +80,7 @@ pub async fn plan_select<S: Storage, R: Replacer>(
 /// Builds a plan from a FROM clause.
 async fn build_from_plan<S: Storage, R: Replacer>(
     from: &FromClause,
-    database: &Database<S, R>,
+    catalog: &Catalog<S, R>,
     snapshot: &Snapshot,
 ) -> Result<Plan, ExecutorError> {
     if from.tables.len() != 1 {
@@ -89,18 +88,18 @@ async fn build_from_plan<S: Storage, R: Replacer>(
             "multiple tables in FROM (use JOIN)".to_string(),
         ));
     }
-    build_table_ref_plan(&from.tables[0], database, snapshot).await
+    build_table_ref_plan(&from.tables[0], catalog, snapshot).await
 }
 
 /// Builds a plan from a table reference.
 async fn build_table_ref_plan<S: Storage, R: Replacer>(
     table_ref: &TableRef,
-    database: &Database<S, R>,
+    catalog: &Catalog<S, R>,
     snapshot: &Snapshot,
 ) -> Result<Plan, ExecutorError> {
     match table_ref {
         TableRef::Table { name, alias } => {
-            build_seq_scan_plan(name, alias.as_deref(), database, snapshot).await
+            build_seq_scan_plan(name, alias.as_deref(), catalog, snapshot).await
         }
         TableRef::Join { .. } => Err(ExecutorError::Unsupported("JOIN".to_string())),
         TableRef::Subquery { .. } => {
@@ -116,12 +115,11 @@ async fn build_table_ref_plan<S: Storage, R: Replacer>(
 async fn build_seq_scan_plan<S: Storage, R: Replacer>(
     table_name: &str,
     alias: Option<&str>,
-    database: &Database<S, R>,
+    catalog: &Catalog<S, R>,
     snapshot: &Snapshot,
 ) -> Result<Plan, ExecutorError> {
     // Look up table in catalog
-    let table_info = database
-        .catalog()
+    let table_info = catalog
         .get_table(snapshot, table_name)
         .await?
         .ok_or_else(|| ExecutorError::TableNotFound {
@@ -129,8 +127,7 @@ async fn build_seq_scan_plan<S: Storage, R: Replacer>(
         })?;
 
     // Get column metadata
-    let column_infos = database
-        .catalog()
+    let column_infos = catalog
         .get_columns(snapshot, table_info.table_id)
         .await?;
 
@@ -361,7 +358,7 @@ mod tests {
         let (db, snapshot) = setup_test_db().await;
         let select = parse_select("SELECT * FROM sys_tables");
 
-        let plan = plan_select(&select, &db, &snapshot).await.unwrap();
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
 
         assert_eq!(plan.columns().len(), 3);
         assert_eq!(plan.columns()[0].name, "table_id");
@@ -374,7 +371,7 @@ mod tests {
         let (db, snapshot) = setup_test_db().await;
         let select = parse_select("SELECT 42");
 
-        let plan = plan_select(&select, &db, &snapshot).await.unwrap();
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
 
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "?column?");
@@ -385,7 +382,7 @@ mod tests {
         let (db, snapshot) = setup_test_db().await;
         let select = parse_select("SELECT * FROM nonexistent");
 
-        let result = plan_select(&select, &db, &snapshot).await;
+        let result = plan_select(&select, db.catalog(), &snapshot).await;
         assert!(matches!(result, Err(ExecutorError::TableNotFound { .. })));
     }
 
@@ -394,7 +391,7 @@ mod tests {
         let (db, snapshot) = setup_test_db().await;
         let select = parse_select("SELECT table_name FROM sys_tables WHERE table_id = 1");
 
-        let plan = plan_select(&select, &db, &snapshot).await.unwrap();
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
 
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "table_name");
@@ -412,7 +409,7 @@ mod tests {
         let (db, snapshot) = setup_test_db().await;
         let select = parse_select("SELECT 1 + table_id FROM sys_tables");
 
-        let plan = plan_select(&select, &db, &snapshot).await.unwrap();
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
 
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "?column?");
@@ -424,7 +421,7 @@ mod tests {
         let (db, snapshot) = setup_test_db().await;
         let select = parse_select("SELECT sys_tables.table_name FROM sys_tables");
 
-        let plan = plan_select(&select, &db, &snapshot).await.unwrap();
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
 
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "table_name");
@@ -442,7 +439,7 @@ mod tests {
         let (db, snapshot) = setup_test_db().await;
         let select = parse_select("SELECT sys_tables.* FROM sys_tables");
 
-        let plan = plan_select(&select, &db, &snapshot).await.unwrap();
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
 
         assert_eq!(plan.columns().len(), 3);
         assert_eq!(plan.columns()[0].name, "table_id");
@@ -455,7 +452,7 @@ mod tests {
         let (db, snapshot) = setup_test_db().await;
         let select = parse_select("SELECT nonexistent.* FROM sys_tables");
 
-        let result = plan_select(&select, &db, &snapshot).await;
+        let result = plan_select(&select, db.catalog(), &snapshot).await;
         assert!(matches!(result, Err(ExecutorError::TableNotFound { .. })));
     }
 
@@ -464,7 +461,7 @@ mod tests {
         let (db, snapshot) = setup_test_db().await;
         let select = parse_select("SELECT t.table_name FROM sys_tables AS t");
 
-        let plan = plan_select(&select, &db, &snapshot).await.unwrap();
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
 
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "table_name");
@@ -480,7 +477,7 @@ mod tests {
         let (db, snapshot) = setup_test_db().await;
         let select = parse_select("SELECT sys_tables.table_name FROM sys_tables AS t");
 
-        let result = plan_select(&select, &db, &snapshot).await;
+        let result = plan_select(&select, db.catalog(), &snapshot).await;
         assert!(matches!(result, Err(ExecutorError::ColumnNotFound { .. })));
     }
 
@@ -489,7 +486,7 @@ mod tests {
         let (db, snapshot) = setup_test_db().await;
         let select = parse_select("SELECT t.* FROM sys_tables AS t");
 
-        let plan = plan_select(&select, &db, &snapshot).await.unwrap();
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
 
         assert_eq!(plan.columns().len(), 3);
         assert_eq!(plan.columns()[0].name, "table_id");

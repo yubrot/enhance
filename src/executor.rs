@@ -31,6 +31,9 @@
 //!
 //! - [`Plan`]: Logical query plan (no data)
 //! - [`ExecutorNode`]: Physical executor nodes with async `next()` (Volcano model)
+//! - [`ExecContext`]: Trait providing catalog/heap/transaction access to executor nodes
+//! - [`Row`]: A single row produced by executor nodes (record + optional physical location)
+//! - [`ColumnDesc`]: Metadata describing a result column (name, type, source table info)
 
 mod column;
 mod context;

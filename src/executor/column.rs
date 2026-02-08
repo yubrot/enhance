@@ -1,3 +1,9 @@
+//! Column metadata types used by executor nodes.
+//!
+//! A [`ColumnDesc`] describes a single result column (name, type, and optional
+//! source table info via [`ColumnSource`]). These descriptors are used by the
+//! server layer to build field descriptions for the wire protocol.
+
 use crate::datum::Type;
 
 /// Source table metadata for columns originating from a table scan.
@@ -23,6 +29,9 @@ pub struct ColumnDesc {
 }
 
 impl ColumnDesc {
+    /// Creates a column descriptor for EXPLAIN output.
+    ///
+    /// Corresponds to [`super::Row::explain_line()`].
     pub fn explain() -> Self {
         Self {
             name: "QUERY PLAN".to_string(),
