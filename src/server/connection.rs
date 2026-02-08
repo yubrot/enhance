@@ -11,8 +11,7 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
 use crate::datum::Value;
-use crate::db::{Database, DatabaseError, QueryResult, Session};
-use crate::executor::ExecutorError;
+use crate::db::{Database, QueryResult, Session};
 use crate::protocol::{
     BackendMessage, BindMessage, CloseMessage, CloseTarget, DataValue, DescribeMessage,
     DescribeTarget, ErrorInfo, ExecuteMessage, FieldDescription, FormatCode, FrontendMessage,
@@ -141,7 +140,7 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
                     .await?;
             }
             Err(e) => {
-                self.framed.send(Self::map_database_error(&e).into()).await?;
+                self.framed.send(e.to_error_info().into()).await?;
             }
         }
 
@@ -257,10 +256,7 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
     }
 
     /// Resolves a portal name to the AST of its backing prepared statement.
-    fn resolve_portal_ast(
-        &self,
-        portal_name: &str,
-    ) -> Result<crate::sql::Statement, ErrorInfo> {
+    fn resolve_portal_ast(&self, portal_name: &str) -> Result<crate::sql::Statement, ErrorInfo> {
         let portal = self.state.get_portal(portal_name).ok_or_else(|| {
             ErrorInfo::new(
                 sql_state::INVALID_CURSOR_NAME,
@@ -290,7 +286,7 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
                 self.framed.send(BackendMessage::NoData).await?;
                 Ok(())
             }
-            Err(e) => self.send_error(Self::map_database_error(&e), true).await,
+            Err(e) => self.send_error(e.to_error_info(), true).await,
         }
     }
 
@@ -319,7 +315,7 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
                     .await?;
             }
             Err(e) => {
-                return self.send_error(Self::map_database_error(&e), true).await;
+                return self.send_error(e.to_error_info(), true).await;
             }
         }
 
@@ -461,25 +457,4 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
         Ok(())
     }
 
-    /// Converts a [`DatabaseError`] into a protocol [`ErrorInfo`] with an appropriate SQL state code.
-    fn map_database_error(err: &DatabaseError) -> ErrorInfo {
-        match err {
-            DatabaseError::Parse(e) => {
-                ErrorInfo::new(sql_state::SYNTAX_ERROR, &e.message).with_position(e.position())
-            }
-            DatabaseError::Executor(exec_err) => {
-                let code = match exec_err {
-                    ExecutorError::TableNotFound { .. } => sql_state::UNDEFINED_TABLE,
-                    ExecutorError::ColumnNotFound { .. } => sql_state::UNDEFINED_COLUMN,
-                    _ => sql_state::INTERNAL_ERROR,
-                };
-                ErrorInfo::new(code, exec_err.to_string())
-            }
-            DatabaseError::TransactionAborted => ErrorInfo::new(
-                sql_state::IN_FAILED_SQL_TRANSACTION,
-                err.to_string(),
-            ),
-            _ => ErrorInfo::new(sql_state::INTERNAL_ERROR, err.to_string()),
-        }
-    }
 }
