@@ -171,15 +171,15 @@ impl BoundExpr {
                 }
             }
 
-            BoundExpr::Cast { expr, data_type } => {
+            BoundExpr::Cast { expr, ty } => {
                 let v = expr.evaluate(record)?;
-                v.cast(data_type).map_err(|(original, err)| match err {
+                v.cast(ty).map_err(|(original, err)| match err {
                     CastError::Invalid => ExecutorError::InvalidCast {
                         from: original.ty(),
-                        to: *data_type,
+                        to: *ty,
                     },
                     CastError::NumericOutOfRange => ExecutorError::NumericOutOfRange {
-                        type_name: data_type.display_name().to_string(),
+                        type_name: ty.display_name().to_string(),
                     },
                 })
             }
@@ -265,18 +265,9 @@ fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) -> Result<Val
     }
 }
 
-/// Converts a value to a nullable boolean, mapping type errors to [`ExecutorError::TypeMismatch`].
-fn to_bool_or_type_error(v: &Value) -> Result<Option<bool>, ExecutorError> {
-    v.to_bool_nullable()
-        .map_err(|()| ExecutorError::TypeMismatch {
-            expected: "boolean".to_string(),
-            found: v.ty(),
-        })
-}
-
 /// Evaluates AND with 3-value NULL logic.
 fn eval_and(left: &Value, right: &Value) -> Result<Value, ExecutorError> {
-    match (to_bool_or_type_error(left)?, to_bool_or_type_error(right)?) {
+    match (to_bool(left)?, to_bool(right)?) {
         (Some(false), _) | (_, Some(false)) => Ok(Value::Boolean(false)),
         (Some(true), Some(true)) => Ok(Value::Boolean(true)),
         _ => Ok(Value::Null),
@@ -285,7 +276,7 @@ fn eval_and(left: &Value, right: &Value) -> Result<Value, ExecutorError> {
 
 /// Evaluates OR with 3-value NULL logic.
 fn eval_or(left: &Value, right: &Value) -> Result<Value, ExecutorError> {
-    match (to_bool_or_type_error(left)?, to_bool_or_type_error(right)?) {
+    match (to_bool(left)?, to_bool(right)?) {
         (Some(true), _) | (_, Some(true)) => Ok(Value::Boolean(true)),
         (Some(false), Some(false)) => Ok(Value::Boolean(false)),
         _ => Ok(Value::Null),
@@ -344,6 +335,15 @@ fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering, Exe
         .ok_or_else(|| ExecutorError::IncomparableTypes {
             lhs: left.ty(),
             rhs: right.ty(),
+        })
+}
+
+/// Converts a value to a nullable boolean, mapping type errors to [`ExecutorError::TypeMismatch`].
+fn to_bool(v: &Value) -> Result<Option<bool>, ExecutorError> {
+    v.to_bool_nullable()
+        .map_err(|()| ExecutorError::TypeMismatch {
+            expected: "boolean".to_string(),
+            found: v.ty(),
         })
 }
 

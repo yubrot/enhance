@@ -77,10 +77,7 @@ pub enum BoundExpr {
         else_result: Option<Box<BoundExpr>>,
     },
     /// CAST expression.
-    Cast {
-        expr: Box<BoundExpr>,
-        data_type: Type,
-    },
+    Cast { expr: Box<BoundExpr>, ty: Type },
 }
 
 /// A WHEN clause in a bound CASE expression.
@@ -207,7 +204,7 @@ impl Expr {
 
             Expr::Cast { expr, data_type } => Ok(BoundExpr::Cast {
                 expr: Box::new(expr.bind(columns)?),
-                data_type: data_type.to_type(),
+                ty: data_type.to_type(),
             }),
 
             Expr::Parameter(_) => Err(ExecutorError::Unsupported(
@@ -297,8 +294,8 @@ impl fmt::Display for BoundExpr {
                 }
                 write!(f, " END")
             }
-            BoundExpr::Cast { expr, data_type } => {
-                write!(f, "CAST({} AS {})", expr, data_type.display_name())
+            BoundExpr::Cast { expr, ty } => {
+                write!(f, "CAST({} AS {})", expr, ty.display_name())
             }
         }
     }
@@ -371,7 +368,7 @@ mod tests {
                     table_oid: 1,
                     column_id: 1,
                 }),
-                data_type: Type::Bigint,
+                ty: Type::Bigint,
             },
             ColumnDesc {
                 name: "name".to_string(),
@@ -380,7 +377,7 @@ mod tests {
                     table_oid: 1,
                     column_id: 2,
                 }),
-                data_type: Type::Text,
+                ty: Type::Text,
             },
             ColumnDesc {
                 name: "id".to_string(),
@@ -389,7 +386,7 @@ mod tests {
                     table_oid: 2,
                     column_id: 1,
                 }),
-                data_type: Type::Bigint,
+                ty: Type::Bigint,
             },
             ColumnDesc {
                 name: "user_id".to_string(),
@@ -398,7 +395,7 @@ mod tests {
                     table_oid: 2,
                     column_id: 2,
                 }),
-                data_type: Type::Bigint,
+                ty: Type::Bigint,
             },
         ]
     }
@@ -642,11 +639,10 @@ mod tests {
     fn test_bind_cast() {
         let columns = make_columns();
 
-        let BoundExpr::Cast { expr, data_type } = bind_expr("CAST(user_id AS TEXT)", &columns)
-        else {
+        let BoundExpr::Cast { expr, ty } = bind_expr("CAST(user_id AS TEXT)", &columns) else {
             panic!("expected Cast");
         };
-        assert_eq!(data_type, Type::Text);
+        assert_eq!(ty, Type::Text);
         assert!(matches!(*expr, BoundExpr::Column { index: 3, .. }));
     }
 

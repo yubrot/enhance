@@ -118,7 +118,7 @@ pub struct SeqScan<C: ExecContext> {
     pub columns: Vec<ColumnDesc>,
     /// Execution context for page I/O.
     ctx: C,
-    /// Column data types for record deserialization.
+    /// Column types for record deserialization.
     schema: Vec<Type>,
     /// Next page to scan, or `None` if exhausted.
     next_page_id: Option<PageId>,
@@ -372,7 +372,7 @@ mod tests {
         ColumnDesc {
             name: name.to_string(),
             source: None,
-            data_type: Type::Bigint,
+            ty: Type::Bigint,
         }
     }
 
@@ -472,7 +472,7 @@ mod tests {
                 ColumnDesc {
                     name: "name".to_string(),
                     source: None,
-                    data_type: Type::Text,
+                    ty: Type::Text,
                 },
             ],
             ctx,
@@ -485,7 +485,7 @@ mod tests {
         let out_cols = vec![ColumnDesc {
             name: "name".to_string(),
             source: None,
-            data_type: Type::Text,
+            ty: Type::Text,
         }];
         let mut node = ExecutorNode::Projection(Projection::new(scan, exprs, out_cols));
 
@@ -576,7 +576,7 @@ mod tests {
                     ColumnDesc {
                         name: "name".to_string(),
                         source: None,
-                        data_type: Type::Text,
+                        ty: Type::Text,
                     },
                 ],
             }),
@@ -584,7 +584,7 @@ mod tests {
             columns: vec![ColumnDesc {
                 name: "name".to_string(),
                 source: None,
-                data_type: Type::Text,
+                ty: Type::Text,
             }],
         };
 

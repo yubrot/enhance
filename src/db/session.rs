@@ -596,7 +596,7 @@ mod tests {
 
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0].name, "QUERY PLAN");
-        assert_eq!(columns[0].data_type, crate::datum::Type::Text);
+        assert_eq!(columns[0].ty, crate::datum::Type::Text);
         assert!(columns[0].source.is_none());
     }
 

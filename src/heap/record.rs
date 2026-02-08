@@ -122,7 +122,7 @@ impl Record {
     /// # Arguments
     ///
     /// * `buf` - Source buffer containing serialized record data
-    /// * `schema` - Column data types (needed to parse each value)
+    /// * `schema` - Column types (needed to parse each value)
     ///
     /// # Errors
     ///

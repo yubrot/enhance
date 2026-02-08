@@ -120,7 +120,7 @@ mod tests {
         ColumnDesc {
             name: name.to_string(),
             source: None,
-            data_type: Type::Bigint,
+            ty: Type::Bigint,
         }
     }
 

@@ -335,8 +335,8 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
                         name: col.name.clone(),
                         table_oid,
                         column_id,
-                        type_oid: col.data_type.oid(),
-                        type_size: col.data_type.fixed_size().map(|s| s as i16).unwrap_or(-1),
+                        type_oid: col.ty.oid(),
+                        type_size: col.ty.fixed_size().map(|s| s as i16).unwrap_or(-1),
                         type_modifier: -1,
                         format_code: FormatCode::Text,
                     }

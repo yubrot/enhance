@@ -24,8 +24,8 @@ pub struct ColumnDesc {
     pub name: String,
     /// Source table info. `None` for computed/expression columns.
     pub source: Option<ColumnSource>,
-    /// Data type.
-    pub data_type: Type,
+    /// Type.
+    pub ty: Type,
 }
 
 impl ColumnDesc {
@@ -36,7 +36,7 @@ impl ColumnDesc {
         Self {
             name: "QUERY PLAN".to_string(),
             source: None,
-            data_type: Type::Text,
+            ty: Type::Text,
         }
     }
 

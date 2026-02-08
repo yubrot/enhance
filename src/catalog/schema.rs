@@ -29,7 +29,7 @@ pub trait SystemCatalogTable {
     /// The column names for this system catalog table.
     const COLUMN_NAMES: &'static [&'static str];
 
-    /// The schema (data types) for this system catalog table.
+    /// The schema (column types) for this system catalog table.
     const SCHEMA: &'static [Type];
 
     /// Returns the TableInfo for this system catalog table.
@@ -41,7 +41,7 @@ pub trait SystemCatalogTable {
 
     /// Returns the column definitions for this system catalog table.
     ///
-    /// Each tuple is (column_name, data_type), automatically paired from
+    /// Each tuple is (column_name, ty), automatically paired from
     /// COLUMN_NAMES and SCHEMA to guarantee consistency.
     fn columns() -> impl IntoIterator<Item = (&'static str, Type)> {
         Self::COLUMN_NAMES
@@ -121,8 +121,8 @@ pub struct ColumnInfo {
     pub column_num: u32,
     /// Column name.
     pub column_name: String,
-    /// Data type.
-    pub data_type: Type,
+    /// Type.
+    pub ty: Type,
     /// Linked sequence ID for SERIAL columns (0 if not SERIAL).
     pub seq_id: u32,
 }
@@ -131,22 +131,16 @@ impl ColumnInfo {
     const COL_TABLE_ID: usize = 0;
     const COL_COLUMN_NUM: usize = 1;
     const COL_COLUMN_NAME: usize = 2;
-    const COL_DATA_TYPE: usize = 3;
+    const COL_TYPE: usize = 3;
     const COL_SEQ_ID: usize = 4;
 
     /// Creates a new ColumnInfo.
-    pub fn new(
-        table_id: u32,
-        column_num: u32,
-        column_name: String,
-        data_type: Type,
-        seq_id: u32,
-    ) -> Self {
+    pub fn new(table_id: u32, column_num: u32, column_name: String, ty: Type, seq_id: u32) -> Self {
         Self {
             table_id,
             column_num,
             column_name,
-            data_type,
+            ty,
             seq_id,
         }
     }
@@ -167,7 +161,7 @@ impl ColumnInfo {
             Value::Text(s) => s.clone(),
             _ => return None,
         };
-        let data_type = match record.values.get(Self::COL_DATA_TYPE)? {
+        let ty = match record.values.get(Self::COL_TYPE)? {
             Value::Integer(oid) => Type::from_oid(*oid)?,
             _ => return None,
         };
@@ -175,13 +169,7 @@ impl ColumnInfo {
             Value::Integer(id) => *id as u32,
             _ => return None,
         };
-        Some(Self::new(
-            table_id,
-            column_num,
-            column_name,
-            data_type,
-            seq_id,
-        ))
+        Some(Self::new(table_id, column_num, column_name, ty, seq_id))
     }
 
     /// Converts this ColumnInfo into a record for sys_columns.
@@ -190,7 +178,7 @@ impl ColumnInfo {
             Value::Integer(self.table_id as i32),
             Value::Integer(self.column_num as i32),
             Value::Text(self.column_name.clone()),
-            Value::Integer(self.data_type.oid()),
+            Value::Integer(self.ty.oid()),
             Value::Integer(self.seq_id as i32),
         ])
     }

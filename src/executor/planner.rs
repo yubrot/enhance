@@ -129,8 +129,8 @@ async fn build_seq_scan_plan<S: Storage, R: Replacer>(
     // Get column metadata
     let column_infos = catalog.get_columns(snapshot, table_info.table_id).await?;
 
-    // Build schema (data types) for record deserialization
-    let schema: Vec<Type> = column_infos.iter().map(|c| c.data_type).collect();
+    // Build schema (column types) for record deserialization
+    let schema: Vec<Type> = column_infos.iter().map(|c| c.ty).collect();
 
     // Build column descriptors — use alias for column resolution if provided
     let resolve_name = alias.unwrap_or(table_name);
@@ -161,7 +161,7 @@ fn build_column_descs(
                 table_oid: table_id,
                 column_id: (i + 1) as i16,
             }),
-            data_type: col.data_type,
+            ty: col.ty,
         })
         .collect()
 }
@@ -252,24 +252,24 @@ fn infer_column_desc(expr: &Expr, alias: Option<&str>, input_columns: &[ColumnDe
                 Err(_) => ColumnDesc {
                     name: column.clone(),
                     source: None,
-                    data_type: Type::Text,
+                    ty: Type::Text,
                 },
             }
         }
         Expr::Function { name, .. } => ColumnDesc {
             name: name.clone(),
             source: None,
-            data_type: infer_data_type(expr, input_columns),
+            ty: infer_type(expr, input_columns),
         },
         Expr::Cast { data_type, .. } => ColumnDesc {
             name: data_type.display_name().to_lowercase(),
             source: None,
-            data_type: infer_data_type(expr, input_columns),
+            ty: infer_type(expr, input_columns),
         },
         _ => ColumnDesc {
             name: "?column?".to_string(),
             source: None,
-            data_type: infer_data_type(expr, input_columns),
+            ty: infer_type(expr, input_columns),
         },
     };
 
@@ -280,16 +280,16 @@ fn infer_column_desc(expr: &Expr, alias: Option<&str>, input_columns: &[ColumnDe
     desc
 }
 
-/// Infers the output data type from an expression.
+/// Infers the output type from an expression.
 ///
 /// For column references, uses the known column type. For other expressions,
 /// uses a heuristic based on the expression kind. The actual type will be
 /// determined at evaluation time and may differ.
-fn infer_data_type(expr: &Expr, columns: &[ColumnDesc]) -> Type {
+fn infer_type(expr: &Expr, columns: &[ColumnDesc]) -> Type {
     match expr {
         Expr::ColumnRef { table, column } => {
             match resolve_column_index(table.as_deref(), column, columns) {
-                Ok(i) => columns[i].data_type,
+                Ok(i) => columns[i].ty,
                 Err(_) => Type::Text,
             }
         }
@@ -308,9 +308,9 @@ fn infer_data_type(expr: &Expr, columns: &[ColumnDesc]) -> Type {
             | crate::sql::BinaryOperator::And
             | crate::sql::BinaryOperator::Or => Type::Bool,
             crate::sql::BinaryOperator::Concat => Type::Text,
-            _ => infer_data_type(left, columns),
+            _ => infer_type(left, columns),
         },
-        Expr::UnaryOp { operand, .. } => infer_data_type(operand, columns),
+        Expr::UnaryOp { operand, .. } => infer_type(operand, columns),
         Expr::IsNull { .. } | Expr::InList { .. } | Expr::Between { .. } | Expr::Like { .. } => {
             Type::Bool
         }
@@ -486,27 +486,27 @@ mod tests {
         // Integer literal → bigint
         let select = parse_select("SELECT 42");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::Bigint);
+        assert_eq!(plan.columns()[0].ty, Type::Bigint);
 
         // Float literal → DoublePrecision
         let select = parse_select("SELECT 3.14");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::DoublePrecision);
+        assert_eq!(plan.columns()[0].ty, Type::DoublePrecision);
 
         // Boolean literal → Bool
         let select = parse_select("SELECT TRUE");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::Bool);
+        assert_eq!(plan.columns()[0].ty, Type::Bool);
 
         // String literal → Text
         let select = parse_select("SELECT 'hello'");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::Text);
+        assert_eq!(plan.columns()[0].ty, Type::Text);
 
         // NULL → Text (fallback)
         let select = parse_select("SELECT NULL");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::Text);
+        assert_eq!(plan.columns()[0].ty, Type::Text);
     }
 
     #[tokio::test]
@@ -516,47 +516,47 @@ mod tests {
         // Comparison → Bool
         let select = parse_select("SELECT 1 = 1");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::Bool);
+        assert_eq!(plan.columns()[0].ty, Type::Bool);
 
         // Arithmetic → inherits left operand type (Bigint)
         let select = parse_select("SELECT 1 + 2");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::Bigint);
+        assert_eq!(plan.columns()[0].ty, Type::Bigint);
 
         // Concatenation → Text
         let select = parse_select("SELECT 'a' || 'b'");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::Text);
+        assert_eq!(plan.columns()[0].ty, Type::Text);
 
         // IS NULL → Bool
         let select = parse_select("SELECT 1 IS NULL");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::Bool);
+        assert_eq!(plan.columns()[0].ty, Type::Bool);
 
         // IN list → Bool
         let select = parse_select("SELECT 1 IN (1, 2)");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::Bool);
+        assert_eq!(plan.columns()[0].ty, Type::Bool);
 
         // BETWEEN → Bool
         let select = parse_select("SELECT 1 BETWEEN 0 AND 2");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::Bool);
+        assert_eq!(plan.columns()[0].ty, Type::Bool);
 
         // LIKE → Bool
         let select = parse_select("SELECT 'a' LIKE '%'");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::Bool);
+        assert_eq!(plan.columns()[0].ty, Type::Bool);
 
         // CAST → target type
         let select = parse_select("SELECT CAST(1 AS TEXT)");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::Text);
+        assert_eq!(plan.columns()[0].ty, Type::Text);
 
         // Unary minus → inherits operand type
         let select = parse_select("SELECT -42");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::Bigint);
+        assert_eq!(plan.columns()[0].ty, Type::Bigint);
     }
 
     #[tokio::test]
@@ -566,11 +566,11 @@ mod tests {
         // Column reference preserves source type
         let select = parse_select("SELECT table_id FROM sys_tables");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::Integer);
+        assert_eq!(plan.columns()[0].ty, Type::Integer);
 
         let select = parse_select("SELECT table_name FROM sys_tables");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
-        assert_eq!(plan.columns()[0].data_type, Type::Text);
+        assert_eq!(plan.columns()[0].ty, Type::Text);
     }
 
     #[tokio::test]
