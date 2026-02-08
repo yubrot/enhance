@@ -216,6 +216,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 .await
             }
             Statement::Select(select_stmt) => {
+                // TODO: We don't want to commit single select
                 self.within_transaction(|db, txid, cid| async move {
                     let snapshot = db.tx_manager().snapshot(txid, cid);
                     let plan = executor::plan_select(select_stmt, db.catalog(), &snapshot).await?;
@@ -231,7 +232,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 })
                 .await
             }
-            Statement::Insert(_) => Ok(QueryResult::command("INSERT0 0")),
+            Statement::Insert(_) => Ok(QueryResult::command("INSERT 0 0")),
             Statement::Update(_) => Ok(QueryResult::command("UPDATE 0")),
             Statement::Delete(_) => Ok(QueryResult::command("DELETE 0")),
             Statement::DropTable(_) => Ok(QueryResult::command("DROP TABLE")),
