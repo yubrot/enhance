@@ -113,7 +113,7 @@ impl Plan {
 mod tests {
     use super::*;
     use crate::datum::Type;
-    use crate::sql::BinaryOperator;
+    use crate::sql::Parser;
     use crate::storage::PageId;
 
     fn int_col(name: &str) -> ColumnDesc {
@@ -122,6 +122,15 @@ mod tests {
             source: None,
             data_type: Type::Int8,
         }
+    }
+
+    /// Parses and binds a SQL expression against the given column descriptors.
+    fn bind_expr(sql: &str, columns: &[ColumnDesc]) -> BoundExpr {
+        Parser::new(sql)
+            .parse_expr()
+            .expect("parse error")
+            .bind(columns)
+            .expect("bind error")
     }
 
     #[test]
@@ -147,14 +156,7 @@ mod tests {
         };
         let plan = Plan::Filter {
             input: Box::new(scan),
-            predicate: BoundExpr::BinaryOp {
-                left: Box::new(BoundExpr::Column {
-                    index: 0,
-                    name: Some("id".into()),
-                }),
-                op: BinaryOperator::Gt,
-                right: Box::new(BoundExpr::Integer(5)),
-            },
+            predicate: bind_expr("id > 5", &[int_col("id")]),
         };
         assert_eq!(
             plan.explain(),
@@ -173,10 +175,7 @@ mod tests {
         };
         let plan = Plan::Projection {
             input: Box::new(scan),
-            exprs: vec![BoundExpr::Column {
-                index: 1,
-                name: Some("name".into()),
-            }],
+            exprs: vec![bind_expr("name", &[int_col("id"), int_col("name")])],
             columns: vec![int_col("name")],
         };
         assert_eq!(

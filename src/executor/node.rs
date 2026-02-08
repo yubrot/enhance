@@ -273,7 +273,7 @@ mod tests {
     use crate::db::Database;
     use crate::executor::ExecContextImpl;
     use crate::heap::{HeapPage, Record};
-    use crate::sql::{BinaryOperator, Parser, Statement};
+    use crate::sql::{Parser, Statement};
     use crate::storage::{LruReplacer, MemoryStorage, PageId};
     use crate::tx::CommandId;
 
@@ -382,6 +382,15 @@ mod tests {
         }
     }
 
+    /// Parses and binds a SQL expression against the given column descriptors.
+    fn bind_expr(sql: &str, columns: &[ColumnDesc]) -> BoundExpr {
+        Parser::new(sql)
+            .parse_expr()
+            .expect("parse error")
+            .bind(columns)
+            .expect("bind error")
+    }
+
     #[tokio::test]
     async fn test_seq_scan_lazy_loading() {
         let (db, first_page) = setup_int_table(vec![1, 2, 3]).await;
@@ -422,15 +431,8 @@ mod tests {
             first_page,
         ));
 
-        // Filter: $col0 > 2
-        let predicate = BoundExpr::BinaryOp {
-            left: Box::new(BoundExpr::Column {
-                index: 0,
-                name: None,
-            }),
-            op: BinaryOperator::Gt,
-            right: Box::new(BoundExpr::Integer(2)),
-        };
+        // Filter: id > 2
+        let predicate = bind_expr("id > 2", &[int_col("id")]);
         let mut node = ExecutorNode::Filter(Filter::new(scan, predicate));
 
         assert_eq!(
@@ -456,16 +458,9 @@ mod tests {
             first_page,
         ));
 
-        // Predicate that always evaluates to NULL: $col0 = NULL
+        // Predicate that always evaluates to NULL: id = NULL
         // NULL comparisons return NULL, which Filter must skip (not treat as true)
-        let predicate = BoundExpr::BinaryOp {
-            left: Box::new(BoundExpr::Column {
-                index: 0,
-                name: None,
-            }),
-            op: BinaryOperator::Eq,
-            right: Box::new(BoundExpr::Null),
-        };
+        let predicate = bind_expr("id = NULL", &[int_col("id")]);
         let mut node = ExecutorNode::Filter(Filter::new(scan, predicate));
 
         // All rows should be skipped because NULL is not true
@@ -492,10 +487,7 @@ mod tests {
         ));
 
         // Project: just the name column (index 1)
-        let exprs = vec![BoundExpr::Column {
-            index: 1,
-            name: Some("name".into()),
-        }];
+        let exprs = vec![bind_expr("name", &[int_col("id"), int_col("name")])];
         let out_cols = vec![ColumnDesc {
             name: "name".to_string(),
             source: None,
@@ -562,14 +554,7 @@ mod tests {
                 schema: vec![Type::Int8],
                 columns: vec![int_col("id")],
             }),
-            predicate: BoundExpr::BinaryOp {
-                left: Box::new(BoundExpr::Column {
-                    index: 0,
-                    name: None,
-                }),
-                op: BinaryOperator::Gt,
-                right: Box::new(BoundExpr::Integer(2)),
-            },
+            predicate: bind_expr("id > 2", &[int_col("id")]),
         };
 
         let mut node = plan.prepare_for_execute(&ctx);
@@ -601,10 +586,7 @@ mod tests {
                     },
                 ],
             }),
-            exprs: vec![BoundExpr::Column {
-                index: 1,
-                name: Some("name".into()),
-            }],
+            exprs: vec![bind_expr("name", &[int_col("id"), int_col("name")])],
             columns: vec![ColumnDesc {
                 name: "name".to_string(),
                 source: None,
@@ -632,7 +614,7 @@ mod tests {
 
         let plan = Plan::Projection {
             input: Box::new(Plan::ValuesScan),
-            exprs: vec![BoundExpr::Integer(42)],
+            exprs: vec![bind_expr("42", &[])],
             columns: vec![int_col("?column?")],
         };
 
