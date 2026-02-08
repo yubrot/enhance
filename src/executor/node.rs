@@ -67,6 +67,129 @@ impl Plan {
     }
 }
 
+impl Plan {
+    /// Executes a DML plan (INSERT, UPDATE, DELETE) and returns the affected row count.
+    ///
+    /// This is the execution entry point for DML statements, in contrast to
+    /// [`prepare_for_execute`](Plan::prepare_for_execute) which is used for
+    /// SELECT/scan plans that produce rows.
+    pub async fn execute_dml<C: ExecContext>(
+        self,
+        ctx: &C,
+    ) -> Result<u64, ExecutorError> {
+        match self {
+            Plan::Insert {
+                first_page,
+                schema,
+                values,
+                serial_columns,
+                ..
+            } => {
+                execute_insert(ctx, first_page, &schema, values, &serial_columns).await
+            }
+            Plan::Update {
+                input,
+                assignments,
+                first_page,
+                ..
+            } => {
+                execute_update(ctx, *input, &assignments, first_page).await
+            }
+            Plan::Delete { input, .. } => {
+                execute_delete(ctx, *input).await
+            }
+            _ => unreachable!("non-DML plans should not be passed to execute_dml"),
+        }
+    }
+}
+
+/// Executes an INSERT plan: evaluates value expressions, auto-populates SERIAL
+/// columns, and inserts records via the context.
+async fn execute_insert<C: ExecContext>(
+    ctx: &C,
+    first_page: PageId,
+    schema: &[Type],
+    values: Vec<Vec<BoundExpr>>,
+    serial_columns: &[(usize, u32)],
+) -> Result<u64, ExecutorError> {
+    let empty_record = Record::new(vec![]);
+    let mut count = 0u64;
+
+    for row_exprs in &values {
+        let mut row_values = Vec::with_capacity(schema.len());
+        for expr in row_exprs {
+            row_values.push(expr.evaluate(&empty_record)?);
+        }
+
+        // Auto-populate SERIAL columns with nextval
+        for &(col_idx, seq_id) in serial_columns {
+            let val = ctx.nextval(seq_id).await?;
+            // Cast the i64 nextval result to match the column type
+            row_values[col_idx] = Value::Bigint(val)
+                .cast(&schema[col_idx])
+                .map_err(|(_, _)| ExecutorError::NumericOutOfRange {
+                    type_name: schema[col_idx].display_name().to_string(),
+                })?;
+        }
+
+        let record = Record::new(row_values);
+        ctx.insert_tuple(first_page, &record).await?;
+        count += 1;
+    }
+
+    Ok(count)
+}
+
+/// Executes an UPDATE plan: scans matching rows, evaluates SET expressions,
+/// and calls update_tuple for each.
+async fn execute_update<C: ExecContext>(
+    ctx: &C,
+    input: Plan,
+    assignments: &[BoundExpr],
+    first_page: PageId,
+) -> Result<u64, ExecutorError> {
+    let mut node = input.prepare_for_execute(ctx);
+    let mut count = 0u64;
+
+    while let Some(row) = node.next().await? {
+        let tid = row.tid.ok_or_else(|| {
+            ExecutorError::Unsupported("UPDATE on rows without physical location".to_string())
+        })?;
+
+        // Evaluate assignments against the current row
+        let mut new_values = Vec::with_capacity(assignments.len());
+        for expr in assignments {
+            let val = expr.evaluate(&row.record)?;
+            new_values.push(val);
+        }
+
+        let new_record = Record::new(new_values);
+        ctx.update_tuple(first_page, tid, &new_record).await?;
+        count += 1;
+    }
+
+    Ok(count)
+}
+
+/// Executes a DELETE plan: scans matching rows and calls delete_tuple for each.
+async fn execute_delete<C: ExecContext>(
+    ctx: &C,
+    input: Plan,
+) -> Result<u64, ExecutorError> {
+    let mut node = input.prepare_for_execute(ctx);
+    let mut count = 0u64;
+
+    while let Some(row) = node.next().await? {
+        let tid = row.tid.ok_or_else(|| {
+            ExecutorError::Unsupported("DELETE on rows without physical location".to_string())
+        })?;
+        ctx.delete_tuple(tid).await?;
+        count += 1;
+    }
+
+    Ok(count)
+}
+
 impl<C: ExecContext> ExecutorNode<C> {
     /// Returns the next tuple, or `None` if exhausted.
     ///
@@ -625,5 +748,225 @@ mod tests {
         let tuple = node.next().await.unwrap().unwrap();
         assert_eq!(tuple.record.values, vec![Value::Bigint(42)]);
         assert!(node.next().await.unwrap().is_none());
+    }
+
+    // --- DML execution tests ---
+
+    use crate::executor::planner;
+
+    /// Helper: create a table, plan an INSERT, execute it, then verify by scanning.
+    async fn setup_table_and_ctx(
+        ddl: &str,
+    ) -> (TestDb, crate::tx::Snapshot) {
+        let db = Database::open(MemoryStorage::new(), 100).await.unwrap();
+        let txid = db.tx_manager().begin();
+        let stmt = crate::sql::Parser::new(ddl).parse().unwrap().unwrap();
+        let Statement::CreateTable(create_stmt) = stmt else {
+            panic!("expected CreateTable");
+        };
+        db.catalog()
+            .create_table(txid, CommandId::FIRST, &create_stmt)
+            .await
+            .unwrap();
+        db.tx_manager().commit(txid).unwrap();
+
+        let txid = db.tx_manager().begin();
+        let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
+        (db, snapshot)
+    }
+
+    fn parse_insert_stmt(sql: &str) -> crate::sql::InsertStmt {
+        let stmt = crate::sql::Parser::new(sql).parse().unwrap().unwrap();
+        let crate::sql::Statement::Insert(insert) = stmt else {
+            panic!("expected INSERT");
+        };
+        *insert
+    }
+
+    fn parse_update_stmt(sql: &str) -> crate::sql::UpdateStmt {
+        let stmt = crate::sql::Parser::new(sql).parse().unwrap().unwrap();
+        let crate::sql::Statement::Update(update) = stmt else {
+            panic!("expected UPDATE");
+        };
+        *update
+    }
+
+    fn parse_delete_stmt(sql: &str) -> crate::sql::DeleteStmt {
+        let stmt = crate::sql::Parser::new(sql).parse().unwrap().unwrap();
+        let crate::sql::Statement::Delete(delete) = stmt else {
+            panic!("expected DELETE");
+        };
+        *delete
+    }
+
+    #[tokio::test]
+    async fn test_execute_insert() {
+        let (db, snapshot) = setup_table_and_ctx(
+            "CREATE TABLE t (id INTEGER, name TEXT)",
+        )
+        .await;
+
+        let insert = parse_insert_stmt("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')");
+        let plan = planner::plan_insert(&insert, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        let ctx = db.exec_context(snapshot.clone());
+        let count = plan.execute_dml(&ctx).await.unwrap();
+        assert_eq!(count, 2);
+
+        // Verify by scanning with a new CID
+        let snapshot2 = db.tx_manager().snapshot(snapshot.current_txid, CommandId::new(1));
+        let table = db.catalog().get_table(&snapshot2, "t").await.unwrap().unwrap();
+        let ctx2 = db.exec_context(snapshot2);
+        let (tuples, _) = ctx2
+            .scan_heap_page(table.first_page, &[Type::Integer, Type::Text])
+            .await
+            .unwrap();
+        assert_eq!(tuples.len(), 2);
+        assert_eq!(tuples[0].record.values[1], Value::Text("Alice".into()));
+        assert_eq!(tuples[1].record.values[1], Value::Text("Bob".into()));
+    }
+
+    #[tokio::test]
+    async fn test_execute_delete() {
+        let (db, snapshot) = setup_table_and_ctx(
+            "CREATE TABLE t (id INTEGER, name TEXT)",
+        )
+        .await;
+
+        // First insert some data
+        let insert = parse_insert_stmt("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')");
+        let plan = planner::plan_insert(&insert, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        let ctx = db.exec_context(snapshot.clone());
+        plan.execute_dml(&ctx).await.unwrap();
+
+        // Delete where id = 2
+        let snapshot2 = db.tx_manager().snapshot(snapshot.current_txid, CommandId::new(1));
+        let delete = parse_delete_stmt("DELETE FROM t WHERE id = 2");
+        let plan = planner::plan_delete(&delete, db.catalog(), &snapshot2)
+            .await
+            .unwrap();
+        let ctx2 = db.exec_context(snapshot2);
+        let count = plan.execute_dml(&ctx2).await.unwrap();
+        assert_eq!(count, 1);
+
+        // Verify: should have 2 rows remaining
+        let snapshot3 = db.tx_manager().snapshot(snapshot.current_txid, CommandId::new(2));
+        let table = db.catalog().get_table(&snapshot3, "t").await.unwrap().unwrap();
+        let ctx3 = db.exec_context(snapshot3);
+        let (tuples, _) = ctx3
+            .scan_heap_page(table.first_page, &[Type::Integer, Type::Text])
+            .await
+            .unwrap();
+        assert_eq!(tuples.len(), 2);
+        assert_eq!(tuples[0].record.values[0], Value::Integer(1));
+        assert_eq!(tuples[1].record.values[0], Value::Integer(3));
+    }
+
+    #[tokio::test]
+    async fn test_execute_update() {
+        let (db, snapshot) = setup_table_and_ctx(
+            "CREATE TABLE t (id INTEGER, name TEXT)",
+        )
+        .await;
+
+        // Insert initial data
+        let insert = parse_insert_stmt("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')");
+        let plan = planner::plan_insert(&insert, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        let ctx = db.exec_context(snapshot.clone());
+        plan.execute_dml(&ctx).await.unwrap();
+
+        // Update: SET name = 'Updated' WHERE id = 1
+        let snapshot2 = db.tx_manager().snapshot(snapshot.current_txid, CommandId::new(1));
+        let update = parse_update_stmt("UPDATE t SET name = 'Updated' WHERE id = 1");
+        let plan = planner::plan_update(&update, db.catalog(), &snapshot2)
+            .await
+            .unwrap();
+        let ctx2 = db.exec_context(snapshot2);
+        let count = plan.execute_dml(&ctx2).await.unwrap();
+        assert_eq!(count, 1);
+
+        // Verify: Alice should now be Updated, Bob unchanged
+        let snapshot3 = db.tx_manager().snapshot(snapshot.current_txid, CommandId::new(2));
+        let table = db.catalog().get_table(&snapshot3, "t").await.unwrap().unwrap();
+        let ctx3 = db.exec_context(snapshot3);
+        let (tuples, _) = ctx3
+            .scan_heap_page(table.first_page, &[Type::Integer, Type::Text])
+            .await
+            .unwrap();
+        // Bob should remain, Alice's old version is deleted, new version is inserted
+        // Due to same-page priority, we should have 3 physical tuples but only 2 visible
+        assert_eq!(tuples.len(), 2);
+        let names: Vec<&Value> = tuples.iter().map(|t| &t.record.values[1]).collect();
+        assert!(names.contains(&&Value::Text("Updated".into())));
+        assert!(names.contains(&&Value::Text("Bob".into())));
+    }
+
+    #[tokio::test]
+    async fn test_execute_insert_serial() {
+        let (db, snapshot) = setup_table_and_ctx(
+            "CREATE TABLE t (id SERIAL, name TEXT)",
+        )
+        .await;
+
+        let insert = parse_insert_stmt("INSERT INTO t (name) VALUES ('Alice'), ('Bob')");
+        let plan = planner::plan_insert(&insert, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        let ctx = db.exec_context(snapshot.clone());
+        let count = plan.execute_dml(&ctx).await.unwrap();
+        assert_eq!(count, 2);
+
+        // Verify SERIAL ids are auto-incremented
+        let snapshot2 = db.tx_manager().snapshot(snapshot.current_txid, CommandId::new(1));
+        let table = db.catalog().get_table(&snapshot2, "t").await.unwrap().unwrap();
+        let ctx2 = db.exec_context(snapshot2);
+        let (tuples, _) = ctx2
+            .scan_heap_page(table.first_page, &[Type::Integer, Type::Text])
+            .await
+            .unwrap();
+        assert_eq!(tuples.len(), 2);
+        assert_eq!(tuples[0].record.values[0], Value::Integer(1));
+        assert_eq!(tuples[1].record.values[0], Value::Integer(2));
+    }
+
+    #[tokio::test]
+    async fn test_execute_delete_without_where() {
+        let (db, snapshot) = setup_table_and_ctx(
+            "CREATE TABLE t (id INTEGER)",
+        )
+        .await;
+
+        // Insert data
+        let insert = parse_insert_stmt("INSERT INTO t VALUES (1), (2), (3)");
+        let plan = planner::plan_insert(&insert, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        let ctx = db.exec_context(snapshot.clone());
+        plan.execute_dml(&ctx).await.unwrap();
+
+        // Delete all rows
+        let snapshot2 = db.tx_manager().snapshot(snapshot.current_txid, CommandId::new(1));
+        let delete = parse_delete_stmt("DELETE FROM t");
+        let plan = planner::plan_delete(&delete, db.catalog(), &snapshot2)
+            .await
+            .unwrap();
+        let ctx2 = db.exec_context(snapshot2);
+        let count = plan.execute_dml(&ctx2).await.unwrap();
+        assert_eq!(count, 3);
+
+        // Verify: no visible rows
+        let snapshot3 = db.tx_manager().snapshot(snapshot.current_txid, CommandId::new(2));
+        let table = db.catalog().get_table(&snapshot3, "t").await.unwrap().unwrap();
+        let ctx3 = db.exec_context(snapshot3);
+        let (tuples, _) = ctx3
+            .scan_heap_page(table.first_page, &[Type::Integer])
+            .await
+            .unwrap();
+        assert_eq!(tuples.len(), 0);
     }
 }

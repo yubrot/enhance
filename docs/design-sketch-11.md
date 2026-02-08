@@ -236,7 +236,7 @@ No circular dependencies. `heap/writer` and `heap/scanner` are shared by both `e
   - Tests: basic UPDATE plan, UPDATE with WHERE, DELETE plan, DELETE with WHERE, UPDATE type coercion on SET values, UPDATE referencing existing columns
   - Edge cases: UPDATE type coercion, expression referencing other columns
 
-- [ ] **Commit 7: DML executor nodes and EXPLAIN** — Add `InsertNode`, `UpdateNode`, `DeleteNode` with `execute_dml()`, EXPLAIN support for DML plans
+- [x] **Commit 7: DML executor nodes and EXPLAIN** — Add `InsertNode`, `UpdateNode`, `DeleteNode` with `execute_dml()`, EXPLAIN support for DML plans
   - Tests: INSERT executes and returns correct affected count, DELETE filters and returns count, UPDATE delete+insert, multi-row INSERT, UPDATE/DELETE without WHERE, EXPLAIN INSERT/UPDATE/DELETE
   - Edge cases: empty table operations, multi-page INSERT
 
