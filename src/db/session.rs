@@ -59,15 +59,20 @@ pub struct TransactionState {
 /// - Auto-commit mode for individual statements
 /// - SQL parsing and execution coordination
 ///
-/// # Transaction Ownership
+/// # Transaction Cleanup
 ///
-/// The caller is responsible for closing any transaction started via [`begin()`](Self::begin)
-/// by calling either [`commit()`](Self::commit) or [`rollback()`](Self::rollback).
-/// Dropping a `Session` with an active transaction does **not** automatically roll it back;
-/// this would leave the transaction manager in an inconsistent state.
+/// When a `Session` is dropped with an active transaction, the transaction is
+/// automatically rolled back. This prevents zombie transactions from accumulating
+/// in the transaction manager (e.g., when a client disconnects unexpectedly).
 pub struct Session<S: Storage, R: Replacer> {
     database: Arc<Database<S, R>>,
     transaction: Option<TransactionState>,
+}
+
+impl<S: Storage, R: Replacer> Drop for Session<S, R> {
+    fn drop(&mut self) {
+        self.rollback();
+    }
 }
 
 impl<S: Storage, R: Replacer> Session<S, R> {
@@ -323,6 +328,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
 mod tests {
     use super::*;
     use crate::storage::MemoryStorage;
+    use crate::tx::TxState;
 
     #[tokio::test]
     async fn test_session_transaction_lifecycle() {
@@ -691,5 +697,36 @@ mod tests {
             .execute_query("SELECT nonexistent_col FROM sys_tables")
             .await;
         assert!(matches!(result, Err(DatabaseError::Executor(_))));
+    }
+
+    #[tokio::test]
+    async fn test_drop_rolls_back_active_transaction() {
+        let storage = Arc::new(MemoryStorage::new());
+        let db = Arc::new(Database::open(storage, 100).await.unwrap());
+        let tx_manager = Arc::clone(db.tx_manager());
+
+        let txid = {
+            let mut session = Session::new(db);
+            session.begin();
+            let txid = session.transaction().unwrap().txid;
+
+            // Transaction should be in-progress before drop
+            assert_eq!(tx_manager.state(txid), TxState::InProgress);
+            txid
+            // session is dropped here
+        };
+
+        // After drop, the transaction should be aborted
+        assert_eq!(tx_manager.state(txid), TxState::Aborted);
+    }
+
+    #[tokio::test]
+    async fn test_drop_without_transaction_is_noop() {
+        let storage = Arc::new(MemoryStorage::new());
+        let db = Arc::new(Database::open(storage, 100).await.unwrap());
+
+        // Session with no transaction — drop should not panic
+        let session = Session::new(db);
+        drop(session);
     }
 }
