@@ -414,7 +414,10 @@ fn eval_unary_op(op: UnaryOperator, val: &Value) -> Result<Value, ExecutorError>
         UnaryOperator::Minus => match val {
             Value::Int16(n) => Ok(Value::Int64(-(*n as i64))),
             Value::Int32(n) => Ok(Value::Int64(-(*n as i64))),
-            Value::Int64(n) => Ok(Value::Int64(-n)),
+            Value::Int64(n) => n
+                .checked_neg()
+                .map(Value::Int64)
+                .ok_or(ExecutorError::IntegerOverflow),
             Value::Float32(n) => Ok(Value::Float64(-(*n as f64))),
             Value::Float64(n) => Ok(Value::Float64(-n)),
             _ => Err(ExecutorError::TypeMismatch {
@@ -1037,6 +1040,19 @@ mod tests {
         assert_eq!(eval("-3.14").unwrap(), Value::Float64(-3.14));
         // -NULL = NULL
         assert_eq!(eval("-NULL").unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_unary_minus_integer_overflow() {
+        // -i64::MIN overflows because i64::MIN.abs() > i64::MAX
+        let bound = BoundExpr::UnaryOp {
+            op: UnaryOperator::Minus,
+            operand: Box::new(BoundExpr::Integer(i64::MIN)),
+        };
+        assert!(matches!(
+            bound.evaluate(&Record::new(vec![])),
+            Err(ExecutorError::IntegerOverflow)
+        ));
     }
 
     #[test]
