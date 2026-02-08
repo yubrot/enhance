@@ -2,7 +2,7 @@
 
 use crate::catalog::{Catalog, ColumnInfo};
 use crate::datum::Type;
-use crate::sql::{Expr, FromClause, SelectItem, SelectStmt, TableRef};
+use crate::sql::{BinaryOperator, Expr, FromClause, SelectItem, SelectStmt, TableRef};
 use crate::storage::{Replacer, Storage};
 use crate::tx::Snapshot;
 
@@ -282,9 +282,9 @@ fn infer_column_desc(expr: &Expr, alias: Option<&str>, input_columns: &[ColumnDe
 
 /// Infers the output type from an expression.
 ///
-/// For column references, uses the known column type. For other expressions,
-/// uses a heuristic based on the expression kind. The actual type will be
-/// determined at evaluation time and may differ.
+/// For column references, uses the known column type. For arithmetic
+/// operations, applies [`numeric_promotion`] to both operands so that the
+/// inferred type matches the runtime evaluation result.
 fn infer_type(expr: &Expr, columns: &[ColumnDesc]) -> Type {
     match expr {
         Expr::ColumnRef { table, column } => {
@@ -298,17 +298,23 @@ fn infer_type(expr: &Expr, columns: &[ColumnDesc]) -> Type {
         Expr::Boolean(_) => Type::Bool,
         Expr::String(_) => Type::Text,
         Expr::Null => Type::Text,
-        Expr::BinaryOp { op, left, .. } => match op {
-            crate::sql::BinaryOperator::Eq
-            | crate::sql::BinaryOperator::Neq
-            | crate::sql::BinaryOperator::Lt
-            | crate::sql::BinaryOperator::LtEq
-            | crate::sql::BinaryOperator::Gt
-            | crate::sql::BinaryOperator::GtEq
-            | crate::sql::BinaryOperator::And
-            | crate::sql::BinaryOperator::Or => Type::Bool,
-            crate::sql::BinaryOperator::Concat => Type::Text,
-            _ => infer_type(left, columns),
+        Expr::BinaryOp { op, left, right } => match op {
+            BinaryOperator::Eq
+            | BinaryOperator::Neq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+            | BinaryOperator::And
+            | BinaryOperator::Or => Type::Bool,
+            BinaryOperator::Concat => Type::Text,
+            BinaryOperator::Add
+            | BinaryOperator::Sub
+            | BinaryOperator::Mul
+            | BinaryOperator::Div
+            | BinaryOperator::Mod => {
+                infer_arithmetic_type(infer_type(left, columns), infer_type(right, columns))
+            }
         },
         Expr::UnaryOp { operand, .. } => infer_type(operand, columns),
         Expr::IsNull { .. } | Expr::InList { .. } | Expr::Between { .. } | Expr::Like { .. } => {
@@ -319,6 +325,17 @@ fn infer_type(expr: &Expr, columns: &[ColumnDesc]) -> Type {
         // "unknown" type. This may cause issues in Step 11 (DML) where INSERT needs
         // accurate type inference for literal values to match target column types.
         _ => Type::Text,
+    }
+}
+
+fn infer_arithmetic_type(left: Type, right: Type) -> Type {
+    let (Some(left), Some(right)) = (left.to_wide_numeric(), right.to_wide_numeric()) else {
+        // Non-numeric operand: keep the inferred type and let eval report the error.
+        return left;
+    };
+    match (left, right) {
+        (Type::Bigint, Type::Bigint) => Type::Bigint,
+        _ => Type::DoublePrecision,
     }
 }
 
@@ -488,7 +505,7 @@ mod tests {
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Bigint);
 
-        // Float literal → DoublePrecision
+        // Float literal → Double
         let select = parse_select("SELECT 3.14");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
         assert_eq!(plan.columns()[0].ty, Type::DoublePrecision);
@@ -518,10 +535,25 @@ mod tests {
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Bool);
 
-        // Arithmetic → inherits left operand type (Bigint)
+        // Arithmetic (int + int) → Bigint
         let select = parse_select("SELECT 1 + 2");
         let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Bigint);
+
+        // Arithmetic (int + float) → Double via numeric promotion
+        let select = parse_select("SELECT 1 + 2.5");
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        assert_eq!(plan.columns()[0].ty, Type::DoublePrecision);
+
+        // Arithmetic (float + int) → Double via numeric promotion
+        let select = parse_select("SELECT 2.5 + 1");
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        assert_eq!(plan.columns()[0].ty, Type::DoublePrecision);
+
+        // Arithmetic (float + float) → Double
+        let select = parse_select("SELECT 1.0 * 2.5");
+        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        assert_eq!(plan.columns()[0].ty, Type::DoublePrecision);
 
         // Concatenation → Text
         let select = parse_select("SELECT 'a' || 'b'");

@@ -121,6 +121,20 @@ impl Type {
         }
     }
 
+    /// Returns the widened numeric [`Type`] that [`Value::to_wide_numeric`] would produce,
+    /// or `None` for non-numeric types.
+    ///
+    /// This is the type-level counterpart of [`Value::to_wide_numeric`]: integer types
+    /// widen to [`Bigint`](Type::Bigint) and floating-point types widen to
+    /// [`Double`](Type::Double).
+    pub const fn to_wide_numeric(self) -> Option<Type> {
+        match self {
+            Type::Smallint | Type::Integer | Type::Bigint => Some(Type::Bigint),
+            Type::Real | Type::DoublePrecision => Some(Type::DoublePrecision),
+            _ => None,
+        }
+    }
+
     /// Returns the fixed byte size for fixed-length types, or `None` for variable-length types.
     pub const fn fixed_size(self) -> Option<usize> {
         match self {
@@ -186,14 +200,6 @@ impl fmt::Display for Type {
         };
         write!(f, "{}", name)
     }
-}
-
-/// Widened numeric representation for cross-type numeric operations.
-pub enum WideNumeric {
-    /// 64-bit integer (widened from Smallint, Integer, or Bigint).
-    Bigint(i64),
-    /// 64-bit float (widened from Real or DoublePrecision).
-    DoublePrecision(f64),
 }
 
 /// A typed database value.
@@ -418,16 +424,19 @@ impl Value {
         }
     }
 
-    /// Widens a numeric [`Value`] for cross-type operations.
+    /// Widens a numeric value to [`Bigint`](Value::Bigint) or
+    /// [`Double`](Value::Double) for cross-type operations.
     ///
-    /// Returns `None` for non-numeric types (Boolean, Text, Bytea, Null).
-    pub fn to_wide_numeric(&self) -> Option<WideNumeric> {
+    /// Integer types widen to `Bigint`, floating-point types widen to
+    /// `Double`. Returns `None` for non-numeric types.
+    /// [`Type::to_wide_numeric`] is the type-level counterpart.
+    pub fn to_wide_numeric(&self) -> Option<Value> {
         match self {
-            Value::Smallint(n) => Some(WideNumeric::Bigint(*n as i64)),
-            Value::Integer(n) => Some(WideNumeric::Bigint(*n as i64)),
-            Value::Bigint(n) => Some(WideNumeric::Bigint(*n)),
-            Value::Real(n) => Some(WideNumeric::DoublePrecision(*n as f64)),
-            Value::DoublePrecision(n) => Some(WideNumeric::DoublePrecision(*n)),
+            Value::Smallint(n) => Some(Value::Bigint(*n as i64)),
+            Value::Integer(n) => Some(Value::Bigint(*n as i64)),
+            Value::Bigint(n) => Some(Value::Bigint(*n)),
+            Value::Real(n) => Some(Value::DoublePrecision(*n as f64)),
+            Value::DoublePrecision(n) => Some(Value::DoublePrecision(*n)),
             _ => None,
         }
     }
@@ -630,8 +639,8 @@ impl PartialOrd for Value {
     /// comparison involving NULL.
     ///
     /// Numeric types are promoted to a common wide type before comparison:
-    /// Smallint/Integer → Bigint, Real → DoublePrecision, and if either operand
-    /// s float both are compared as DoublePrecision.
+    /// Smallint/Integer → Bigint, Real → Double, and if either operand
+    /// s float both are compared as Double.
     ///
     /// Float ordering follows NaN-aware total ordering: NaN is greater than all
     /// non-NaN values, and NaN == NaN.
@@ -646,18 +655,15 @@ impl PartialOrd for Value {
             _ => {
                 let l = self.to_wide_numeric()?;
                 let r = other.to_wide_numeric()?;
-                Some(match (l, r) {
-                    (WideNumeric::Bigint(a), WideNumeric::Bigint(b)) => a.cmp(&b),
-                    (WideNumeric::DoublePrecision(a), WideNumeric::DoublePrecision(b)) => {
-                        compare_f64(a, b)
+                match (l, r) {
+                    (Value::Bigint(a), Value::Bigint(b)) => Some(a.cmp(&b)),
+                    (Value::DoublePrecision(a), Value::DoublePrecision(b)) => {
+                        Some(compare_f64(a, b))
                     }
-                    (WideNumeric::DoublePrecision(a), WideNumeric::Bigint(b)) => {
-                        compare_f64(a, b as f64)
-                    }
-                    (WideNumeric::Bigint(a), WideNumeric::DoublePrecision(b)) => {
-                        compare_f64(a as f64, b)
-                    }
-                })
+                    (Value::DoublePrecision(a), Value::Bigint(b)) => Some(compare_f64(a, b as f64)),
+                    (Value::Bigint(a), Value::DoublePrecision(b)) => Some(compare_f64(a as f64, b)),
+                    _ => None,
+                }
             }
         }
     }
@@ -1097,8 +1103,8 @@ mod tests {
     }
 
     #[test]
-    fn test_cast_double_precision_to_real_overflow() {
-        // DoublePrecision value too large for Real
+    fn test_cast_double_to_real_overflow() {
+        // Double value too large for Real
         assert!(matches!(
             Value::DoublePrecision(1.7976931348623157e308).cast(&Type::Real),
             Err((_, CastError::NumericOutOfRange))

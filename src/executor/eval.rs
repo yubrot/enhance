@@ -4,7 +4,7 @@
 //! [`Value`] result. Supports arithmetic, comparison, logical, string, NULL,
 //! LIKE, CASE, and CAST operations.
 
-use crate::datum::{CastError, Value, WideNumeric};
+use crate::datum::{CastError, Value};
 use crate::heap::Record;
 use crate::sql::{BinaryOperator, UnaryOperator};
 
@@ -313,16 +313,17 @@ fn eval_arithmetic(
         });
     };
     Ok(match (left, right) {
-        (WideNumeric::Bigint(a), WideNumeric::Bigint(b)) => Value::Bigint(int_op(a, b)?),
-        (WideNumeric::DoublePrecision(a), WideNumeric::DoublePrecision(b)) => {
+        (Value::Bigint(a), Value::Bigint(b)) => Value::Bigint(int_op(a, b)?),
+        (Value::DoublePrecision(a), Value::DoublePrecision(b)) => {
             Value::DoublePrecision(float_op(a, b)?)
         }
-        (WideNumeric::DoublePrecision(a), WideNumeric::Bigint(b)) => {
+        (Value::DoublePrecision(a), Value::Bigint(b)) => {
             Value::DoublePrecision(float_op(a, b as f64)?)
         }
-        (WideNumeric::Bigint(a), WideNumeric::DoublePrecision(b)) => {
+        (Value::Bigint(a), Value::DoublePrecision(b)) => {
             Value::DoublePrecision(float_op(a as f64, b)?)
         }
+        _ => panic!(), // to_wide_numeric only returns Bigint or Double
     })
 }
 
