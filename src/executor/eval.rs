@@ -237,9 +237,12 @@ fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) -> Result<Val
                 0 => Err(ExecutorError::DivisionByZero),
                 _ => Ok(a / b),
             },
-            |a, b| match b {
-                0.0 => Err(ExecutorError::DivisionByZero),
-                _ => Ok(a / b),
+            |a, b| {
+                if b == 0.0 {
+                    Err(ExecutorError::DivisionByZero)
+                } else {
+                    Ok(a / b)
+                }
             },
         ),
         BinaryOperator::Mod => eval_arithmetic(
@@ -249,9 +252,12 @@ fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) -> Result<Val
                 0 => Err(ExecutorError::DivisionByZero),
                 _ => Ok(a % b),
             },
-            |a, b| match b {
-                0.0 => Err(ExecutorError::DivisionByZero),
-                _ => Ok(a % b),
+            |a, b| {
+                if b == 0.0 {
+                    Err(ExecutorError::DivisionByZero)
+                } else {
+                    Ok(a % b)
+                }
             },
         ),
     }
