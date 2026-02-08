@@ -92,14 +92,14 @@ pub struct BoundWhenClause {
     pub result: BoundExpr,
 }
 
-impl BoundExpr {
-    /// Converts an AST [`Expr`] into a [`BoundExpr`] by resolving column names
+impl Expr {
+    /// Converts this AST [`Expr`] into a [`BoundExpr`] by resolving column names
     /// to positional indices via the provided column descriptors.
     ///
     /// Unsupported AST variants (Parameter, Function, Subquery, InSubquery, Exists)
     /// return [`ExecutorError::Unsupported`].
-    pub fn bind(expr: &Expr, columns: &[ColumnDesc]) -> Result<BoundExpr, ExecutorError> {
-        match expr {
+    pub fn bind(&self, columns: &[ColumnDesc]) -> Result<BoundExpr, ExecutorError> {
+        match self {
             Expr::Null => Ok(BoundExpr::Null),
             Expr::Boolean(b) => Ok(BoundExpr::Boolean(*b)),
             Expr::Integer(n) => Ok(BoundExpr::Integer(*n)),
@@ -113,18 +113,18 @@ impl BoundExpr {
             }
 
             Expr::BinaryOp { left, op, right } => Ok(BoundExpr::BinaryOp {
-                left: Box::new(BoundExpr::bind(left, columns)?),
+                left: Box::new(left.bind(columns)?),
                 op: *op,
-                right: Box::new(BoundExpr::bind(right, columns)?),
+                right: Box::new(right.bind(columns)?),
             }),
 
             Expr::UnaryOp { op, operand } => Ok(BoundExpr::UnaryOp {
                 op: *op,
-                operand: Box::new(BoundExpr::bind(operand, columns)?),
+                operand: Box::new(operand.bind(columns)?),
             }),
 
             Expr::IsNull { expr, negated } => Ok(BoundExpr::IsNull {
-                expr: Box::new(BoundExpr::bind(expr, columns)?),
+                expr: Box::new(expr.bind(columns)?),
                 negated: *negated,
             }),
 
@@ -135,10 +135,10 @@ impl BoundExpr {
             } => {
                 let bound_list = list
                     .iter()
-                    .map(|e| BoundExpr::bind(e, columns))
+                    .map(|e| e.bind(columns))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(BoundExpr::InList {
-                    expr: Box::new(BoundExpr::bind(expr, columns)?),
+                    expr: Box::new(expr.bind(columns)?),
                     list: bound_list,
                     negated: *negated,
                 })
@@ -150,9 +150,9 @@ impl BoundExpr {
                 high,
                 negated,
             } => Ok(BoundExpr::Between {
-                expr: Box::new(BoundExpr::bind(expr, columns)?),
-                low: Box::new(BoundExpr::bind(low, columns)?),
-                high: Box::new(BoundExpr::bind(high, columns)?),
+                expr: Box::new(expr.bind(columns)?),
+                low: Box::new(low.bind(columns)?),
+                high: Box::new(high.bind(columns)?),
                 negated: *negated,
             }),
 
@@ -164,12 +164,12 @@ impl BoundExpr {
                 case_insensitive,
             } => {
                 let bound_escape = match escape {
-                    Some(e) => Some(Box::new(BoundExpr::bind(e, columns)?)),
+                    Some(e) => Some(Box::new(e.bind(columns)?)),
                     None => None,
                 };
                 Ok(BoundExpr::Like {
-                    expr: Box::new(BoundExpr::bind(expr, columns)?),
-                    pattern: Box::new(BoundExpr::bind(pattern, columns)?),
+                    expr: Box::new(expr.bind(columns)?),
+                    pattern: Box::new(pattern.bind(columns)?),
                     escape: bound_escape,
                     negated: *negated,
                     case_insensitive: *case_insensitive,
@@ -182,20 +182,20 @@ impl BoundExpr {
                 else_result,
             } => {
                 let bound_operand = match operand {
-                    Some(op) => Some(Box::new(BoundExpr::bind(op, columns)?)),
+                    Some(op) => Some(Box::new(op.bind(columns)?)),
                     None => None,
                 };
                 let bound_whens = when_clauses
                     .iter()
                     .map(|wc| {
                         Ok(BoundWhenClause {
-                            condition: BoundExpr::bind(&wc.condition, columns)?,
-                            result: BoundExpr::bind(&wc.result, columns)?,
+                            condition: wc.condition.bind(columns)?,
+                            result: wc.result.bind(columns)?,
                         })
                     })
                     .collect::<Result<Vec<_>, ExecutorError>>()?;
                 let bound_else = match else_result {
-                    Some(e) => Some(Box::new(BoundExpr::bind(e, columns)?)),
+                    Some(e) => Some(Box::new(e.bind(columns)?)),
                     None => None,
                 };
                 Ok(BoundExpr::Case {
@@ -206,7 +206,7 @@ impl BoundExpr {
             }
 
             Expr::Cast { expr, data_type } => Ok(BoundExpr::Cast {
-                expr: Box::new(BoundExpr::bind(expr, columns)?),
+                expr: Box::new(expr.bind(columns)?),
                 data_type: data_type.to_type(),
             }),
 
@@ -356,6 +356,11 @@ mod tests {
         Parser::new(sql).parse_expr().expect("parse error")
     }
 
+    /// Parses and binds a SQL expression against the given column descriptors.
+    fn bind_expr(sql: &str, columns: &[ColumnDesc]) -> BoundExpr {
+        parse_expr(sql).bind(columns).expect("bind error")
+    }
+
     fn make_columns() -> Vec<ColumnDesc> {
         use crate::executor::ColumnSource;
         vec![
@@ -400,64 +405,50 @@ mod tests {
 
     #[test]
     fn test_display_literals() {
-        assert_eq!(BoundExpr::Null.to_string(), "NULL");
-        assert_eq!(BoundExpr::Boolean(true).to_string(), "true");
-        assert_eq!(BoundExpr::Integer(42).to_string(), "42");
-        assert_eq!(BoundExpr::Float(3.14).to_string(), "3.14");
-        assert_eq!(BoundExpr::String("hello".into()).to_string(), "'hello'");
+        let columns = vec![];
+        assert_eq!(bind_expr("NULL", &columns).to_string(), "NULL");
+        assert_eq!(bind_expr("TRUE", &columns).to_string(), "true");
+        assert_eq!(bind_expr("42", &columns).to_string(), "42");
+        assert_eq!(bind_expr("3.14", &columns).to_string(), "3.14");
+        assert_eq!(bind_expr("'hello'", &columns).to_string(), "'hello'");
     }
 
     #[test]
     fn test_display_column() {
+        let columns = make_columns();
         assert_eq!(
-            BoundExpr::Column {
-                index: 0,
-                name: None
-            }
-            .to_string(),
-            "$col0"
+            bind_expr("name", &columns).to_string(),
+            "$col1 (users.name)"
         );
         assert_eq!(
-            BoundExpr::Column {
-                index: 1,
-                name: Some("id".into())
-            }
-            .to_string(),
-            "$col1 (id)"
+            bind_expr("orders.id", &columns).to_string(),
+            "$col2 (orders.id)"
         );
     }
 
     #[test]
     fn test_display_binary_op() {
-        let expr = BoundExpr::BinaryOp {
-            left: Box::new(BoundExpr::Column {
-                index: 0,
-                name: Some("age".into()),
-            }),
-            op: BinaryOperator::Gt,
-            right: Box::new(BoundExpr::Integer(18)),
-        };
-        assert_eq!(expr.to_string(), "($col0 (age) > 18)");
+        let columns = make_columns();
+        assert_eq!(
+            bind_expr("users.id > 18", &columns).to_string(),
+            "($col0 (users.id) > 18)"
+        );
     }
 
     #[test]
     fn test_bind_literals() {
         let columns = vec![];
 
-        let bound = BoundExpr::bind(&parse_expr("NULL"), &columns).unwrap();
-        assert!(matches!(bound, BoundExpr::Null));
-
-        let bound = BoundExpr::bind(&parse_expr("TRUE"), &columns).unwrap();
-        assert!(matches!(bound, BoundExpr::Boolean(true)));
-
-        let bound = BoundExpr::bind(&parse_expr("42"), &columns).unwrap();
-        assert!(matches!(bound, BoundExpr::Integer(42)));
-
-        let bound = BoundExpr::bind(&parse_expr("3.14"), &columns).unwrap();
-        assert!(matches!(bound, BoundExpr::Float(v) if (v - 3.14).abs() < f64::EPSILON));
-
-        let bound = BoundExpr::bind(&parse_expr("'hello'"), &columns).unwrap();
-        assert!(matches!(bound, BoundExpr::String(s) if s == "hello"));
+        assert!(matches!(bind_expr("NULL", &columns), BoundExpr::Null));
+        assert!(matches!(
+            bind_expr("TRUE", &columns),
+            BoundExpr::Boolean(true)
+        ));
+        assert!(matches!(bind_expr("42", &columns), BoundExpr::Integer(42)));
+        assert!(
+            matches!(bind_expr("3.14", &columns), BoundExpr::Float(v) if (v - 3.14).abs() < f64::EPSILON)
+        );
+        assert!(matches!(bind_expr("'hello'", &columns), BoundExpr::String(s) if s == "hello"));
     }
 
     #[test]
@@ -465,13 +456,13 @@ mod tests {
         let columns = make_columns();
 
         // "name" is unique, should resolve to index 1 with qualified display name
-        let bound = BoundExpr::bind(&parse_expr("name"), &columns).unwrap();
+        let bound = bind_expr("name", &columns);
         assert!(
             matches!(bound, BoundExpr::Column { index: 1, name: Some(ref n) } if n == "users.name")
         );
 
         // "user_id" is unique, should resolve to index 3
-        let bound = BoundExpr::bind(&parse_expr("user_id"), &columns).unwrap();
+        let bound = bind_expr("user_id", &columns);
         assert!(
             matches!(bound, BoundExpr::Column { index: 3, name: Some(ref n) } if n == "orders.user_id")
         );
@@ -482,7 +473,7 @@ mod tests {
         let columns = make_columns();
 
         // "id" exists in both tables, should be ambiguous
-        let err = BoundExpr::bind(&parse_expr("id"), &columns).unwrap_err();
+        let err = parse_expr("id").bind(&columns).unwrap_err();
         assert!(matches!(err, ExecutorError::AmbiguousColumn { name } if name == "id"));
     }
 
@@ -491,13 +482,13 @@ mod tests {
         let columns = make_columns();
 
         // "users.id" should resolve to index 0
-        let bound = BoundExpr::bind(&parse_expr("users.id"), &columns).unwrap();
+        let bound = bind_expr("users.id", &columns);
         assert!(
             matches!(bound, BoundExpr::Column { index: 0, name: Some(ref n) } if n == "users.id")
         );
 
         // "orders.id" should resolve to index 2
-        let bound = BoundExpr::bind(&parse_expr("orders.id"), &columns).unwrap();
+        let bound = bind_expr("orders.id", &columns);
         assert!(
             matches!(bound, BoundExpr::Column { index: 2, name: Some(ref n) } if n == "orders.id")
         );
@@ -508,11 +499,14 @@ mod tests {
         let columns = make_columns();
 
         // Case-insensitive matching
-        let bound = BoundExpr::bind(&parse_expr("NAME"), &columns).unwrap();
-        assert!(matches!(bound, BoundExpr::Column { index: 1, .. }));
-
-        let bound = BoundExpr::bind(&parse_expr("USERS.ID"), &columns).unwrap();
-        assert!(matches!(bound, BoundExpr::Column { index: 0, .. }));
+        assert!(matches!(
+            bind_expr("NAME", &columns),
+            BoundExpr::Column { index: 1, .. }
+        ));
+        assert!(matches!(
+            bind_expr("USERS.ID", &columns),
+            BoundExpr::Column { index: 0, .. }
+        ));
     }
 
     #[test]
@@ -520,17 +514,17 @@ mod tests {
         let columns = make_columns();
 
         // Non-existent column
-        let err = BoundExpr::bind(&parse_expr("nonexistent"), &columns).unwrap_err();
+        let err = parse_expr("nonexistent").bind(&columns).unwrap_err();
         assert!(matches!(err, ExecutorError::ColumnNotFound { name } if name == "nonexistent"));
 
         // Non-existent qualified column
-        let err = BoundExpr::bind(&parse_expr("users.nonexistent"), &columns).unwrap_err();
+        let err = parse_expr("users.nonexistent").bind(&columns).unwrap_err();
         assert!(
             matches!(err, ExecutorError::ColumnNotFound { name } if name == "users.nonexistent")
         );
 
         // Wrong table qualification
-        let err = BoundExpr::bind(&parse_expr("products.id"), &columns).unwrap_err();
+        let err = parse_expr("products.id").bind(&columns).unwrap_err();
         assert!(matches!(err, ExecutorError::ColumnNotFound { name } if name == "products.id"));
     }
 
@@ -538,9 +532,7 @@ mod tests {
     fn test_bind_binary_op() {
         let columns = make_columns();
 
-        // name = 'alice'
-        let bound = BoundExpr::bind(&parse_expr("name = 'alice'"), &columns).unwrap();
-        let BoundExpr::BinaryOp { left, right, op } = bound else {
+        let BoundExpr::BinaryOp { left, right, op } = bind_expr("name = 'alice'", &columns) else {
             panic!("expected BinaryOp");
         };
         assert_eq!(op, BinaryOperator::Eq);
@@ -552,9 +544,7 @@ mod tests {
     fn test_bind_unary_op() {
         let columns = vec![];
 
-        // -42
-        let bound = BoundExpr::bind(&parse_expr("-42"), &columns).unwrap();
-        let BoundExpr::UnaryOp { operand, op } = bound else {
+        let BoundExpr::UnaryOp { operand, op } = bind_expr("-42", &columns) else {
             panic!("expected UnaryOp");
         };
         assert_eq!(op, UnaryOperator::Minus);
@@ -565,8 +555,7 @@ mod tests {
     fn test_bind_is_null() {
         let columns = make_columns();
 
-        let bound = BoundExpr::bind(&parse_expr("name IS NULL"), &columns).unwrap();
-        let BoundExpr::IsNull { expr, negated } = bound else {
+        let BoundExpr::IsNull { expr, negated } = bind_expr("name IS NULL", &columns) else {
             panic!("expected IsNull");
         };
         assert!(!negated);
@@ -577,13 +566,11 @@ mod tests {
     fn test_bind_in_list() {
         let columns = make_columns();
 
-        // user_id IN (1, 2, 3)
-        let bound = BoundExpr::bind(&parse_expr("user_id IN (1, 2, 3)"), &columns).unwrap();
         let BoundExpr::InList {
             expr,
             list,
             negated,
-        } = bound
+        } = bind_expr("user_id IN (1, 2, 3)", &columns)
         else {
             panic!("expected InList");
         };
@@ -596,14 +583,12 @@ mod tests {
     fn test_bind_between() {
         let columns = make_columns();
 
-        // user_id BETWEEN 1 AND 10
-        let bound = BoundExpr::bind(&parse_expr("user_id BETWEEN 1 AND 10"), &columns).unwrap();
         let BoundExpr::Between {
             expr,
             low,
             high,
             negated,
-        } = bound
+        } = bind_expr("user_id BETWEEN 1 AND 10", &columns)
         else {
             panic!("expected Between");
         };
@@ -617,15 +602,13 @@ mod tests {
     fn test_bind_like() {
         let columns = make_columns();
 
-        // name LIKE 'a%'
-        let bound = BoundExpr::bind(&parse_expr("name LIKE 'a%'"), &columns).unwrap();
         let BoundExpr::Like {
             expr,
             pattern,
             negated,
             case_insensitive,
             ..
-        } = bound
+        } = bind_expr("name LIKE 'a%'", &columns)
         else {
             panic!("expected Like");
         };
@@ -639,17 +622,14 @@ mod tests {
     fn test_bind_case() {
         let columns = make_columns();
 
-        // CASE WHEN user_id = 1 THEN 'one' ELSE 'other' END
-        let bound = BoundExpr::bind(
-            &parse_expr("CASE WHEN user_id = 1 THEN 'one' ELSE 'other' END"),
-            &columns,
-        )
-        .unwrap();
         let BoundExpr::Case {
             operand,
             when_clauses,
             else_result,
-        } = bound
+        } = bind_expr(
+            "CASE WHEN user_id = 1 THEN 'one' ELSE 'other' END",
+            &columns,
+        )
         else {
             panic!("expected Case");
         };
@@ -662,9 +642,8 @@ mod tests {
     fn test_bind_cast() {
         let columns = make_columns();
 
-        // CAST(user_id AS TEXT)
-        let bound = BoundExpr::bind(&parse_expr("CAST(user_id AS TEXT)"), &columns).unwrap();
-        let BoundExpr::Cast { expr, data_type } = bound else {
+        let BoundExpr::Cast { expr, data_type } = bind_expr("CAST(user_id AS TEXT)", &columns)
+        else {
             panic!("expected Cast");
         };
         assert_eq!(data_type, Type::Text);
@@ -675,12 +654,10 @@ mod tests {
     fn test_bind_unsupported() {
         let columns = vec![];
 
-        // Parameter
-        let err = BoundExpr::bind(&parse_expr("$1"), &columns).unwrap_err();
+        let err = parse_expr("$1").bind(&columns).unwrap_err();
         assert!(matches!(err, ExecutorError::Unsupported(_)));
 
-        // Function
-        let err = BoundExpr::bind(&parse_expr("count()"), &columns).unwrap_err();
+        let err = parse_expr("count()").bind(&columns).unwrap_err();
         assert!(matches!(err, ExecutorError::Unsupported(_)));
     }
 }

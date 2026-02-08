@@ -18,11 +18,17 @@ pub enum ExecutorError {
     /// Type mismatch in expression evaluation.
     TypeMismatch { expected: String, found: String },
 
+    /// Integer overflow.
+    IntegerOverflow,
+
     /// Division by zero in arithmetic expression.
     DivisionByZero,
 
     /// Invalid type cast.
     InvalidCast { from: String, to: String },
+
+    /// Numeric value out of range for the target type.
+    NumericOutOfRange { type_name: String },
 
     /// Column index exceeds the number of columns in the record.
     ColumnIndexOutOfBounds { index: usize, len: usize },
@@ -59,9 +65,13 @@ impl std::fmt::Display for ExecutorError {
                     index, len
                 )
             }
+            ExecutorError::IntegerOverflow => write!(f, "integer overflow"),
             ExecutorError::DivisionByZero => write!(f, "division by zero"),
             ExecutorError::InvalidCast { from, to } => {
                 write!(f, "cannot cast {} to {}", from, to)
+            }
+            ExecutorError::NumericOutOfRange { type_name } => {
+                write!(f, "{} out of range", type_name)
             }
             ExecutorError::Unsupported(msg) => write!(f, "unsupported: {}", msg),
             ExecutorError::Catalog(e) => write!(f, "{}", e),

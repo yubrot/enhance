@@ -181,60 +181,80 @@ impl BoundExpr {
 
 /// Evaluates a binary operation.
 fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) -> Result<Value, ExecutorError> {
-    // Logical operators with 3-value NULL logic
     match op {
-        BinaryOperator::And => return eval_and(left, right),
-        BinaryOperator::Or => return eval_or(left, right),
-        _ => {}
-    }
+        // Logical operators with 3-value NULL logic
+        BinaryOperator::And => eval_and(left, right),
+        BinaryOperator::Or => eval_or(left, right),
 
-    // String concatenation
-    if op == BinaryOperator::Concat {
-        return eval_concat(left, right);
-    }
+        // String concatenation (has its own NULL handling)
+        BinaryOperator::Concat => eval_concat(left, right),
 
-    // NULL propagation for all other operators
-    if left.is_null() || right.is_null() {
-        return Ok(Value::Null);
-    }
+        // NULL propagation for all remaining operators
+        _ if left.is_null() || right.is_null() => Ok(Value::Null),
 
-    // Comparison operators
-    match op {
-        BinaryOperator::Eq => {
-            return Ok(Value::Boolean(
-                compare_values(left, right)? == std::cmp::Ordering::Equal,
-            ));
-        }
-        BinaryOperator::Neq => {
-            return Ok(Value::Boolean(
-                compare_values(left, right)? != std::cmp::Ordering::Equal,
-            ));
-        }
-        BinaryOperator::Lt => {
-            return Ok(Value::Boolean(
-                compare_values(left, right)? == std::cmp::Ordering::Less,
-            ));
-        }
-        BinaryOperator::LtEq => {
-            return Ok(Value::Boolean(
-                compare_values(left, right)? != std::cmp::Ordering::Greater,
-            ));
-        }
-        BinaryOperator::Gt => {
-            return Ok(Value::Boolean(
-                compare_values(left, right)? == std::cmp::Ordering::Greater,
-            ));
-        }
-        BinaryOperator::GtEq => {
-            return Ok(Value::Boolean(
-                compare_values(left, right)? != std::cmp::Ordering::Less,
-            ));
-        }
-        _ => {}
-    }
+        // Comparison operators
+        BinaryOperator::Eq => Ok(Value::Boolean(
+            compare_values(left, right)? == std::cmp::Ordering::Equal,
+        )),
+        BinaryOperator::Neq => Ok(Value::Boolean(
+            compare_values(left, right)? != std::cmp::Ordering::Equal,
+        )),
+        BinaryOperator::Lt => Ok(Value::Boolean(
+            compare_values(left, right)? == std::cmp::Ordering::Less,
+        )),
+        BinaryOperator::LtEq => Ok(Value::Boolean(
+            compare_values(left, right)? != std::cmp::Ordering::Greater,
+        )),
+        BinaryOperator::Gt => Ok(Value::Boolean(
+            compare_values(left, right)? == std::cmp::Ordering::Greater,
+        )),
+        BinaryOperator::GtEq => Ok(Value::Boolean(
+            compare_values(left, right)? != std::cmp::Ordering::Less,
+        )),
 
-    // Arithmetic operators
-    eval_arithmetic(left, op, right)
+        BinaryOperator::Add => eval_arithmetic(
+            left,
+            right,
+            |a, b| a.checked_add(b).ok_or(ExecutorError::IntegerOverflow),
+            |a, b| Ok(a + b),
+        ),
+        BinaryOperator::Sub => eval_arithmetic(
+            left,
+            right,
+            |a, b| a.checked_sub(b).ok_or(ExecutorError::IntegerOverflow),
+            |a, b| Ok(a - b),
+        ),
+        BinaryOperator::Mul => eval_arithmetic(
+            left,
+            right,
+            |a, b| a.checked_mul(b).ok_or(ExecutorError::IntegerOverflow),
+            |a, b| Ok(a * b),
+        ),
+        BinaryOperator::Div => eval_arithmetic(
+            left,
+            right,
+            |a, b| match b {
+                0 => Err(ExecutorError::DivisionByZero),
+                _ => Ok(a / b),
+            },
+            |a, b| match b {
+                0.0 => Err(ExecutorError::DivisionByZero),
+                _ => Ok(a / b),
+            },
+        ),
+        BinaryOperator::Mod => eval_arithmetic(
+            left,
+            right,
+            |a, b| match b {
+                0 => Err(ExecutorError::DivisionByZero),
+                _ => Ok(a % b),
+            },
+            |a, b| match b {
+                0.0 => Err(ExecutorError::DivisionByZero),
+                _ => Ok(a % b),
+            },
+        ),
+    }
 }
 
 /// Evaluates AND with 3-value NULL logic.
@@ -281,67 +301,20 @@ fn eval_concat(left: &Value, right: &Value) -> Result<Value, ExecutorError> {
     Ok(Value::Text(format!("{}{}", l, r)))
 }
 
-/// Evaluates arithmetic operators (+, -, *, /, %).
+/// Evaluates an arithmetic operation by promoting operands to a common numeric type.
 fn eval_arithmetic(
     left: &Value,
-    op: BinaryOperator,
     right: &Value,
+    int_op: impl FnOnce(i64, i64) -> Result<i64, ExecutorError>,
+    float_op: impl FnOnce(f64, f64) -> Result<f64, ExecutorError>,
 ) -> Result<Value, ExecutorError> {
-    // Promote to common numeric type
     let (l, r) = promote_numeric(left, right)?;
-
     match (&l, &r) {
-        (Value::Int64(a), Value::Int64(b)) => {
-            let result = match op {
-                BinaryOperator::Add => a
-                    .checked_add(*b)
-                    .ok_or(ExecutorError::Unsupported("integer overflow".to_string()))?,
-                BinaryOperator::Sub => a
-                    .checked_sub(*b)
-                    .ok_or(ExecutorError::Unsupported("integer overflow".to_string()))?,
-                BinaryOperator::Mul => a
-                    .checked_mul(*b)
-                    .ok_or(ExecutorError::Unsupported("integer overflow".to_string()))?,
-                BinaryOperator::Div => {
-                    if *b == 0 {
-                        return Err(ExecutorError::DivisionByZero);
-                    }
-                    a / b
-                }
-                BinaryOperator::Mod => {
-                    if *b == 0 {
-                        return Err(ExecutorError::DivisionByZero);
-                    }
-                    a % b
-                }
-                _ => unreachable!(),
-            };
-            Ok(Value::Int64(result))
-        }
-        (Value::Float64(a), Value::Float64(b)) => {
-            let result = match op {
-                BinaryOperator::Add => a + b,
-                BinaryOperator::Sub => a - b,
-                BinaryOperator::Mul => a * b,
-                BinaryOperator::Div => {
-                    if *b == 0.0 {
-                        return Err(ExecutorError::DivisionByZero);
-                    }
-                    a / b
-                }
-                BinaryOperator::Mod => {
-                    if *b == 0.0 {
-                        return Err(ExecutorError::DivisionByZero);
-                    }
-                    a % b
-                }
-                _ => unreachable!(),
-            };
-            Ok(Value::Float64(result))
-        }
+        (Value::Int64(a), Value::Int64(b)) => Ok(Value::Int64(int_op(*a, *b)?)),
+        (Value::Float64(a), Value::Float64(b)) => Ok(Value::Float64(float_op(*a, *b)?)),
         _ => Err(ExecutorError::TypeMismatch {
             expected: "numeric".to_string(),
-            found: format!("{:?}", left),
+            found: format!("{}, {}", value_type_name(left), value_type_name(right)),
         }),
     }
 }
@@ -351,8 +324,8 @@ fn eval_arithmetic(
 /// - Int16/Int32 are promoted to Int64.
 /// - If either operand is Float, both are promoted to Float64.
 fn promote_numeric(left: &Value, right: &Value) -> Result<(Value, Value), ExecutorError> {
-    let l = promote_to_int64(left)?;
-    let r = promote_to_int64(right)?;
+    let l = widen_numeric(left)?;
+    let r = widen_numeric(right)?;
 
     // If either is float, promote both to float
     match (&l, &r) {
@@ -367,8 +340,8 @@ fn promote_numeric(left: &Value, right: &Value) -> Result<(Value, Value), Execut
     }
 }
 
-/// Promotes Int16/Int32 to Int64, passes Float32 to Float64.
-fn promote_to_int64(v: &Value) -> Result<Value, ExecutorError> {
+/// Widens narrow numeric types to their widest form (Int64 or Float64).
+fn widen_numeric(v: &Value) -> Result<Value, ExecutorError> {
     match v {
         Value::Int16(n) => Ok(Value::Int64(*n as i64)),
         Value::Int32(n) => Ok(Value::Int64(*n as i64)),
@@ -394,8 +367,8 @@ fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering, Exe
         (Value::Bytea(a), Value::Bytea(b)) => Ok(a.cmp(b)),
         _ => {
             // Try numeric comparison
-            let l = promote_to_int64(left)?;
-            let r = promote_to_int64(right)?;
+            let l = widen_numeric(left)?;
+            let r = widen_numeric(right)?;
             match (&l, &r) {
                 (Value::Int64(a), Value::Int64(b)) => Ok(a.cmp(b)),
                 (Value::Float64(a), Value::Float64(b)) => Ok(compare_f64(*a, *b)),
@@ -490,10 +463,27 @@ fn eval_cast(v: Value, target: &Type) -> Result<Value, ExecutorError> {
         Type::Int2 => {
             match &v {
                 Value::Int16(_) => Ok(v),
-                Value::Int32(n) => Ok(Value::Int16(*n as i16)),
-                Value::Int64(n) => Ok(Value::Int16(*n as i16)),
-                Value::Float32(n) => Ok(Value::Int16(*n as i16)),
-                Value::Float64(n) => Ok(Value::Int16(*n as i16)),
+                Value::Int32(n) => match i16::try_from(*n) {
+                    Ok(v) => Ok(Value::Int16(v)),
+                    Err(_) => Err(ExecutorError::NumericOutOfRange {
+                        type_name: "smallint".to_string(),
+                    }),
+                },
+                Value::Int64(n) => match i16::try_from(*n) {
+                    Ok(v) => Ok(Value::Int16(v)),
+                    Err(_) => Err(ExecutorError::NumericOutOfRange {
+                        type_name: "smallint".to_string(),
+                    }),
+                },
+                Value::Float32(n) => {
+                    let i =
+                        cast_float_to_int(*n as f64, i16::MIN as i64, i16::MAX as i64, "smallint")?;
+                    Ok(Value::Int16(i as i16))
+                }
+                Value::Float64(n) => {
+                    let i = cast_float_to_int(*n, i16::MIN as i64, i16::MAX as i64, "smallint")?;
+                    Ok(Value::Int16(i as i16))
+                }
                 Value::Text(s) => s.trim().parse::<i16>().map(Value::Int16).map_err(|_| {
                     ExecutorError::InvalidCast {
                         from: format!("'{}'", s),
@@ -511,9 +501,21 @@ fn eval_cast(v: Value, target: &Type) -> Result<Value, ExecutorError> {
             match &v {
                 Value::Int32(_) => Ok(v),
                 Value::Int16(n) => Ok(Value::Int32(*n as i32)),
-                Value::Int64(n) => Ok(Value::Int32(*n as i32)),
-                Value::Float32(n) => Ok(Value::Int32(*n as i32)),
-                Value::Float64(n) => Ok(Value::Int32(*n as i32)),
+                Value::Int64(n) => match i32::try_from(*n) {
+                    Ok(v) => Ok(Value::Int32(v)),
+                    Err(_) => Err(ExecutorError::NumericOutOfRange {
+                        type_name: "integer".to_string(),
+                    }),
+                },
+                Value::Float32(n) => {
+                    let i =
+                        cast_float_to_int(*n as f64, i32::MIN as i64, i32::MAX as i64, "integer")?;
+                    Ok(Value::Int32(i as i32))
+                }
+                Value::Float64(n) => {
+                    let i = cast_float_to_int(*n, i32::MIN as i64, i32::MAX as i64, "integer")?;
+                    Ok(Value::Int32(i as i32))
+                }
                 Value::Text(s) => s.trim().parse::<i32>().map(Value::Int32).map_err(|_| {
                     ExecutorError::InvalidCast {
                         from: format!("'{}'", s),
@@ -532,8 +534,14 @@ fn eval_cast(v: Value, target: &Type) -> Result<Value, ExecutorError> {
                 Value::Int64(_) => Ok(v),
                 Value::Int16(n) => Ok(Value::Int64(*n as i64)),
                 Value::Int32(n) => Ok(Value::Int64(*n as i64)),
-                Value::Float32(n) => Ok(Value::Int64(*n as i64)),
-                Value::Float64(n) => Ok(Value::Int64(*n as i64)),
+                Value::Float32(n) => {
+                    let i = cast_float_to_int(*n as f64, i64::MIN, i64::MAX, "bigint")?;
+                    Ok(Value::Int64(i))
+                }
+                Value::Float64(n) => {
+                    let i = cast_float_to_int(*n, i64::MIN, i64::MAX, "bigint")?;
+                    Ok(Value::Int64(i))
+                }
                 Value::Text(s) => s.trim().parse::<i64>().map(Value::Int64).map_err(|_| {
                     ExecutorError::InvalidCast {
                         from: format!("'{}'", s),
@@ -549,7 +557,16 @@ fn eval_cast(v: Value, target: &Type) -> Result<Value, ExecutorError> {
         }
         Type::Float4 => match &v {
             Value::Float32(_) => Ok(v),
-            Value::Float64(n) => Ok(Value::Float32(*n as f32)),
+            Value::Float64(n) => {
+                let result = *n as f32;
+                if result.is_infinite() && !n.is_infinite() {
+                    Err(ExecutorError::NumericOutOfRange {
+                        type_name: "real".to_string(),
+                    })
+                } else {
+                    Ok(Value::Float32(result))
+                }
+            }
             Value::Int16(n) => Ok(Value::Float32(*n as f32)),
             Value::Int32(n) => Ok(Value::Float32(*n as f32)),
             Value::Int64(n) => Ok(Value::Float32(*n as f32)),
@@ -591,6 +608,29 @@ fn eval_cast(v: Value, target: &Type) -> Result<Value, ExecutorError> {
             }),
         },
     }
+}
+
+/// Casts a float to an integer value with rounding and range checking.
+///
+/// Rounds to the nearest integer (ties away from zero), then verifies the
+/// result fits within `[min, max]`. Returns an error for NaN, infinity, or
+/// out-of-range values.
+fn cast_float_to_int(n: f64, min: i64, max: i64, type_name: &str) -> Result<i64, ExecutorError> {
+    if !n.is_finite() {
+        return Err(ExecutorError::NumericOutOfRange {
+            type_name: type_name.to_string(),
+        });
+    }
+    let rounded = n.round();
+    // Use i128 for the range comparison to avoid f64 precision loss at i64
+    // boundaries (i64::MAX is not exactly representable in f64).
+    let wide = rounded as i128;
+    if wide < min as i128 || wide > max as i128 {
+        return Err(ExecutorError::NumericOutOfRange {
+            type_name: type_name.to_string(),
+        });
+    }
+    Ok(wide as i64)
 }
 
 /// Returns a human-readable type name for a value.
@@ -675,34 +715,41 @@ fn like_match_recursive(s: &[char], p: &[char], escape: Option<char>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::Parser;
 
-    // --- BoundExpr tests ---
+    /// Parses, binds, and evaluates a SQL expression with no columns and an empty record.
+    fn eval(sql: &str) -> Result<Value, ExecutorError> {
+        let expr = Parser::new(sql).parse_expr().expect("parse error");
+        let bound = expr.bind(&[]).expect("bind error");
+        bound.evaluate(&Record::new(vec![]))
+    }
 
-    fn make_record(cols: &[(&str, Value)]) -> Record {
-        let values: Vec<Value> = cols.iter().map(|(_, v)| v.clone()).collect();
-        Record::new(values)
+    // ========================================================================
+    // BoundExpr::evaluate – literal & column
+    // ========================================================================
+
+    #[test]
+    fn test_evaluate_literals() {
+        assert_eq!(eval("NULL").unwrap(), Value::Null);
+        assert_eq!(eval("42").unwrap(), Value::Int64(42));
+        assert_eq!(eval("TRUE").unwrap(), Value::Boolean(true));
     }
 
     #[test]
-    fn test_bound_expr_evaluate_literals() {
-        let record = Record::new(vec![]);
-        assert_eq!(BoundExpr::Null.evaluate(&record).unwrap(), Value::Null);
-        assert_eq!(
-            BoundExpr::Integer(42).evaluate(&record).unwrap(),
-            Value::Int64(42)
-        );
-        assert_eq!(
-            BoundExpr::Boolean(true).evaluate(&record).unwrap(),
-            Value::Boolean(true)
-        );
+    fn test_evaluate_float_literal() {
+        assert_eq!(eval("3.14").unwrap(), Value::Float64(3.14));
+        assert_eq!(eval("0.0").unwrap(), Value::Float64(0.0));
     }
 
     #[test]
-    fn test_bound_expr_evaluate_column() {
-        let record = make_record(&[
-            ("id", Value::Int64(1)),
-            ("name", Value::Text("alice".into())),
-        ]);
+    fn test_evaluate_string_literal() {
+        assert_eq!(eval("'hello'").unwrap(), Value::Text("hello".into()));
+        assert_eq!(eval("''").unwrap(), Value::Text("".into()));
+    }
+
+    #[test]
+    fn test_evaluate_column() {
+        let record = Record::new(vec![Value::Int64(1), Value::Text("alice".into())]);
         assert_eq!(
             BoundExpr::Column {
                 index: 0,
@@ -724,7 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bound_expr_evaluate_column_out_of_bounds() {
+    fn test_evaluate_column_out_of_bounds() {
         let record = Record::new(vec![Value::Int64(1)]);
         assert!(matches!(
             BoundExpr::Column {
@@ -736,263 +783,565 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_bound_expr_evaluate_binary_op() {
-        let record = Record::new(vec![Value::Int64(10)]);
-        let expr = BoundExpr::BinaryOp {
-            left: Box::new(BoundExpr::Column {
-                index: 0,
-                name: None,
-            }),
-            op: BinaryOperator::Gt,
-            right: Box::new(BoundExpr::Integer(5)),
-        };
-        assert_eq!(expr.evaluate(&record).unwrap(), Value::Boolean(true));
-    }
-
-    // --- 3-value NULL logic tests ---
-
-    fn eval_binop(left: Value, op: BinaryOperator, right: Value) -> Result<Value, ExecutorError> {
-        eval_binary_op(&left, op, &right)
-    }
+    // ========================================================================
+    // eval_binary_op – AND / OR  (3-value NULL logic)
+    // ========================================================================
 
     #[test]
     fn test_and_null_propagation() {
         // TRUE AND NULL = NULL
-        assert_eq!(
-            eval_binop(Value::Boolean(true), BinaryOperator::And, Value::Null).unwrap(),
-            Value::Null
-        );
+        assert_eq!(eval("TRUE AND NULL").unwrap(), Value::Null);
         // NULL AND TRUE = NULL
-        assert_eq!(
-            eval_binop(Value::Null, BinaryOperator::And, Value::Boolean(true)).unwrap(),
-            Value::Null
-        );
+        assert_eq!(eval("NULL AND TRUE").unwrap(), Value::Null);
         // FALSE AND NULL = FALSE (short-circuit)
-        assert_eq!(
-            eval_binop(Value::Boolean(false), BinaryOperator::And, Value::Null).unwrap(),
-            Value::Boolean(false)
-        );
+        assert_eq!(eval("FALSE AND NULL").unwrap(), Value::Boolean(false));
         // NULL AND FALSE = FALSE (short-circuit)
-        assert_eq!(
-            eval_binop(Value::Null, BinaryOperator::And, Value::Boolean(false)).unwrap(),
-            Value::Boolean(false)
-        );
+        assert_eq!(eval("NULL AND FALSE").unwrap(), Value::Boolean(false));
         // NULL AND NULL = NULL
-        assert_eq!(
-            eval_binop(Value::Null, BinaryOperator::And, Value::Null).unwrap(),
-            Value::Null
-        );
+        assert_eq!(eval("NULL AND NULL").unwrap(), Value::Null);
     }
 
     #[test]
     fn test_or_null_propagation() {
         // TRUE OR NULL = TRUE (short-circuit)
-        assert_eq!(
-            eval_binop(Value::Boolean(true), BinaryOperator::Or, Value::Null).unwrap(),
-            Value::Boolean(true)
-        );
+        assert_eq!(eval("TRUE OR NULL").unwrap(), Value::Boolean(true));
         // NULL OR TRUE = TRUE (short-circuit)
-        assert_eq!(
-            eval_binop(Value::Null, BinaryOperator::Or, Value::Boolean(true)).unwrap(),
-            Value::Boolean(true)
-        );
+        assert_eq!(eval("NULL OR TRUE").unwrap(), Value::Boolean(true));
         // FALSE OR NULL = NULL
-        assert_eq!(
-            eval_binop(Value::Boolean(false), BinaryOperator::Or, Value::Null).unwrap(),
-            Value::Null
-        );
+        assert_eq!(eval("FALSE OR NULL").unwrap(), Value::Null);
         // NULL OR FALSE = NULL
-        assert_eq!(
-            eval_binop(Value::Null, BinaryOperator::Or, Value::Boolean(false)).unwrap(),
-            Value::Null
-        );
+        assert_eq!(eval("NULL OR FALSE").unwrap(), Value::Null);
         // NULL OR NULL = NULL
+        assert_eq!(eval("NULL OR NULL").unwrap(), Value::Null);
+    }
+
+    // ========================================================================
+    // eval_binary_op – string concatenation (||)
+    // ========================================================================
+
+    #[test]
+    fn test_concat_strings() {
         assert_eq!(
-            eval_binop(Value::Null, BinaryOperator::Or, Value::Null).unwrap(),
-            Value::Null
+            eval("'hello' || ' ' || 'world'").unwrap(),
+            Value::Text("hello world".into())
         );
+        assert_eq!(eval("'' || 'a'").unwrap(), Value::Text("a".into()));
+    }
+
+    #[test]
+    fn test_concat_type_coercion() {
+        // Non-string values are converted via to_text()
+        assert_eq!(eval("'id=' || 42").unwrap(), Value::Text("id=42".into()));
+        assert_eq!(
+            eval("'flag=' || TRUE").unwrap(),
+            Value::Text("flag=t".into())
+        );
+    }
+
+    #[test]
+    fn test_concat_null_propagation() {
+        // String concatenation with NULL returns NULL
+        assert_eq!(eval("'hello' || NULL").unwrap(), Value::Null);
+        assert_eq!(eval("NULL || 'world'").unwrap(), Value::Null);
+    }
+
+    // ========================================================================
+    // eval_binary_op – comparison operators  (Eq, Neq, Lt, LtEq, Gt, GtEq)
+    // ========================================================================
+
+    #[test]
+    fn test_comparison_operators() {
+        // Eq
+        assert_eq!(eval("5 = 5").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("5 = 6").unwrap(), Value::Boolean(false));
+        // Neq
+        assert_eq!(eval("5 <> 6").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("5 <> 5").unwrap(), Value::Boolean(false));
+        // Lt
+        assert_eq!(eval("3 < 5").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("5 < 5").unwrap(), Value::Boolean(false));
+        // LtEq
+        assert_eq!(eval("5 <= 5").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("6 <= 5").unwrap(), Value::Boolean(false));
+        // Gt
+        assert_eq!(eval("6 > 5").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("5 > 5").unwrap(), Value::Boolean(false));
+        // GtEq
+        assert_eq!(eval("5 >= 5").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("4 >= 5").unwrap(), Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_comparison_strings() {
+        assert_eq!(eval("'abc' < 'abd'").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("'abc' = 'abc'").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("'b' > 'a'").unwrap(), Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_comparison_booleans() {
+        // false < true
+        assert_eq!(eval("FALSE < TRUE").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("TRUE = TRUE").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("FALSE = FALSE").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("TRUE > FALSE").unwrap(), Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_comparison_mixed_int_float() {
+        assert_eq!(eval("5 = 5.0").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("5 < 5.5").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("5.5 > 5").unwrap(), Value::Boolean(true));
     }
 
     #[test]
     fn test_comparison_null_propagation() {
         // Any comparison with NULL returns NULL
+        assert_eq!(eval("1 = NULL").unwrap(), Value::Null);
+        assert_eq!(eval("NULL < 1").unwrap(), Value::Null);
+        assert_eq!(eval("NULL <> NULL").unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_nan_ordering() {
+        // NaN > any non-NaN value
         assert_eq!(
-            eval_binop(Value::Int64(1), BinaryOperator::Eq, Value::Null).unwrap(),
-            Value::Null
+            eval("CAST('NaN' AS DOUBLE PRECISION) > 0.0").unwrap(),
+            Value::Boolean(true)
         );
         assert_eq!(
-            eval_binop(Value::Null, BinaryOperator::Lt, Value::Int64(1)).unwrap(),
-            Value::Null
+            eval("CAST('NaN' AS DOUBLE PRECISION) > CAST('inf' AS DOUBLE PRECISION)").unwrap(),
+            Value::Boolean(true)
         );
         assert_eq!(
-            eval_binop(Value::Null, BinaryOperator::Neq, Value::Null).unwrap(),
-            Value::Null
+            eval("CAST('NaN' AS DOUBLE PRECISION) > CAST('-inf' AS DOUBLE PRECISION)").unwrap(),
+            Value::Boolean(true)
         );
+
+        // any non-NaN value < NaN
+        assert_eq!(
+            eval("0.0 < CAST('NaN' AS DOUBLE PRECISION)").unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            eval("CAST('inf' AS DOUBLE PRECISION) < CAST('NaN' AS DOUBLE PRECISION)").unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            eval("CAST('-inf' AS DOUBLE PRECISION) < CAST('NaN' AS DOUBLE PRECISION)").unwrap(),
+            Value::Boolean(true)
+        );
+
+        // NaN == NaN
+        assert_eq!(
+            eval("CAST('NaN' AS DOUBLE PRECISION) = CAST('NaN' AS DOUBLE PRECISION)").unwrap(),
+            Value::Boolean(true)
+        );
+
+        // Cross-type: NaN > integer (promotion)
+        assert_eq!(
+            eval("CAST('NaN' AS DOUBLE PRECISION) > 100").unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            eval("100 < CAST('NaN' AS DOUBLE PRECISION)").unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    // ========================================================================
+    // eval_binary_op – arithmetic  (Add, Sub, Mul, Div, Mod)
+    // ========================================================================
+
+    #[test]
+    fn test_arithmetic_basic() {
+        assert_eq!(eval("3 + 4").unwrap(), Value::Int64(7));
+        assert_eq!(eval("10 - 3").unwrap(), Value::Int64(7));
+        assert_eq!(eval("6 * 7").unwrap(), Value::Int64(42));
+        assert_eq!(eval("15 / 4").unwrap(), Value::Int64(3));
+        assert_eq!(eval("17 % 5").unwrap(), Value::Int64(2));
+    }
+
+    #[test]
+    fn test_arithmetic_float() {
+        assert_eq!(eval("1.5 + 2.5").unwrap(), Value::Float64(4.0));
+        assert_eq!(eval("5.0 - 1.5").unwrap(), Value::Float64(3.5));
+        assert_eq!(eval("2.0 * 3.0").unwrap(), Value::Float64(6.0));
+        assert_eq!(eval("7.0 / 2.0").unwrap(), Value::Float64(3.5));
+    }
+
+    #[test]
+    fn test_arithmetic_mixed_int_float() {
+        // int + float promotes to float
+        assert_eq!(eval("1 + 2.5").unwrap(), Value::Float64(3.5));
+        assert_eq!(eval("2.5 + 1").unwrap(), Value::Float64(3.5));
+        assert_eq!(eval("10 * 0.5").unwrap(), Value::Float64(5.0));
+    }
+
+    #[test]
+    fn test_arithmetic_null_propagation() {
+        // Any arithmetic with NULL returns NULL
+        assert_eq!(eval("1 + NULL").unwrap(), Value::Null);
+        assert_eq!(eval("NULL * 2").unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_integer_overflow() {
+        assert!(matches!(
+            eval("9223372036854775807 + 1"),
+            Err(ExecutorError::IntegerOverflow)
+        ));
+        assert!(matches!(
+            eval("-9223372036854775807 - 2"),
+            Err(ExecutorError::IntegerOverflow)
+        ));
+        assert!(matches!(
+            eval("9223372036854775807 * 2"),
+            Err(ExecutorError::IntegerOverflow)
+        ));
+    }
+
+    #[test]
+    fn test_division_by_zero() {
+        assert!(matches!(eval("1 / 0"), Err(ExecutorError::DivisionByZero)));
+        assert!(matches!(eval("1 % 0"), Err(ExecutorError::DivisionByZero)));
+        assert!(matches!(
+            eval("1.0 / 0.0"),
+            Err(ExecutorError::DivisionByZero)
+        ));
+    }
+
+    // ========================================================================
+    // eval_unary_op  (Not, Minus, Plus)
+    // ========================================================================
+
+    #[test]
+    fn test_unary_not() {
+        assert_eq!(eval("NOT TRUE").unwrap(), Value::Boolean(false));
+        assert_eq!(eval("NOT FALSE").unwrap(), Value::Boolean(true));
+        // NOT NULL = NULL
+        assert_eq!(eval("NOT NULL").unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_unary_not_type_error() {
+        assert!(matches!(
+            eval("NOT 42"),
+            Err(ExecutorError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_unary_minus() {
+        assert_eq!(eval("-42").unwrap(), Value::Int64(-42));
+        assert_eq!(eval("-3.14").unwrap(), Value::Float64(-3.14));
+        // -NULL = NULL
+        assert_eq!(eval("-NULL").unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_unary_minus_type_error() {
+        assert!(matches!(
+            eval("-'text'"),
+            Err(ExecutorError::TypeMismatch { .. })
+        ));
+        assert!(matches!(
+            eval("-TRUE"),
+            Err(ExecutorError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_unary_plus() {
+        assert_eq!(eval("+42").unwrap(), Value::Int64(42));
+        assert_eq!(eval("+3.14").unwrap(), Value::Float64(3.14));
+        // +NULL = NULL
+        assert_eq!(eval("+NULL").unwrap(), Value::Null);
+    }
+
+    // ========================================================================
+    // IS [NOT] NULL
+    // ========================================================================
+
+    #[test]
+    fn test_is_null() {
+        // NULL IS NULL = TRUE
+        assert_eq!(eval("NULL IS NULL").unwrap(), Value::Boolean(true));
+        // 1 IS NULL = FALSE
+        assert_eq!(eval("1 IS NULL").unwrap(), Value::Boolean(false));
+        // NULL IS NOT NULL = FALSE
+        assert_eq!(eval("NULL IS NOT NULL").unwrap(), Value::Boolean(false));
+    }
+
+    // ========================================================================
+    // [NOT] IN list
+    // ========================================================================
+
+    #[test]
+    fn test_in_list() {
+        assert_eq!(eval("1 IN (1, 2, 3)").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("4 IN (1, 2, 3)").unwrap(), Value::Boolean(false));
+        assert_eq!(eval("'a' IN ('a', 'b')").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("'c' IN ('a', 'b')").unwrap(), Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_not_in_list() {
+        assert_eq!(eval("4 NOT IN (1, 2, 3)").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("1 NOT IN (1, 2, 3)").unwrap(), Value::Boolean(false));
     }
 
     #[test]
     fn test_in_list_null_propagation() {
-        let record = Record::new(vec![]);
         // NULL IN (1, 2) = NULL
-        let expr = BoundExpr::InList {
-            expr: Box::new(BoundExpr::Null),
-            list: vec![BoundExpr::Integer(1), BoundExpr::Integer(2)],
-            negated: false,
-        };
-        assert_eq!(expr.evaluate(&record).unwrap(), Value::Null);
-
+        assert_eq!(eval("NULL IN (1, 2)").unwrap(), Value::Null);
         // 1 IN (1, NULL) = TRUE (found before NULL)
-        let expr = BoundExpr::InList {
-            expr: Box::new(BoundExpr::Integer(1)),
-            list: vec![BoundExpr::Integer(1), BoundExpr::Null],
-            negated: false,
-        };
-        assert_eq!(expr.evaluate(&record).unwrap(), Value::Boolean(true));
-
+        assert_eq!(eval("1 IN (1, NULL)").unwrap(), Value::Boolean(true));
         // 3 IN (1, NULL) = NULL (not found, has NULL)
-        let expr = BoundExpr::InList {
-            expr: Box::new(BoundExpr::Integer(3)),
-            list: vec![BoundExpr::Integer(1), BoundExpr::Null],
-            negated: false,
-        };
-        assert_eq!(expr.evaluate(&record).unwrap(), Value::Null);
-
+        assert_eq!(eval("3 IN (1, NULL)").unwrap(), Value::Null);
         // 3 NOT IN (1, 2) = TRUE (not found, no NULL)
-        let expr = BoundExpr::InList {
-            expr: Box::new(BoundExpr::Integer(3)),
-            list: vec![BoundExpr::Integer(1), BoundExpr::Integer(2)],
-            negated: true,
-        };
-        assert_eq!(expr.evaluate(&record).unwrap(), Value::Boolean(true));
-
+        assert_eq!(eval("3 NOT IN (1, 2)").unwrap(), Value::Boolean(true));
         // 3 NOT IN (1, NULL) = NULL (not found, has NULL)
-        let expr = BoundExpr::InList {
-            expr: Box::new(BoundExpr::Integer(3)),
-            list: vec![BoundExpr::Integer(1), BoundExpr::Null],
-            negated: true,
-        };
-        assert_eq!(expr.evaluate(&record).unwrap(), Value::Null);
+        assert_eq!(eval("3 NOT IN (1, NULL)").unwrap(), Value::Null);
+    }
+
+    // ========================================================================
+    // [NOT] BETWEEN
+    // ========================================================================
+
+    #[test]
+    fn test_between() {
+        assert_eq!(eval("5 BETWEEN 1 AND 10").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("0 BETWEEN 1 AND 10").unwrap(), Value::Boolean(false));
+        assert_eq!(eval("11 BETWEEN 1 AND 10").unwrap(), Value::Boolean(false));
+        // Boundary values are inclusive
+        assert_eq!(eval("1 BETWEEN 1 AND 10").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("10 BETWEEN 1 AND 10").unwrap(), Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_not_between() {
+        assert_eq!(eval("5 NOT BETWEEN 1 AND 3").unwrap(), Value::Boolean(true));
+        assert_eq!(
+            eval("2 NOT BETWEEN 1 AND 3").unwrap(),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn test_between_strings() {
+        assert_eq!(
+            eval("'b' BETWEEN 'a' AND 'c'").unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            eval("'z' BETWEEN 'a' AND 'c'").unwrap(),
+            Value::Boolean(false)
+        );
     }
 
     #[test]
     fn test_between_null_propagation() {
-        let record = Record::new(vec![]);
         // NULL BETWEEN 1 AND 10 = NULL
-        let expr = BoundExpr::Between {
-            expr: Box::new(BoundExpr::Null),
-            low: Box::new(BoundExpr::Integer(1)),
-            high: Box::new(BoundExpr::Integer(10)),
-            negated: false,
-        };
-        assert_eq!(expr.evaluate(&record).unwrap(), Value::Null);
-
+        assert_eq!(eval("NULL BETWEEN 1 AND 10").unwrap(), Value::Null);
         // 5 BETWEEN NULL AND 10 = NULL
-        let expr = BoundExpr::Between {
-            expr: Box::new(BoundExpr::Integer(5)),
-            low: Box::new(BoundExpr::Null),
-            high: Box::new(BoundExpr::Integer(10)),
-            negated: false,
-        };
-        assert_eq!(expr.evaluate(&record).unwrap(), Value::Null);
-
+        assert_eq!(eval("5 BETWEEN NULL AND 10").unwrap(), Value::Null);
         // 5 BETWEEN 1 AND NULL = NULL
-        let expr = BoundExpr::Between {
-            expr: Box::new(BoundExpr::Integer(5)),
-            low: Box::new(BoundExpr::Integer(1)),
-            high: Box::new(BoundExpr::Null),
-            negated: false,
-        };
-        assert_eq!(expr.evaluate(&record).unwrap(), Value::Null);
+        assert_eq!(eval("5 BETWEEN 1 AND NULL").unwrap(), Value::Null);
+    }
+
+    // ========================================================================
+    // [NOT] LIKE / ILIKE  (like_match, like_match_recursive)
+    // ========================================================================
+
+    #[test]
+    fn test_like_exact_match() {
+        assert_eq!(eval("'hello' LIKE 'hello'").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("'hello' LIKE 'world'").unwrap(), Value::Boolean(false));
     }
 
     #[test]
-    fn test_is_null_expr() {
-        let record = Record::new(vec![]);
-        // NULL IS NULL = TRUE
-        let expr = BoundExpr::IsNull {
-            expr: Box::new(BoundExpr::Null),
-            negated: false,
-        };
-        assert_eq!(expr.evaluate(&record).unwrap(), Value::Boolean(true));
-
-        // 1 IS NULL = FALSE
-        let expr = BoundExpr::IsNull {
-            expr: Box::new(BoundExpr::Integer(1)),
-            negated: false,
-        };
-        assert_eq!(expr.evaluate(&record).unwrap(), Value::Boolean(false));
-
-        // NULL IS NOT NULL = FALSE
-        let expr = BoundExpr::IsNull {
-            expr: Box::new(BoundExpr::Null),
-            negated: true,
-        };
-        assert_eq!(expr.evaluate(&record).unwrap(), Value::Boolean(false));
-    }
-
-    // --- Cast boundary tests ---
-
-    #[test]
-    fn test_cast_int64_to_int16_truncation() {
-        // Large Int64 value truncates when cast to Int16
-        let result = eval_cast(Value::Int64(70000), &Type::Int2).unwrap();
-        // 70000 = 0x11170, truncated to i16 = 0x1170 = 4464
-        assert!(matches!(result, Value::Int16(_)));
+    fn test_like_percent_wildcard() {
+        // % matches zero or more characters
+        assert_eq!(eval("'hello' LIKE 'h%'").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("'hello' LIKE '%lo'").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("'hello' LIKE '%ell%'").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("'hello' LIKE '%'").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("'' LIKE '%'").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("'hello' LIKE 'x%'").unwrap(), Value::Boolean(false));
     }
 
     #[test]
-    fn test_cast_float_to_int_truncation() {
-        // Float truncates toward zero
-        let result = eval_cast(Value::Float64(3.9), &Type::Int8).unwrap();
-        assert_eq!(result, Value::Int64(3));
-
-        let result = eval_cast(Value::Float64(-3.9), &Type::Int8).unwrap();
-        assert_eq!(result, Value::Int64(-3));
+    fn test_like_underscore_wildcard() {
+        // _ matches exactly one character
+        assert_eq!(eval("'abc' LIKE 'a_c'").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("'abc' LIKE '___'").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("'ab' LIKE '___'").unwrap(), Value::Boolean(false));
+        assert_eq!(eval("'abcd' LIKE '___'").unwrap(), Value::Boolean(false));
     }
 
     #[test]
-    fn test_cast_text_to_numeric() {
+    fn test_like_combined_wildcards() {
+        assert_eq!(eval("'abcdef' LIKE 'a%f'").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("'abcdef' LIKE '_b%e_'").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("'a' LIKE '_%'").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("'' LIKE '_%'").unwrap(), Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_like_empty_string() {
+        assert_eq!(eval("'' LIKE ''").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("'a' LIKE ''").unwrap(), Value::Boolean(false));
+        assert_eq!(eval("'' LIKE 'a'").unwrap(), Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_not_like() {
         assert_eq!(
-            eval_cast(Value::Text("42".into()), &Type::Int4).unwrap(),
-            Value::Int32(42)
+            eval("'hello' NOT LIKE 'world'").unwrap(),
+            Value::Boolean(true)
         );
         assert_eq!(
-            eval_cast(Value::Text(" -7 ".into()), &Type::Int8).unwrap(),
-            Value::Int64(-7)
-        );
-        assert_eq!(
-            eval_cast(Value::Text("3.14".into()), &Type::Float8).unwrap(),
-            Value::Float64(3.14)
+            eval("'hello' NOT LIKE 'h%'").unwrap(),
+            Value::Boolean(false)
         );
     }
 
     #[test]
-    fn test_cast_text_to_numeric_invalid() {
-        assert!(matches!(
-            eval_cast(Value::Text("abc".into()), &Type::Int4),
-            Err(ExecutorError::InvalidCast { .. })
-        ));
-        assert!(matches!(
-            eval_cast(Value::Text("".into()), &Type::Int8),
-            Err(ExecutorError::InvalidCast { .. })
-        ));
+    fn test_ilike() {
+        assert_eq!(eval("'Hello' ILIKE 'hello'").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("'HELLO' ILIKE 'h%'").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("'ABC' ILIKE '%b%'").unwrap(), Value::Boolean(true));
+        assert_eq!(eval("'ABC' ILIKE 'x%'").unwrap(), Value::Boolean(false));
     }
+
+    #[test]
+    fn test_like_escape() {
+        // Escape the % wildcard so it matches a literal %
+        assert_eq!(
+            eval(r"'100%' LIKE '100\%' ESCAPE '\'").unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            eval(r"'100x' LIKE '100\%' ESCAPE '\'").unwrap(),
+            Value::Boolean(false)
+        );
+        // Escape the _ wildcard
+        assert_eq!(
+            eval(r"'a_b' LIKE 'a\_b' ESCAPE '\'").unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            eval(r"'axb' LIKE 'a\_b' ESCAPE '\'").unwrap(),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn test_like_null_propagation() {
+        // NULL LIKE '%' = NULL
+        assert_eq!(eval("NULL LIKE '%'").unwrap(), Value::Null);
+        // 'abc' LIKE NULL = NULL
+        assert_eq!(eval("'abc' LIKE NULL").unwrap(), Value::Null);
+    }
+
+    // ========================================================================
+    // CASE expression  (searched & simple)
+    // ========================================================================
+
+    #[test]
+    fn test_searched_case() {
+        assert_eq!(
+            eval("CASE WHEN TRUE THEN 'yes' ELSE 'no' END").unwrap(),
+            Value::Text("yes".into())
+        );
+        assert_eq!(
+            eval("CASE WHEN FALSE THEN 'yes' ELSE 'no' END").unwrap(),
+            Value::Text("no".into())
+        );
+    }
+
+    #[test]
+    fn test_searched_case_multiple_when() {
+        assert_eq!(
+            eval("CASE WHEN FALSE THEN 'a' WHEN TRUE THEN 'b' ELSE 'c' END").unwrap(),
+            Value::Text("b".into())
+        );
+        // First match wins
+        assert_eq!(
+            eval("CASE WHEN TRUE THEN 'first' WHEN TRUE THEN 'second' END").unwrap(),
+            Value::Text("first".into())
+        );
+    }
+
+    #[test]
+    fn test_searched_case_no_else() {
+        // No ELSE and no match → NULL
+        assert_eq!(eval("CASE WHEN FALSE THEN 'a' END").unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_searched_case_null_condition() {
+        // NULL condition is not true
+        assert_eq!(
+            eval("CASE WHEN NULL THEN 'a' ELSE 'b' END").unwrap(),
+            Value::Text("b".into())
+        );
+    }
+
+    #[test]
+    fn test_simple_case() {
+        assert_eq!(
+            eval("CASE 1 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END").unwrap(),
+            Value::Text("one".into())
+        );
+        assert_eq!(
+            eval("CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END").unwrap(),
+            Value::Text("two".into())
+        );
+        assert_eq!(
+            eval("CASE 3 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END").unwrap(),
+            Value::Text("other".into())
+        );
+    }
+
+    #[test]
+    fn test_simple_case_no_match_no_else() {
+        assert_eq!(eval("CASE 99 WHEN 1 THEN 'one' END").unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_simple_case_null_operand() {
+        // NULL operand never matches (NULL != anything)
+        assert_eq!(
+            eval("CASE NULL WHEN 1 THEN 'a' ELSE 'b' END").unwrap(),
+            Value::Text("b".into())
+        );
+    }
+
+    #[test]
+    fn test_simple_case_null_when_value() {
+        // NULL in WHEN value never matches
+        assert_eq!(
+            eval("CASE 1 WHEN NULL THEN 'a' ELSE 'b' END").unwrap(),
+            Value::Text("b".into())
+        );
+    }
+
+    // ========================================================================
+    // CAST  (eval_cast, cast_float_to_int)
+    // ========================================================================
 
     #[test]
     fn test_cast_null_passthrough() {
         // CAST(NULL AS <any type>) = NULL
-        for ty in [
-            Type::Bool,
-            Type::Int2,
-            Type::Int4,
-            Type::Int8,
-            Type::Float4,
-            Type::Float8,
-            Type::Text,
-        ] {
-            assert_eq!(eval_cast(Value::Null, &ty).unwrap(), Value::Null);
-        }
+        assert_eq!(eval("CAST(NULL AS BOOLEAN)").unwrap(), Value::Null);
+        assert_eq!(eval("CAST(NULL AS SMALLINT)").unwrap(), Value::Null);
+        assert_eq!(eval("CAST(NULL AS INTEGER)").unwrap(), Value::Null);
+        assert_eq!(eval("CAST(NULL AS BIGINT)").unwrap(), Value::Null);
+        assert_eq!(eval("CAST(NULL AS REAL)").unwrap(), Value::Null);
+        assert_eq!(eval("CAST(NULL AS DOUBLE PRECISION)").unwrap(), Value::Null);
+        assert_eq!(eval("CAST(NULL AS TEXT)").unwrap(), Value::Null);
     }
 
     #[test]
@@ -1010,159 +1359,140 @@ mod tests {
             ("off", false),
         ] {
             assert_eq!(
-                eval_cast(Value::Text(input.into()), &Type::Bool).unwrap(),
+                eval(&format!("CAST('{}' AS BOOLEAN)", input)).unwrap(),
                 Value::Boolean(expected),
-                "CAST('{}' AS BOOL)",
+                "CAST('{}' AS BOOLEAN)",
                 input
             );
         }
     }
 
     #[test]
-    fn test_arithmetic_null_propagation() {
-        // Any arithmetic with NULL returns NULL
+    fn test_cast_int_narrowing_overflow() {
+        // Int64 → Int16: out of range
+        assert!(matches!(
+            eval("CAST(70000 AS SMALLINT)"),
+            Err(ExecutorError::NumericOutOfRange { .. })
+        ));
+        assert!(matches!(
+            eval("CAST(-70000 AS SMALLINT)"),
+            Err(ExecutorError::NumericOutOfRange { .. })
+        ));
+        // Int32 → Int16: out of range
+        assert!(matches!(
+            eval("CAST(CAST(70000 AS INTEGER) AS SMALLINT)"),
+            Err(ExecutorError::NumericOutOfRange { .. })
+        ));
+        // Int64 → Int32: out of range
+        assert!(matches!(
+            eval("CAST(3000000000 AS INTEGER)"),
+            Err(ExecutorError::NumericOutOfRange { .. })
+        ));
+
+        // Boundary values should succeed
         assert_eq!(
-            eval_binop(Value::Int64(1), BinaryOperator::Add, Value::Null).unwrap(),
-            Value::Null
+            eval("CAST(32767 AS SMALLINT)").unwrap(),
+            Value::Int16(i16::MAX)
         );
         assert_eq!(
-            eval_binop(Value::Null, BinaryOperator::Mul, Value::Int64(2)).unwrap(),
-            Value::Null
+            eval("CAST(-32768 AS SMALLINT)").unwrap(),
+            Value::Int16(i16::MIN)
+        );
+        assert_eq!(
+            eval("CAST(2147483647 AS INTEGER)").unwrap(),
+            Value::Int32(i32::MAX)
+        );
+        assert_eq!(
+            eval("CAST(-2147483648 AS INTEGER)").unwrap(),
+            Value::Int32(i32::MIN)
         );
     }
 
     #[test]
-    fn test_concat_null_propagation() {
-        // String concatenation with NULL returns NULL
-        assert_eq!(
-            eval_binop(
-                Value::Text("hello".into()),
-                BinaryOperator::Concat,
-                Value::Null
-            )
-            .unwrap(),
-            Value::Null
-        );
-        assert_eq!(
-            eval_binop(
-                Value::Null,
-                BinaryOperator::Concat,
-                Value::Text("world".into())
-            )
-            .unwrap(),
-            Value::Null
-        );
+    fn test_cast_float_to_int_rounds() {
+        // Float rounds to nearest integer (ties away from zero)
+        assert_eq!(eval("CAST(3.9 AS BIGINT)").unwrap(), Value::Int64(4));
+        assert_eq!(eval("CAST(-3.9 AS BIGINT)").unwrap(), Value::Int64(-4));
+        assert_eq!(eval("CAST(0.5 AS BIGINT)").unwrap(), Value::Int64(1));
+        assert_eq!(eval("CAST(-0.5 AS BIGINT)").unwrap(), Value::Int64(-1));
+        assert_eq!(eval("CAST(2.4 AS INTEGER)").unwrap(), Value::Int32(2));
     }
 
     #[test]
-    fn test_like_null_propagation() {
-        let record = Record::new(vec![]);
-        // NULL LIKE '%' = NULL
-        let expr = BoundExpr::Like {
-            expr: Box::new(BoundExpr::Null),
-            pattern: Box::new(BoundExpr::String("%".into())),
-            escape: None,
-            negated: false,
-            case_insensitive: false,
-        };
-        assert_eq!(expr.evaluate(&record).unwrap(), Value::Null);
-
-        // 'abc' LIKE NULL = NULL
-        let expr = BoundExpr::Like {
-            expr: Box::new(BoundExpr::String("abc".into())),
-            pattern: Box::new(BoundExpr::Null),
-            escape: None,
-            negated: false,
-            case_insensitive: false,
-        };
-        assert_eq!(expr.evaluate(&record).unwrap(), Value::Null);
-    }
-
-    #[test]
-    fn test_integer_overflow() {
+    fn test_cast_float_to_int_overflow() {
+        // Float too large for integer type
         assert!(matches!(
-            eval_binop(Value::Int64(i64::MAX), BinaryOperator::Add, Value::Int64(1)),
-            Err(ExecutorError::Unsupported(_))
+            eval("CAST(CAST('1e100' AS DOUBLE PRECISION) AS BIGINT)"),
+            Err(ExecutorError::NumericOutOfRange { .. })
         ));
         assert!(matches!(
-            eval_binop(Value::Int64(i64::MIN), BinaryOperator::Sub, Value::Int64(1)),
-            Err(ExecutorError::Unsupported(_))
+            eval("CAST(CAST('inf' AS DOUBLE PRECISION) AS BIGINT)"),
+            Err(ExecutorError::NumericOutOfRange { .. })
         ));
         assert!(matches!(
-            eval_binop(Value::Int64(i64::MAX), BinaryOperator::Mul, Value::Int64(2)),
-            Err(ExecutorError::Unsupported(_))
+            eval("CAST(CAST('NaN' AS DOUBLE PRECISION) AS INTEGER)"),
+            Err(ExecutorError::NumericOutOfRange { .. })
+        ));
+        assert!(matches!(
+            eval("CAST(40000.0 AS SMALLINT)"),
+            Err(ExecutorError::NumericOutOfRange { .. })
         ));
     }
 
     #[test]
-    fn test_division_by_zero() {
+    fn test_cast_float64_to_float32_overflow() {
+        // Float64 value too large for Float32
         assert!(matches!(
-            eval_binop(Value::Int64(1), BinaryOperator::Div, Value::Int64(0)),
-            Err(ExecutorError::DivisionByZero)
+            eval("CAST(CAST('1.7976931348623157e308' AS DOUBLE PRECISION) AS REAL)"),
+            Err(ExecutorError::NumericOutOfRange { .. })
         ));
-        assert!(matches!(
-            eval_binop(Value::Int64(1), BinaryOperator::Mod, Value::Int64(0)),
-            Err(ExecutorError::DivisionByZero)
-        ));
-        assert!(matches!(
-            eval_binop(Value::Float64(1.0), BinaryOperator::Div, Value::Float64(0.0)),
-            Err(ExecutorError::DivisionByZero)
-        ));
-    }
-
-    // --- NaN ordering tests ---
-
-    #[test]
-    fn test_compare_f64_nan_ordering() {
-        use std::cmp::Ordering;
-
-        // NaN > any non-NaN value
-        assert_eq!(compare_f64(f64::NAN, 0.0), Ordering::Greater);
-        assert_eq!(compare_f64(f64::NAN, f64::INFINITY), Ordering::Greater);
-        assert_eq!(compare_f64(f64::NAN, f64::NEG_INFINITY), Ordering::Greater);
-
-        // any non-NaN value < NaN
-        assert_eq!(compare_f64(0.0, f64::NAN), Ordering::Less);
-        assert_eq!(compare_f64(f64::INFINITY, f64::NAN), Ordering::Less);
-        assert_eq!(compare_f64(f64::NEG_INFINITY, f64::NAN), Ordering::Less);
-
-        // NaN == NaN
-        assert_eq!(compare_f64(f64::NAN, f64::NAN), Ordering::Equal);
-
-        // Normal comparisons still work
-        assert_eq!(compare_f64(1.0, 2.0), Ordering::Less);
-        assert_eq!(compare_f64(2.0, 1.0), Ordering::Greater);
-        assert_eq!(compare_f64(1.0, 1.0), Ordering::Equal);
+        // Infinity is preserved (not an overflow)
+        assert_eq!(
+            eval("CAST(CAST('inf' AS DOUBLE PRECISION) AS REAL)").unwrap(),
+            Value::Float32(f32::INFINITY)
+        );
+        // NaN is preserved
+        let result = eval("CAST(CAST('NaN' AS DOUBLE PRECISION) AS REAL)").unwrap();
+        assert!(matches!(result, Value::Float32(n) if n.is_nan()));
     }
 
     #[test]
-    fn test_compare_values_nan_ordering() {
-        use std::cmp::Ordering;
+    fn test_cast_text_to_numeric() {
+        assert_eq!(eval("CAST('42' AS INTEGER)").unwrap(), Value::Int32(42));
+        assert_eq!(eval("CAST(' -7 ' AS BIGINT)").unwrap(), Value::Int64(-7));
+        assert_eq!(
+            eval("CAST('3.14' AS DOUBLE PRECISION)").unwrap(),
+            Value::Float64(3.14)
+        );
+    }
 
-        // NaN > regular float
-        assert_eq!(
-            compare_values(&Value::Float64(f64::NAN), &Value::Float64(1.0)).unwrap(),
-            Ordering::Greater
-        );
-        // regular float < NaN
-        assert_eq!(
-            compare_values(&Value::Float64(1.0), &Value::Float64(f64::NAN)).unwrap(),
-            Ordering::Less
-        );
-        // NaN == NaN
-        assert_eq!(
-            compare_values(&Value::Float64(f64::NAN), &Value::Float64(f64::NAN)).unwrap(),
-            Ordering::Equal
-        );
+    #[test]
+    fn test_cast_text_to_numeric_invalid() {
+        assert!(matches!(
+            eval("CAST('abc' AS INTEGER)"),
+            Err(ExecutorError::InvalidCast { .. })
+        ));
+        assert!(matches!(
+            eval("CAST('' AS BIGINT)"),
+            Err(ExecutorError::InvalidCast { .. })
+        ));
+    }
 
-        // NaN > integer (cross-type comparison via promotion)
+    #[test]
+    fn test_cast_to_text() {
+        assert_eq!(eval("CAST(42 AS TEXT)").unwrap(), Value::Text("42".into()));
+        assert_eq!(eval("CAST(TRUE AS TEXT)").unwrap(), Value::Text("t".into()));
         assert_eq!(
-            compare_values(&Value::Float64(f64::NAN), &Value::Int64(100)).unwrap(),
-            Ordering::Greater
+            eval("CAST(3.14 AS TEXT)").unwrap(),
+            Value::Text("3.14".into())
         );
+    }
+
+    #[test]
+    fn test_cast_to_varchar() {
         assert_eq!(
-            compare_values(&Value::Int64(100), &Value::Float64(f64::NAN)).unwrap(),
-            Ordering::Less
+            eval("CAST(42 AS VARCHAR)").unwrap(),
+            Value::Text("42".into())
         );
     }
 }

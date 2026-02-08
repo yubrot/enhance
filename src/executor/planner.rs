@@ -1,7 +1,4 @@
-//! Query planner for SELECT statements.
-//!
-//! Transforms a parsed [`SelectStmt`] AST into a logical [`Plan`] tree
-//! by resolving table references via the catalog and binding column names.
+//! Query planner.
 
 use crate::catalog::ColumnInfo;
 use crate::datum::Type;
@@ -10,10 +7,10 @@ use crate::sql::{Expr, FromClause, SelectItem, SelectStmt, TableRef};
 use crate::storage::{Replacer, Storage};
 use crate::tx::Snapshot;
 
-use super::{ColumnDesc, ColumnSource};
 use super::error::ExecutorError;
 use super::expr::{BoundExpr, resolve_column_index};
 use super::plan::Plan;
+use super::{ColumnDesc, ColumnSource};
 
 /// Plans a SELECT statement into a logical [`Plan`] tree.
 ///
@@ -68,7 +65,7 @@ pub async fn plan_select<S: Storage, R: Replacer>(
     // Step 2: WHERE clause -> Filter (bind column names to indices)
     if let Some(where_clause) = &select.where_clause {
         let columns = plan.columns().to_vec();
-        let bound_predicate = BoundExpr::bind(where_clause, &columns)?;
+        let bound_predicate = where_clause.bind(&columns)?;
         plan = Plan::Filter {
             input: Box::new(plan),
             predicate: bound_predicate,
@@ -213,7 +210,7 @@ fn resolve_select_item(
             Ok(expanded)
         }
         SelectItem::Expr { expr, alias } => {
-            let bound = BoundExpr::bind(expr, input_columns)?;
+            let bound = expr.bind(input_columns)?;
             let desc = infer_column_desc(expr, alias.as_deref(), input_columns);
             Ok(vec![(bound, desc)])
         }
@@ -234,10 +231,7 @@ fn expand_columns(
         .iter()
         .enumerate()
         .filter(|(_, col)| match table_name {
-            Some(name) => col
-                .source
-                .as_ref()
-                .is_some_and(|s| s.table_name == name),
+            Some(name) => col.source.as_ref().is_some_and(|s| s.table_name == name),
             None => true,
         })
         .map(|(i, col)| {
@@ -404,7 +398,10 @@ mod tests {
 
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "table_name");
-        let source = plan.columns()[0].source.as_ref().expect("should have source");
+        let source = plan.columns()[0]
+            .source
+            .as_ref()
+            .expect("should have source");
         assert_eq!(source.table_name, "sys_tables");
         assert_ne!(source.table_oid, 0);
         assert_ne!(source.column_id, 0);
@@ -431,7 +428,10 @@ mod tests {
 
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "table_name");
-        let source = plan.columns()[0].source.as_ref().expect("should have source");
+        let source = plan.columns()[0]
+            .source
+            .as_ref()
+            .expect("should have source");
         assert_eq!(source.table_name, "sys_tables");
         assert_ne!(source.table_oid, 0);
         assert_ne!(source.column_id, 0);
@@ -468,7 +468,10 @@ mod tests {
 
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "table_name");
-        let source = plan.columns()[0].source.as_ref().expect("should have source");
+        let source = plan.columns()[0]
+            .source
+            .as_ref()
+            .expect("should have source");
         assert_eq!(source.table_name, "t");
     }
 
