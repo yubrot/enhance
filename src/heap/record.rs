@@ -164,6 +164,21 @@ impl Record {
 mod tests {
     use super::*;
 
+    /// Asserts that two records are structurally identical, including NULL positions.
+    ///
+    /// `Value::PartialEq` treats NULL as incomparable (NULL != NULL), so
+    /// `assert_eq!` cannot verify roundtrip correctness for records containing
+    /// NULLs. This helper checks each position individually.
+    fn assert_record_eq(actual: &Record, expected: &Record) {
+        assert_eq!(actual.len(), expected.len(), "record length mismatch");
+        for (i, (a, e)) in actual.values.iter().zip(expected.values.iter()).enumerate() {
+            match (a, e) {
+                (Value::Null, Value::Null) => {}
+                _ => assert_eq!(a, e, "value mismatch at index {i}"),
+            }
+        }
+    }
+
     #[test]
     fn test_empty_record() {
         let record = Record::new(vec![]);
@@ -225,7 +240,7 @@ mod tests {
 
         let schema = [Type::Int4, Type::Text, Type::Text, Type::Int4];
         let parsed = Record::deserialize(&buf, &schema).unwrap();
-        assert_eq!(parsed, record);
+        assert_record_eq(&parsed, &record);
     }
 
     #[test]
@@ -239,7 +254,7 @@ mod tests {
 
         let schema = [Type::Int4, Type::Text, Type::Bool];
         let parsed = Record::deserialize(&buf, &schema).unwrap();
-        assert_eq!(parsed, record);
+        assert_record_eq(&parsed, &record);
     }
 
     #[test]
@@ -265,7 +280,7 @@ mod tests {
 
         let schema = vec![Type::Int4; 9];
         let parsed = Record::deserialize(&buf, &schema).unwrap();
-        assert_eq!(parsed, record);
+        assert_record_eq(&parsed, &record);
     }
 
     #[test]

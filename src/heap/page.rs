@@ -898,10 +898,13 @@ mod tests {
             .insert(&record, TxId::new(1), CommandId::FIRST)
             .unwrap();
 
-        // Read back
+        // Read back and verify element-by-element (Value::Null != Value::Null)
         let schema = [Type::Int4, Type::Int4, Type::Text];
         let (_, read_record) = page.get(slot, &schema).unwrap();
-        assert_eq!(read_record, record);
+        assert_eq!(read_record.len(), record.len());
+        assert_eq!(read_record.values[0], record.values[0]);
+        assert!(read_record.values[1].is_null());
+        assert_eq!(read_record.values[2], record.values[2]);
     }
 
     #[test]

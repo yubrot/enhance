@@ -198,7 +198,7 @@ impl fmt::Display for Type {
 /// - Numeric/Decimal type for exact decimal arithmetic
 /// - Date/Time types
 /// - Array types
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     /// SQL NULL (type is unknown/any).
     Null,
@@ -239,6 +239,20 @@ impl Value {
     /// Returns true if this value is NULL.
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
+    }
+
+    /// Interprets this value as a nullable boolean.
+    ///
+    /// Returns `Ok(None)` for NULL, `Ok(Some(b))` for Boolean, and `Err(())`
+    /// for any other type. The unit error signals a type mismatch without
+    /// prescribing an error representation; callers map it to their own error.
+    #[allow(clippy::result_unit_err)]
+    pub fn to_bool_nullable(&self) -> Result<Option<bool>, ()> {
+        match self {
+            Value::Null => Ok(None),
+            Value::Boolean(b) => Ok(Some(*b)),
+            _ => Err(()),
+        }
     }
 
     /// Returns the serialized size in bytes.
@@ -599,6 +613,17 @@ fn compare_f64(a: f64, b: f64) -> std::cmp::Ordering {
     }
 }
 
+impl PartialEq for Value {
+    /// Returns true when [`partial_cmp`](Self::partial_cmp) yields
+    /// [`Ordering::Equal`](std::cmp::Ordering::Equal).
+    ///
+    /// This is intentionally consistent with `PartialOrd`: NULL is not equal
+    /// to anything (including itself), and cross-type numeric promotion applies.
+    fn eq(&self, other: &Self) -> bool {
+        self.partial_cmp(other) == Some(std::cmp::Ordering::Equal)
+    }
+}
+
 impl PartialOrd for Value {
     /// Compares two values with numeric type promotion.
     ///
@@ -933,13 +958,17 @@ mod tests {
 
     #[test]
     fn test_cast_null_passthrough() {
-        assert_eq!(Value::Null.cast(&Type::Bool).unwrap(), Value::Null);
-        assert_eq!(Value::Null.cast(&Type::Int2).unwrap(), Value::Null);
-        assert_eq!(Value::Null.cast(&Type::Int4).unwrap(), Value::Null);
-        assert_eq!(Value::Null.cast(&Type::Int8).unwrap(), Value::Null);
-        assert_eq!(Value::Null.cast(&Type::Float4).unwrap(), Value::Null);
-        assert_eq!(Value::Null.cast(&Type::Float8).unwrap(), Value::Null);
-        assert_eq!(Value::Null.cast(&Type::Text).unwrap(), Value::Null);
+        for ty in [
+            Type::Bool,
+            Type::Int2,
+            Type::Int4,
+            Type::Int8,
+            Type::Float4,
+            Type::Float8,
+            Type::Text,
+        ] {
+            assert!(Value::Null.cast(&ty).unwrap().is_null(), "CAST(NULL AS {ty})");
+        }
     }
 
     #[test]

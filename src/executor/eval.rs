@@ -277,35 +277,20 @@ fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) -> Result<Val
     }
 }
 
+/// Converts a value to a nullable boolean, mapping type errors to [`ExecutorError::TypeMismatch`].
+fn to_bool_or_type_error(v: &Value) -> Result<Option<bool>, ExecutorError> {
+    v.to_bool_nullable().map_err(|()| ExecutorError::TypeMismatch {
+        expected: "boolean".to_string(),
+        found: v
+            .data_type()
+            .map_or("NULL", Type::display_name)
+            .to_string(),
+    })
+}
+
 /// Evaluates AND with 3-value NULL logic.
 fn eval_and(left: &Value, right: &Value) -> Result<Value, ExecutorError> {
-    let l = match left {
-        Value::Null => None,
-        Value::Boolean(b) => Some(*b),
-        _ => {
-            return Err(ExecutorError::TypeMismatch {
-                expected: "boolean".to_string(),
-                found: left
-                    .data_type()
-                    .map_or("NULL", Type::display_name)
-                    .to_string(),
-            })
-        }
-    };
-    let r = match right {
-        Value::Null => None,
-        Value::Boolean(b) => Some(*b),
-        _ => {
-            return Err(ExecutorError::TypeMismatch {
-                expected: "boolean".to_string(),
-                found: right
-                    .data_type()
-                    .map_or("NULL", Type::display_name)
-                    .to_string(),
-            })
-        }
-    };
-    match (l, r) {
+    match (to_bool_or_type_error(left)?, to_bool_or_type_error(right)?) {
         (Some(false), _) | (_, Some(false)) => Ok(Value::Boolean(false)),
         (Some(true), Some(true)) => Ok(Value::Boolean(true)),
         _ => Ok(Value::Null),
@@ -314,33 +299,7 @@ fn eval_and(left: &Value, right: &Value) -> Result<Value, ExecutorError> {
 
 /// Evaluates OR with 3-value NULL logic.
 fn eval_or(left: &Value, right: &Value) -> Result<Value, ExecutorError> {
-    let l = match left {
-        Value::Null => None,
-        Value::Boolean(b) => Some(*b),
-        _ => {
-            return Err(ExecutorError::TypeMismatch {
-                expected: "boolean".to_string(),
-                found: left
-                    .data_type()
-                    .map_or("NULL", Type::display_name)
-                    .to_string(),
-            })
-        }
-    };
-    let r = match right {
-        Value::Null => None,
-        Value::Boolean(b) => Some(*b),
-        _ => {
-            return Err(ExecutorError::TypeMismatch {
-                expected: "boolean".to_string(),
-                found: right
-                    .data_type()
-                    .map_or("NULL", Type::display_name)
-                    .to_string(),
-            })
-        }
-    };
-    match (l, r) {
+    match (to_bool_or_type_error(left)?, to_bool_or_type_error(right)?) {
         (Some(true), _) | (_, Some(true)) => Ok(Value::Boolean(true)),
         (Some(false), Some(false)) => Ok(Value::Boolean(false)),
         _ => Ok(Value::Null),
@@ -531,7 +490,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_literals() {
-        assert_eq!(eval("NULL").unwrap(), Value::Null);
+        assert!(eval("NULL").unwrap().is_null());
         assert_eq!(eval("42").unwrap(), Value::Int64(42));
         assert_eq!(eval("TRUE").unwrap(), Value::Boolean(true));
     }
@@ -591,15 +550,15 @@ mod tests {
     #[test]
     fn test_and_null_propagation() {
         // TRUE AND NULL = NULL
-        assert_eq!(eval("TRUE AND NULL").unwrap(), Value::Null);
+        assert!(eval("TRUE AND NULL").unwrap().is_null());
         // NULL AND TRUE = NULL
-        assert_eq!(eval("NULL AND TRUE").unwrap(), Value::Null);
+        assert!(eval("NULL AND TRUE").unwrap().is_null());
         // FALSE AND NULL = FALSE (short-circuit)
         assert_eq!(eval("FALSE AND NULL").unwrap(), Value::Boolean(false));
         // NULL AND FALSE = FALSE (short-circuit)
         assert_eq!(eval("NULL AND FALSE").unwrap(), Value::Boolean(false));
         // NULL AND NULL = NULL
-        assert_eq!(eval("NULL AND NULL").unwrap(), Value::Null);
+        assert!(eval("NULL AND NULL").unwrap().is_null());
     }
 
     #[test]
@@ -609,11 +568,11 @@ mod tests {
         // NULL OR TRUE = TRUE (short-circuit)
         assert_eq!(eval("NULL OR TRUE").unwrap(), Value::Boolean(true));
         // FALSE OR NULL = NULL
-        assert_eq!(eval("FALSE OR NULL").unwrap(), Value::Null);
+        assert!(eval("FALSE OR NULL").unwrap().is_null());
         // NULL OR FALSE = NULL
-        assert_eq!(eval("NULL OR FALSE").unwrap(), Value::Null);
+        assert!(eval("NULL OR FALSE").unwrap().is_null());
         // NULL OR NULL = NULL
-        assert_eq!(eval("NULL OR NULL").unwrap(), Value::Null);
+        assert!(eval("NULL OR NULL").unwrap().is_null());
     }
 
     // ========================================================================
@@ -642,8 +601,8 @@ mod tests {
     #[test]
     fn test_concat_null_propagation() {
         // String concatenation with NULL returns NULL
-        assert_eq!(eval("'hello' || NULL").unwrap(), Value::Null);
-        assert_eq!(eval("NULL || 'world'").unwrap(), Value::Null);
+        assert!(eval("'hello' || NULL").unwrap().is_null());
+        assert!(eval("NULL || 'world'").unwrap().is_null());
     }
 
     // ========================================================================
@@ -675,9 +634,9 @@ mod tests {
     #[test]
     fn test_comparison_null_propagation() {
         // Any comparison with NULL returns NULL
-        assert_eq!(eval("1 = NULL").unwrap(), Value::Null);
-        assert_eq!(eval("NULL < 1").unwrap(), Value::Null);
-        assert_eq!(eval("NULL <> NULL").unwrap(), Value::Null);
+        assert!(eval("1 = NULL").unwrap().is_null());
+        assert!(eval("NULL < 1").unwrap().is_null());
+        assert!(eval("NULL <> NULL").unwrap().is_null());
     }
 
     // ========================================================================
@@ -712,8 +671,8 @@ mod tests {
     #[test]
     fn test_arithmetic_null_propagation() {
         // Any arithmetic with NULL returns NULL
-        assert_eq!(eval("1 + NULL").unwrap(), Value::Null);
-        assert_eq!(eval("NULL * 2").unwrap(), Value::Null);
+        assert!(eval("1 + NULL").unwrap().is_null());
+        assert!(eval("NULL * 2").unwrap().is_null());
     }
 
     #[test]
@@ -751,7 +710,7 @@ mod tests {
         assert_eq!(eval("NOT TRUE").unwrap(), Value::Boolean(false));
         assert_eq!(eval("NOT FALSE").unwrap(), Value::Boolean(true));
         // NOT NULL = NULL
-        assert_eq!(eval("NOT NULL").unwrap(), Value::Null);
+        assert!(eval("NOT NULL").unwrap().is_null());
     }
 
     #[test]
@@ -767,7 +726,7 @@ mod tests {
         assert_eq!(eval("-42").unwrap(), Value::Int64(-42));
         assert_eq!(eval("-3.14").unwrap(), Value::Float64(-3.14));
         // -NULL = NULL
-        assert_eq!(eval("-NULL").unwrap(), Value::Null);
+        assert!(eval("-NULL").unwrap().is_null());
     }
 
     #[test]
@@ -800,7 +759,7 @@ mod tests {
         assert_eq!(eval("+42").unwrap(), Value::Int64(42));
         assert_eq!(eval("+3.14").unwrap(), Value::Float64(3.14));
         // +NULL = NULL
-        assert_eq!(eval("+NULL").unwrap(), Value::Null);
+        assert!(eval("+NULL").unwrap().is_null());
     }
 
     // ========================================================================
@@ -838,15 +797,15 @@ mod tests {
     #[test]
     fn test_in_list_null_propagation() {
         // NULL IN (1, 2) = NULL
-        assert_eq!(eval("NULL IN (1, 2)").unwrap(), Value::Null);
+        assert!(eval("NULL IN (1, 2)").unwrap().is_null());
         // 1 IN (1, NULL) = TRUE (found before NULL)
         assert_eq!(eval("1 IN (1, NULL)").unwrap(), Value::Boolean(true));
         // 3 IN (1, NULL) = NULL (not found, has NULL)
-        assert_eq!(eval("3 IN (1, NULL)").unwrap(), Value::Null);
+        assert!(eval("3 IN (1, NULL)").unwrap().is_null());
         // 3 NOT IN (1, 2) = TRUE (not found, no NULL)
         assert_eq!(eval("3 NOT IN (1, 2)").unwrap(), Value::Boolean(true));
         // 3 NOT IN (1, NULL) = NULL (not found, has NULL)
-        assert_eq!(eval("3 NOT IN (1, NULL)").unwrap(), Value::Null);
+        assert!(eval("3 NOT IN (1, NULL)").unwrap().is_null());
     }
 
     // ========================================================================
@@ -887,11 +846,11 @@ mod tests {
     #[test]
     fn test_between_null_propagation() {
         // NULL BETWEEN 1 AND 10 = NULL
-        assert_eq!(eval("NULL BETWEEN 1 AND 10").unwrap(), Value::Null);
+        assert!(eval("NULL BETWEEN 1 AND 10").unwrap().is_null());
         // 5 BETWEEN NULL AND 10 = NULL
-        assert_eq!(eval("5 BETWEEN NULL AND 10").unwrap(), Value::Null);
+        assert!(eval("5 BETWEEN NULL AND 10").unwrap().is_null());
         // 5 BETWEEN 1 AND NULL = NULL
-        assert_eq!(eval("5 BETWEEN 1 AND NULL").unwrap(), Value::Null);
+        assert!(eval("5 BETWEEN 1 AND NULL").unwrap().is_null());
     }
 
     // ========================================================================
@@ -984,9 +943,9 @@ mod tests {
     #[test]
     fn test_like_null_propagation() {
         // NULL LIKE '%' = NULL
-        assert_eq!(eval("NULL LIKE '%'").unwrap(), Value::Null);
+        assert!(eval("NULL LIKE '%'").unwrap().is_null());
         // 'abc' LIKE NULL = NULL
-        assert_eq!(eval("'abc' LIKE NULL").unwrap(), Value::Null);
+        assert!(eval("'abc' LIKE NULL").unwrap().is_null());
     }
 
     // ========================================================================
@@ -1021,7 +980,7 @@ mod tests {
     #[test]
     fn test_searched_case_no_else() {
         // No ELSE and no match → NULL
-        assert_eq!(eval("CASE WHEN FALSE THEN 'a' END").unwrap(), Value::Null);
+        assert!(eval("CASE WHEN FALSE THEN 'a' END").unwrap().is_null());
     }
 
     #[test]
@@ -1051,7 +1010,7 @@ mod tests {
 
     #[test]
     fn test_simple_case_no_match_no_else() {
-        assert_eq!(eval("CASE 99 WHEN 1 THEN 'one' END").unwrap(), Value::Null);
+        assert!(eval("CASE 99 WHEN 1 THEN 'one' END").unwrap().is_null());
     }
 
     #[test]
