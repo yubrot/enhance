@@ -3,6 +3,11 @@
 //! The [`Parser`] converts a stream of tokens into an Abstract Syntax Tree (AST).
 //! It uses recursive descent for most constructs and precedence climbing for
 //! expression parsing.
+//!
+//! NOTE: There is no recursion depth limit. Deeply nested expressions like
+//! `(((((...))))))` can cause a stack overflow. Since the parser accepts external
+//! input via the wire protocol, this is a DoS risk. A production system should
+//! track recursion depth and return an error when a threshold is exceeded.
 
 use super::ast::*;
 use super::error::{Span, SyntaxError};
