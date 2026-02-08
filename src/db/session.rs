@@ -222,7 +222,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                     let columns = plan.columns().to_vec();
 
                     let ctx = db.exec_context(snapshot);
-                    let mut node = executor::ExecutorNode::build(plan, &ctx);
+                    let mut node = plan.prepare_for_execute(&ctx);
                     let mut rows = Vec::new();
                     while let Some(row) = node.next().await? {
                         rows.push(row);
@@ -242,7 +242,8 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 Statement::Select(select_stmt) => {
                     self.within_transaction(|db, txid, cid| async move {
                         let snapshot = db.tx_manager().snapshot(txid, cid);
-                        let plan = executor::plan_select(select_stmt, db.catalog(), &snapshot).await?;
+                        let plan =
+                            executor::plan_select(select_stmt, db.catalog(), &snapshot).await?;
                         Ok(QueryResult::Rows {
                             columns: vec![ColumnDesc::explain()],
                             rows: plan.explain().lines().map(Row::explain_line).collect(),

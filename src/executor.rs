@@ -17,7 +17,7 @@
 //! |    └── Filter          |
 //! |          └── SeqScan   |
 //! +-----------+------------+
-//!             | ExecutorNode::build (converts Plan into ExecutorNode)
+//!             | Plan::prepare_for_execute() (converts Plan into ExecutorNode)
 //!             v
 //! +------------------------+
 //! |      ExecutorNode      |  <- Physical tree (lazy page I/O via next())

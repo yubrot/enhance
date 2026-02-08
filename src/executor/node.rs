@@ -1,9 +1,5 @@
 //! Executor nodes implementing the Volcano iterator model.
 //!
-//! Each node produces tuples one at a time via [`ExecutorNode::next()`].
-//! Nodes are composed into a tree (e.g., Projection -> Filter -> SeqScan)
-//! where each parent pulls tuples from its child.
-//!
 //! All nodes are generic over [`ExecContext`], which provides storage
 //! operations. This keeps executor logic decoupled from concrete storage types.
 
@@ -19,11 +15,6 @@ use super::plan::Plan;
 use super::row::Row;
 
 /// A query executor node.
-///
-/// Uses enum dispatch instead of `dyn Trait` to avoid boxing async methods.
-/// This is sufficient since the number of node types is small and fixed.
-///
-/// Generic over [`ExecContext`] to decouple from concrete storage types.
 pub enum ExecutorNode<C: ExecContext> {
     /// Sequential heap scan with lazy page loading.
     SeqScan(SeqScan<C>),
@@ -35,13 +26,13 @@ pub enum ExecutorNode<C: ExecContext> {
     ValuesScan(ValuesScan),
 }
 
-impl<C: ExecContext> ExecutorNode<C> {
-    /// Converts a logical [`Plan`] into a physical `ExecutorNode` tree.
+impl Plan {
+    /// Converts a logical [`Plan`] into a physical [`ExecutorNode`] tree.
     ///
     /// This is a synchronous function — no I/O happens here. All storage access
     /// is deferred to [`ExecutorNode::next()`] via the [`ExecContext`].
-    pub fn build(plan: Plan, ctx: &C) -> Self {
-        match plan {
+    pub fn prepare_for_execute<C: ExecContext>(self, ctx: &C) -> ExecutorNode<C> {
+        match self {
             Plan::SeqScan {
                 table_name,
                 first_page,
@@ -56,21 +47,23 @@ impl<C: ExecContext> ExecutorNode<C> {
                 first_page,
             )),
             Plan::Filter { input, predicate } => {
-                let child = Self::build(*input, ctx);
-                ExecutorNode::Filter(Filter::new(child, predicate))
+                ExecutorNode::Filter(Filter::new(input.prepare_for_execute(ctx), predicate))
             }
             Plan::Projection {
                 input,
                 exprs,
                 columns,
-            } => {
-                let child = Self::build(*input, ctx);
-                ExecutorNode::Projection(Projection::new(child, exprs, columns))
-            }
+            } => ExecutorNode::Projection(Projection::new(
+                input.prepare_for_execute(ctx),
+                exprs,
+                columns,
+            )),
             Plan::ValuesScan => ExecutorNode::ValuesScan(ValuesScan::new()),
         }
     }
+}
 
+impl<C: ExecContext> ExecutorNode<C> {
     /// Returns the next tuple, or `None` if exhausted.
     ///
     /// This method follows the Volcano iterator model naming convention,
@@ -275,39 +268,110 @@ impl ValuesScan {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
-    use crate::sql::BinaryOperator;
+    use crate::datum::{Type, Value};
+    use crate::db::Database;
+    use crate::executor::ExecContextImpl;
+    use crate::heap::{HeapPage, Record};
+    use crate::sql::{BinaryOperator, Parser, Statement};
+    use crate::storage::{LruReplacer, MemoryStorage, PageId};
+    use crate::tx::CommandId;
 
-    /// Mock execution context for unit testing executor nodes without real storage.
-    #[derive(Clone)]
-    struct MockContext {
-        /// Pages indexed by page number. Each page is a Vec of tuples.
-        pages: Arc<Vec<Vec<Row>>>,
-    }
+    type TestCtx = ExecContextImpl<MemoryStorage, LruReplacer>;
+    type TestDb = Database<MemoryStorage, LruReplacer>;
 
-    impl MockContext {
-        /// Creates a mock context with a single page of tuples.
-        fn single_page(tuples: Vec<Row>) -> Self {
-            Self {
-                pages: Arc::new(vec![tuples]),
+    /// Creates a test database with `CREATE TABLE test (id INT)` and inserts
+    /// the given values via direct heap page writes. Returns the database
+    /// and the table's first page ID.
+    async fn setup_int_table(values: Vec<i64>) -> (TestDb, PageId) {
+        let db = Database::open(MemoryStorage::new(), 100).await.unwrap();
+
+        let txid = db.tx_manager().begin();
+        let cid = CommandId::FIRST;
+        let Statement::CreateTable(stmt) = Parser::new("CREATE TABLE test (id INT)")
+            .parse()
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected CreateTable");
+        };
+        db.catalog()
+            .create_table(txid, cid, &stmt)
+            .await
+            .unwrap();
+        db.tx_manager().commit(txid).unwrap();
+
+        let txid = db.tx_manager().begin();
+        let cid = CommandId::FIRST;
+        let snapshot = db.tx_manager().snapshot(txid, cid);
+        let table = db
+            .catalog()
+            .get_table(&snapshot, "test")
+            .await
+            .unwrap()
+            .unwrap();
+        let first_page = table.first_page;
+        {
+            let page = db.pool().fetch_page_mut(first_page, true).await.unwrap();
+            let mut heap = HeapPage::new(page);
+            for v in values {
+                heap.insert(&Record::new(vec![Value::Int64(v)]), txid, cid)
+                    .unwrap();
             }
         }
+        db.tx_manager().commit(txid).unwrap();
+
+        (db, first_page)
     }
 
-    impl ExecContext for MockContext {
-        async fn scan_heap_page(
-            &self,
-            page_id: PageId,
-            _schema: &[Type],
-        ) -> Result<Vec<Row>, ExecutorError> {
-            Ok(self
-                .pages
-                .get(page_id.page_num() as usize)
-                .cloned()
-                .unwrap_or_default())
+    /// Creates a test database with `CREATE TABLE test (id INT, name TEXT)` and
+    /// inserts the given rows. Returns the database and the table's first page ID.
+    async fn setup_two_col_table(rows: Vec<(i64, &str)>) -> (TestDb, PageId) {
+        let db = Database::open(MemoryStorage::new(), 100).await.unwrap();
+
+        let txid = db.tx_manager().begin();
+        let cid = CommandId::FIRST;
+        let Statement::CreateTable(stmt) = Parser::new("CREATE TABLE test (id INT, name TEXT)")
+            .parse()
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected CreateTable");
+        };
+        db.catalog()
+            .create_table(txid, cid, &stmt)
+            .await
+            .unwrap();
+        db.tx_manager().commit(txid).unwrap();
+
+        let txid = db.tx_manager().begin();
+        let cid = CommandId::FIRST;
+        let snapshot = db.tx_manager().snapshot(txid, cid);
+        let table = db
+            .catalog()
+            .get_table(&snapshot, "test")
+            .await
+            .unwrap()
+            .unwrap();
+        let first_page = table.first_page;
+        {
+            let page = db.pool().fetch_page_mut(first_page, true).await.unwrap();
+            let mut heap = HeapPage::new(page);
+            for (id, name) in rows {
+                let record = Record::new(vec![Value::Int64(id), Value::Text(name.into())]);
+                heap.insert(&record, txid, cid).unwrap();
+            }
         }
+        db.tx_manager().commit(txid).unwrap();
+
+        (db, first_page)
+    }
+
+    /// Creates an ExecContext from a database with a fresh read-only snapshot.
+    fn read_ctx(db: &TestDb) -> TestCtx {
+        let txid = db.tx_manager().begin();
+        let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
+        db.exec_context(snapshot)
     }
 
     fn int_col(name: &str) -> ColumnDesc {
@@ -318,26 +382,16 @@ mod tests {
         }
     }
 
-    fn make_tuples(rows: Vec<Vec<Value>>) -> Vec<Row> {
-        rows.into_iter()
-            .map(|values| Row::computed(Record::new(values)))
-            .collect()
-    }
-
     #[tokio::test]
     async fn test_seq_scan_lazy_loading() {
-        let tuples = make_tuples(vec![
-            vec![Value::Int64(1)],
-            vec![Value::Int64(2)],
-            vec![Value::Int64(3)],
-        ]);
-        let ctx = MockContext::single_page(tuples);
+        let (db, first_page) = setup_int_table(vec![1, 2, 3]).await;
+        let ctx = read_ctx(&db);
         let mut node = ExecutorNode::SeqScan(SeqScan::new(
             "test".to_string(),
             vec![int_col("id")],
             ctx,
             vec![Type::Int8],
-            PageId::new(0),
+            first_page,
         ));
 
         assert_eq!(
@@ -358,19 +412,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_filter_predicate() {
-        let tuples = make_tuples(vec![
-            vec![Value::Int64(1)],
-            vec![Value::Int64(2)],
-            vec![Value::Int64(3)],
-            vec![Value::Int64(4)],
-        ]);
-        let ctx = MockContext::single_page(tuples);
+        let (db, first_page) = setup_int_table(vec![1, 2, 3, 4]).await;
+        let ctx = read_ctx(&db);
         let scan = ExecutorNode::SeqScan(SeqScan::new(
             "test".to_string(),
             vec![int_col("id")],
             ctx,
             vec![Type::Int8],
-            PageId::new(0),
+            first_page,
         ));
 
         // Filter: $col0 > 2
@@ -397,11 +446,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_projection() {
-        let tuples = make_tuples(vec![
-            vec![Value::Int64(1), Value::Text("alice".into())],
-            vec![Value::Int64(2), Value::Text("bob".into())],
-        ]);
-        let ctx = MockContext::single_page(tuples);
+        let (db, first_page) = setup_two_col_table(vec![(1, "alice"), (2, "bob")]).await;
+        let ctx = read_ctx(&db);
         let scan = ExecutorNode::SeqScan(SeqScan::new(
             "test".to_string(),
             vec![
@@ -414,7 +460,7 @@ mod tests {
             ],
             ctx,
             vec![Type::Int8, Type::Text],
-            PageId::new(0),
+            first_page,
         ));
 
         // Project: just the name column (index 1)
@@ -442,7 +488,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_values_scan() {
-        let mut node: ExecutorNode<MockContext> = ExecutorNode::ValuesScan(ValuesScan::new());
+        let mut node: ExecutorNode<TestCtx> = ExecutorNode::ValuesScan(ValuesScan::new());
         let tuple = node.next().await.unwrap().unwrap();
         assert!(tuple.record.values.is_empty());
         assert!(tuple.tid.is_none());
@@ -451,17 +497,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_seq_scan() {
+        let (db, first_page) = setup_int_table(vec![10, 20]).await;
+        let ctx = read_ctx(&db);
+
         let plan = Plan::SeqScan {
             table_name: "test".to_string(),
             table_id: 1,
-            first_page: PageId::new(0),
+            first_page,
             schema: vec![Type::Int8],
             columns: vec![int_col("id")],
         };
 
-        let tuples = make_tuples(vec![vec![Value::Int64(10)], vec![Value::Int64(20)]]);
-        let ctx = MockContext::single_page(tuples);
-        let mut node = ExecutorNode::build(plan, &ctx);
+        let mut node = plan.prepare_for_execute(&ctx);
 
         assert_eq!(
             node.next().await.unwrap().unwrap().record.values,
@@ -476,11 +523,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_filter() {
+        let (db, first_page) = setup_int_table(vec![1, 2, 3]).await;
+        let ctx = read_ctx(&db);
+
         let plan = Plan::Filter {
             input: Box::new(Plan::SeqScan {
                 table_name: "test".to_string(),
                 table_id: 1,
-                first_page: PageId::new(0),
+                first_page,
                 schema: vec![Type::Int8],
                 columns: vec![int_col("id")],
             }),
@@ -494,13 +544,7 @@ mod tests {
             },
         };
 
-        let tuples = make_tuples(vec![
-            vec![Value::Int64(1)],
-            vec![Value::Int64(2)],
-            vec![Value::Int64(3)],
-        ]);
-        let ctx = MockContext::single_page(tuples);
-        let mut node = ExecutorNode::build(plan, &ctx);
+        let mut node = plan.prepare_for_execute(&ctx);
 
         assert_eq!(
             node.next().await.unwrap().unwrap().record.values,
@@ -511,11 +555,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_projection() {
+        let (db, first_page) = setup_two_col_table(vec![(1, "alice"), (2, "bob")]).await;
+        let ctx = read_ctx(&db);
+
         let plan = Plan::Projection {
             input: Box::new(Plan::SeqScan {
                 table_name: "test".to_string(),
                 table_id: 1,
-                first_page: PageId::new(0),
+                first_page,
                 schema: vec![Type::Int8, Type::Text],
                 columns: vec![
                     int_col("id"),
@@ -537,12 +584,7 @@ mod tests {
             }],
         };
 
-        let tuples = make_tuples(vec![
-            vec![Value::Int64(1), Value::Text("alice".into())],
-            vec![Value::Int64(2), Value::Text("bob".into())],
-        ]);
-        let ctx = MockContext::single_page(tuples);
-        let mut node = ExecutorNode::build(plan, &ctx);
+        let mut node = plan.prepare_for_execute(&ctx);
 
         assert_eq!(
             node.next().await.unwrap().unwrap().record.values,
@@ -557,14 +599,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_values_scan() {
+        let db = Database::open(MemoryStorage::new(), 100).await.unwrap();
+        let ctx = read_ctx(&db);
+
         let plan = Plan::Projection {
             input: Box::new(Plan::ValuesScan),
             exprs: vec![BoundExpr::Integer(42)],
             columns: vec![int_col("?column?")],
         };
 
-        let ctx = MockContext::single_page(vec![]);
-        let mut node = ExecutorNode::build(plan, &ctx);
+        let mut node = plan.prepare_for_execute(&ctx);
 
         let tuple = node.next().await.unwrap().unwrap();
         assert_eq!(tuple.record.values, vec![Value::Int64(42)]);
