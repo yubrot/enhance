@@ -4,7 +4,7 @@
 //! [`Value`] result. Supports arithmetic, comparison, logical, string, NULL,
 //! LIKE, CASE, and CAST operations.
 
-use crate::datum::{CastError, Type, Value, WideNumeric, to_wide_numeric};
+use crate::datum::{CastError, Value, WideNumeric, to_wide_numeric};
 use crate::heap::Record;
 use crate::sql::{BinaryOperator, UnaryOperator};
 
@@ -178,9 +178,7 @@ impl BoundExpr {
                         from: match &original {
                             Value::Text(s) => format!("'{}'", s),
                             _ => original
-                                .data_type()
-                                .map_or("NULL", Type::display_name)
-                                .to_string(),
+                                .type_name().to_string(),
                         },
                         to: data_type.display_name().to_string(),
                     },
@@ -251,12 +249,9 @@ fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) -> Result<Val
                 0 => Err(ExecutorError::DivisionByZero),
                 _ => Ok(a / b),
             },
-            |a, b| {
-                if b == 0.0 {
-                    Err(ExecutorError::DivisionByZero)
-                } else {
-                    Ok(a / b)
-                }
+            |a, b| match b == 0.0 {
+                true => Err(ExecutorError::DivisionByZero),
+                false => Ok(a / b),
             },
         ),
         BinaryOperator::Mod => eval_arithmetic(
@@ -266,12 +261,9 @@ fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) -> Result<Val
                 0 => Err(ExecutorError::DivisionByZero),
                 _ => Ok(a % b),
             },
-            |a, b| {
-                if b == 0.0 {
-                    Err(ExecutorError::DivisionByZero)
-                } else {
-                    Ok(a % b)
-                }
+            |a, b| match b == 0.0 {
+                true => Err(ExecutorError::DivisionByZero),
+                false => Ok(a % b),
             },
         ),
     }
@@ -279,13 +271,11 @@ fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) -> Result<Val
 
 /// Converts a value to a nullable boolean, mapping type errors to [`ExecutorError::TypeMismatch`].
 fn to_bool_or_type_error(v: &Value) -> Result<Option<bool>, ExecutorError> {
-    v.to_bool_nullable().map_err(|()| ExecutorError::TypeMismatch {
-        expected: "boolean".to_string(),
-        found: v
-            .data_type()
-            .map_or("NULL", Type::display_name)
-            .to_string(),
-    })
+    v.to_bool_nullable()
+        .map_err(|()| ExecutorError::TypeMismatch {
+            expected: "boolean".to_string(),
+            found: v.type_name().to_string(),
+        })
 }
 
 /// Evaluates AND with 3-value NULL logic.
@@ -340,8 +330,8 @@ fn eval_arithmetic(
             expected: "numeric".to_string(),
             found: format!(
                 "{}, {}",
-                left.data_type().map_or("NULL", Type::display_name),
-                right.data_type().map_or("NULL", Type::display_name)
+                left.type_name(),
+                right.type_name()
             ),
         }),
     }
@@ -352,14 +342,15 @@ fn eval_arithmetic(
 /// Delegates to [`Value::partial_cmp`] and converts incomparable types to
 /// a [`ExecutorError::TypeMismatch`] error.
 fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering, ExecutorError> {
-    left.partial_cmp(right).ok_or_else(|| ExecutorError::TypeMismatch {
-        expected: "comparable types".to_string(),
-        found: format!(
-            "{}, {}",
-            left.data_type().map_or("NULL", Type::display_name),
-            right.data_type().map_or("NULL", Type::display_name)
-        ),
-    })
+    left.partial_cmp(right)
+        .ok_or_else(|| ExecutorError::TypeMismatch {
+            expected: "comparable types".to_string(),
+            found: format!(
+                "{}, {}",
+                left.type_name(),
+                right.type_name()
+            ),
+        })
 }
 
 /// Evaluates a unary operation.
@@ -367,11 +358,7 @@ fn eval_unary_op(op: UnaryOperator, val: &Value) -> Result<Value, ExecutorError>
     if val.is_null() {
         return Ok(Value::Null);
     }
-    let type_name = || {
-        val.data_type()
-            .map_or("NULL", Type::display_name)
-            .to_string()
-    };
+    let type_name = || val.type_name().to_string();
     match op {
         UnaryOperator::Not => match val {
             Value::Boolean(b) => Ok(Value::Boolean(!b)),
@@ -1030,5 +1017,4 @@ mod tests {
             Value::Text("b".into())
         );
     }
-
 }

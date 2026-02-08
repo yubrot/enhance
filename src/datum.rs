@@ -241,6 +241,11 @@ impl Value {
         matches!(self, Value::Null)
     }
 
+    /// Returns the SQL type display name, or `"NULL"` for null values.
+    pub fn type_name(&self) -> &'static str {
+        self.data_type().map_or("NULL", Type::display_name)
+    }
+
     /// Interprets this value as a nullable boolean.
     ///
     /// Returns `Ok(None)` for NULL, `Ok(Some(b))` for Boolean, and `Err(())`
