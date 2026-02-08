@@ -44,6 +44,12 @@ pub enum ExecutorError {
     /// Column index exceeds the number of columns in the record.
     ColumnIndexOutOfBounds { index: usize, len: usize },
 
+    /// Number of values does not match the number of target columns.
+    ColumnCountMismatch { expected: usize, found: usize },
+
+    /// Duplicate column name in column list.
+    DuplicateColumn { name: String },
+
     /// Unsupported operation or feature.
     Unsupported(String),
 
@@ -94,6 +100,16 @@ impl std::fmt::Display for ExecutorError {
             }
             ExecutorError::NumericOutOfRange { type_name } => {
                 write!(f, "{} out of range", type_name)
+            }
+            ExecutorError::ColumnCountMismatch { expected, found } => {
+                write!(
+                    f,
+                    "INSERT has {} expressions but {} target columns",
+                    found, expected
+                )
+            }
+            ExecutorError::DuplicateColumn { name } => {
+                write!(f, "column \"{}\" specified more than once", name)
             }
             ExecutorError::Unsupported(msg) => write!(f, "unsupported: {}", msg),
             ExecutorError::Catalog(e) => write!(f, "{}", e),

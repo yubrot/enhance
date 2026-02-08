@@ -51,5 +51,5 @@ pub use error::ExecutorError;
 pub use expr::BoundExpr;
 pub use node::ExecutorNode;
 pub use plan::Plan;
-pub use planner::plan_select;
+pub use planner::{plan_insert, plan_select};
 pub use row::Row;

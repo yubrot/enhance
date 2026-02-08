@@ -47,6 +47,23 @@ pub enum Plan {
     },
     /// Single-row scan for queries without FROM (e.g., `SELECT 1+1`).
     ValuesScan,
+    /// INSERT into a table.
+    Insert {
+        /// Table name (for EXPLAIN output and command tags).
+        table_name: String,
+        /// Catalog table ID.
+        table_id: u32,
+        /// First heap page of the table.
+        first_page: PageId,
+        /// Column data types in table-schema order.
+        schema: Vec<Type>,
+        /// Bound value expressions for each row, in table-schema order.
+        /// Each inner Vec has exactly `schema.len()` elements.
+        values: Vec<Vec<BoundExpr>>,
+        /// SERIAL columns to auto-populate with nextval (column index, seq_id).
+        /// Only includes SERIAL columns NOT explicitly provided in the INSERT column list.
+        serial_columns: Vec<(usize, u32)>,
+    },
 }
 
 impl Plan {
@@ -57,6 +74,7 @@ impl Plan {
             Plan::Filter { input, .. } => input.columns(),
             Plan::Projection { columns, .. } => columns,
             Plan::ValuesScan => &[],
+            Plan::Insert { .. } => &[],
         }
     }
 
@@ -104,6 +122,18 @@ impl Plan {
             }
             Plan::ValuesScan => {
                 format!("{}ValuesScan (1 row)", prefix)
+            }
+            Plan::Insert {
+                table_name, values, ..
+            } => {
+                let row_count = values.len();
+                format!(
+                    "{}Insert on {} ({} row{})",
+                    prefix,
+                    table_name,
+                    row_count,
+                    if row_count == 1 { "" } else { "s" }
+                )
             }
         }
     }

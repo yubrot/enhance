@@ -59,6 +59,10 @@ impl Plan {
                 columns,
             )),
             Plan::ValuesScan => ExecutorNode::ValuesScan(ValuesScan::new()),
+            // DML plans are executed via execute_dml(), not prepare_for_execute()
+            Plan::Insert { .. } => {
+                unreachable!("DML plans should not be converted to executor nodes via prepare_for_execute")
+            }
         }
     }
 }

@@ -228,7 +228,7 @@ No circular dependencies. `heap/writer` and `heap/scanner` are shared by both `e
   - Tests: insert a tuple via context and verify it's readable, delete a tuple and verify not visible, update a tuple and verify new version, nextval returns incrementing values, insert triggers page extension
   - Edge cases: same-page UPDATE priority, cross-page UPDATE fallback
 
-- [ ] **Commit 5: DML planner — plan_insert** — Add `Plan::Insert` and `plan_insert()` with column resolution, SERIAL handling, type coercion
+- [x] **Commit 5: DML planner — plan_insert** — Add `Plan::Insert` and `plan_insert()` with column resolution, SERIAL handling, type coercion
   - Tests: basic INSERT plan, INSERT with column list, INSERT with column reordering, INSERT with SERIAL skip, column count mismatch error, duplicate column error, type coercion (integer→smallint, float→integer, incompatible types error), multi-row INSERT
   - Edge cases: column list ordering, SERIAL auto-populate, type coercion
 

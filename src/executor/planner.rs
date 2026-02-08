@@ -1,8 +1,10 @@
 //! Query planner.
 
+use std::collections::HashSet;
+
 use crate::catalog::{Catalog, ColumnInfo};
 use crate::datum::Type;
-use crate::sql::{BinaryOperator, Expr, FromClause, SelectItem, SelectStmt, TableRef};
+use crate::sql::{BinaryOperator, Expr, FromClause, InsertStmt, SelectItem, SelectStmt, TableRef};
 use crate::storage::{Replacer, Storage};
 use crate::tx::Snapshot;
 
@@ -75,6 +77,180 @@ pub async fn plan_select<S: Storage, R: Replacer>(
     plan = build_projection_plan(plan, &select.columns)?;
 
     Ok(plan)
+}
+
+/// Plans an INSERT statement into a logical [`Plan::Insert`].
+///
+/// Resolves column names to positions, handles SERIAL auto-population,
+/// binds value expressions, and applies type coercion to match target
+/// column types.
+///
+/// # Arguments
+///
+/// * `insert` - The parsed INSERT statement
+/// * `catalog` - Catalog for table/column metadata access
+/// * `snapshot` - MVCC snapshot for catalog visibility checks
+///
+/// # Errors
+///
+/// Returns [`ExecutorError`] for unknown tables/columns, column count
+/// mismatches, duplicate columns, or type coercion failures.
+pub async fn plan_insert<S: Storage, R: Replacer>(
+    insert: &InsertStmt,
+    catalog: &Catalog<S, R>,
+    snapshot: &Snapshot,
+) -> Result<Plan, ExecutorError> {
+    // Look up the target table
+    let table_info = catalog
+        .get_table(snapshot, &insert.table)
+        .await?
+        .ok_or_else(|| ExecutorError::TableNotFound {
+            name: insert.table.clone(),
+        })?;
+
+    let column_infos = catalog.get_columns(snapshot, table_info.table_id).await?;
+    let column_count = column_infos.len();
+
+    // Determine the column mapping: which table column each value expression maps to.
+    // If no column list is specified, values map 1:1 to table columns.
+    let column_mapping = if insert.columns.is_empty() {
+        // No column list: values must match table column count
+        (0..column_count).collect::<Vec<_>>()
+    } else {
+        resolve_insert_columns(&insert.columns, &column_infos)?
+    };
+
+    // Identify SERIAL columns for auto-population
+    let serial_columns: Vec<(usize, u32)> = column_infos
+        .iter()
+        .enumerate()
+        .filter(|(_, col)| col.is_serial())
+        .map(|(i, col)| (i, col.seq_id))
+        .collect();
+
+    // Columns explicitly provided by the user
+    let provided_columns: HashSet<usize> = column_mapping.iter().copied().collect();
+
+    // Build schema (column types) for type coercion
+    let schema: Vec<Type> = column_infos.iter().map(|c| c.ty).collect();
+
+    // Bind each row of values
+    let mut bound_rows = Vec::with_capacity(insert.values.len());
+    for row_exprs in &insert.values {
+        if row_exprs.len() != column_mapping.len() {
+            return Err(ExecutorError::ColumnCountMismatch {
+                expected: column_mapping.len(),
+                found: row_exprs.len(),
+            });
+        }
+
+        // Start with NULL for all columns
+        let mut bound_row = vec![BoundExpr::Null; column_count];
+
+        // Fill in provided values with type coercion
+        // NOTE: VALUES expressions are bound with an empty column list because
+        // they cannot reference table columns. Column refs in VALUES would
+        // produce ColumnNotFound. INSERT ... SELECT (which needs column
+        // resolution) would require a different binding approach.
+        for (expr_idx, &col_idx) in column_mapping.iter().enumerate() {
+            let bound = row_exprs[expr_idx].bind(&[])?;
+            let target_type = schema[col_idx];
+            let coerced = coerce_expr(bound, target_type);
+            bound_row[col_idx] = coerced;
+        }
+
+        // SERIAL columns that were not explicitly provided remain as Null —
+        // the executor will call nextval for these.
+
+        bound_rows.push(bound_row);
+    }
+
+    Ok(Plan::Insert {
+        table_name: insert.table.clone(),
+        table_id: table_info.table_id,
+        first_page: table_info.first_page,
+        schema,
+        values: bound_rows,
+        serial_columns: serial_columns
+            .into_iter()
+            .filter(|(i, _)| !provided_columns.contains(i))
+            .collect(),
+    })
+}
+
+/// Resolves column names from an INSERT column list to table column indices.
+///
+/// Returns a Vec of table column indices in the order specified by the user.
+/// Validates that all column names exist and no column is specified more than once.
+fn resolve_insert_columns(
+    column_names: &[String],
+    column_infos: &[ColumnInfo],
+) -> Result<Vec<usize>, ExecutorError> {
+    let mut seen = HashSet::new();
+    let mut mapping = Vec::with_capacity(column_names.len());
+
+    for name in column_names {
+        let lower = name.to_lowercase();
+        if !seen.insert(lower.clone()) {
+            return Err(ExecutorError::DuplicateColumn {
+                name: name.clone(),
+            });
+        }
+
+        let col_idx = column_infos
+            .iter()
+            .position(|c| c.column_name.to_lowercase() == lower)
+            .ok_or_else(|| ExecutorError::ColumnNotFound {
+                name: name.clone(),
+            })?;
+
+        mapping.push(col_idx);
+    }
+
+    Ok(mapping)
+}
+
+/// Wraps a bound expression in a cast if the expression's type doesn't match
+/// the target column type.
+///
+/// For literal values, this inserts a `BoundExpr::Cast` node so that runtime
+/// evaluation will apply the conversion. NULL values pass through without casting.
+fn coerce_expr(expr: BoundExpr, target_type: Type) -> BoundExpr {
+    // NULL doesn't need coercion
+    if matches!(&expr, BoundExpr::Null) {
+        return expr;
+    }
+
+    // If the expression already has a cast to the right type, no additional wrapping needed
+    if let BoundExpr::Cast { ref ty, .. } = expr
+        && *ty == target_type
+    {
+        return expr;
+    }
+
+    // Infer the expression type — if it matches target, no cast needed
+    if let Some(et) = infer_bound_expr_type(&expr)
+        && et == target_type
+    {
+        return expr;
+    }
+
+    BoundExpr::Cast {
+        expr: Box::new(expr),
+        ty: target_type,
+    }
+}
+
+/// Infers the type of a bound expression.
+fn infer_bound_expr_type(expr: &BoundExpr) -> Option<Type> {
+    match expr {
+        BoundExpr::Integer(_) => Some(Type::Bigint),
+        BoundExpr::Float(_) => Some(Type::Double),
+        BoundExpr::Boolean(_) => Some(Type::Bool),
+        BoundExpr::String(_) => Some(Type::Text),
+        BoundExpr::Cast { ty, .. } => Some(*ty),
+        _ => None,
+    }
 }
 
 /// Builds a plan from a FROM clause.
@@ -614,5 +790,265 @@ mod tests {
 
         assert_eq!(plan.columns().len(), 3);
         assert_eq!(plan.columns()[0].name, "table_id");
+    }
+
+    // --- INSERT planner tests ---
+
+    /// Sets up a database with a user-defined table for INSERT tests.
+    async fn setup_db_with_table(
+        ddl: &str,
+    ) -> (
+        Arc<Database<MemoryStorage, crate::storage::LruReplacer>>,
+        Snapshot,
+    ) {
+        let storage = MemoryStorage::new();
+        let db = Arc::new(Database::open(storage, 100).await.unwrap());
+
+        let txid = db.tx_manager().begin();
+        let stmt = Parser::new(ddl).parse().unwrap().unwrap();
+        let Statement::CreateTable(create_stmt) = stmt else {
+            panic!("expected CREATE TABLE");
+        };
+        db.catalog()
+            .create_table(txid, CommandId::FIRST, &create_stmt)
+            .await
+            .unwrap();
+        db.tx_manager().commit(txid).unwrap();
+
+        let txid = db.tx_manager().begin();
+        let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
+        (db, snapshot)
+    }
+
+    fn parse_insert(sql: &str) -> InsertStmt {
+        let stmt = Parser::new(sql).parse().unwrap().unwrap();
+        let Statement::Insert(insert) = stmt else {
+            panic!("expected INSERT statement");
+        };
+        *insert
+    }
+
+    #[tokio::test]
+    async fn test_plan_insert_basic() {
+        let (db, snapshot) =
+            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let insert = parse_insert("INSERT INTO users VALUES (1, 'Alice')");
+
+        let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
+
+        let Plan::Insert {
+            table_name,
+            values,
+            schema,
+            serial_columns,
+            ..
+        } = &plan
+        else {
+            panic!("expected Plan::Insert");
+        };
+        assert_eq!(table_name, "users");
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].len(), 2);
+        assert_eq!(schema, &[Type::Integer, Type::Text]);
+        assert!(serial_columns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_plan_insert_with_column_list() {
+        let (db, snapshot) =
+            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let insert = parse_insert("INSERT INTO users (name, id) VALUES ('Bob', 2)");
+
+        let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
+
+        let Plan::Insert { values, schema, .. } = &plan else {
+            panic!("expected Plan::Insert");
+        };
+        assert_eq!(schema.len(), 2);
+        assert_eq!(values.len(), 1);
+        // Value at index 0 (id) should be integer 2 cast to Integer
+        // (Bigint literal → Integer column)
+        let BoundExpr::Cast { ty, .. } = &values[0][0] else {
+            panic!("expected Cast for id column, got {:?}", &values[0][0]);
+        };
+        assert_eq!(*ty, Type::Integer);
+        // Value at index 1 (name) should be the string 'Bob' (no cast needed, Text→Text)
+        assert!(matches!(&values[0][1], BoundExpr::String(s) if s == "Bob"));
+    }
+
+    #[tokio::test]
+    async fn test_plan_insert_fewer_columns() {
+        let (db, snapshot) =
+            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        // Only specify id, name should default to NULL
+        let insert = parse_insert("INSERT INTO users (id) VALUES (1)");
+
+        let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
+
+        let Plan::Insert { values, .. } = &plan else {
+            panic!("expected Plan::Insert");
+        };
+        assert_eq!(values[0].len(), 2);
+        // name column (index 1) should be NULL
+        assert!(matches!(&values[0][1], BoundExpr::Null));
+    }
+
+    #[tokio::test]
+    async fn test_plan_insert_serial_auto_populate() {
+        let (db, snapshot) =
+            setup_db_with_table("CREATE TABLE users (id SERIAL, name TEXT)").await;
+        // Don't specify id — should be auto-populated
+        let insert = parse_insert("INSERT INTO users (name) VALUES ('Alice')");
+
+        let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
+
+        let Plan::Insert {
+            serial_columns,
+            values,
+            ..
+        } = &plan
+        else {
+            panic!("expected Plan::Insert");
+        };
+        // SERIAL column should be in the auto-populate list
+        assert_eq!(serial_columns.len(), 1);
+        assert_eq!(serial_columns[0].0, 0); // column index 0 (id)
+        assert!(serial_columns[0].1 > 0); // non-zero seq_id
+        // id column should be NULL (to be replaced by nextval at execution)
+        assert!(matches!(&values[0][0], BoundExpr::Null));
+    }
+
+    #[tokio::test]
+    async fn test_plan_insert_serial_explicit_value() {
+        let (db, snapshot) =
+            setup_db_with_table("CREATE TABLE users (id SERIAL, name TEXT)").await;
+        // Explicitly provide id — should NOT auto-populate
+        let insert = parse_insert("INSERT INTO users (id, name) VALUES (99, 'Bob')");
+
+        let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
+
+        let Plan::Insert {
+            serial_columns, ..
+        } = &plan
+        else {
+            panic!("expected Plan::Insert");
+        };
+        // SERIAL column explicitly provided → not in auto-populate list
+        assert!(serial_columns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_plan_insert_column_count_mismatch() {
+        let (db, snapshot) =
+            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        // 3 values but only 2 columns
+        let insert = parse_insert("INSERT INTO users VALUES (1, 'Alice', 'extra')");
+
+        let result = plan_insert(&insert, db.catalog(), &snapshot).await;
+        assert!(matches!(
+            result,
+            Err(ExecutorError::ColumnCountMismatch {
+                expected: 2,
+                found: 3
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_plan_insert_duplicate_column() {
+        let (db, snapshot) =
+            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let insert = parse_insert("INSERT INTO users (id, id) VALUES (1, 2)");
+
+        let result = plan_insert(&insert, db.catalog(), &snapshot).await;
+        assert!(matches!(
+            result,
+            Err(ExecutorError::DuplicateColumn { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_plan_insert_column_not_found() {
+        let (db, snapshot) =
+            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let insert = parse_insert("INSERT INTO users (id, nonexistent) VALUES (1, 'x')");
+
+        let result = plan_insert(&insert, db.catalog(), &snapshot).await;
+        assert!(matches!(
+            result,
+            Err(ExecutorError::ColumnNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_plan_insert_table_not_found() {
+        let (db, snapshot) = setup_test_db().await;
+        let insert = parse_insert("INSERT INTO nonexistent VALUES (1)");
+
+        let result = plan_insert(&insert, db.catalog(), &snapshot).await;
+        assert!(matches!(
+            result,
+            Err(ExecutorError::TableNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_plan_insert_type_coercion() {
+        let (db, snapshot) =
+            setup_db_with_table("CREATE TABLE t (val SMALLINT)").await;
+        // Integer literal 42 (Bigint) → should be coerced to Smallint
+        let insert = parse_insert("INSERT INTO t VALUES (42)");
+
+        let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
+
+        let Plan::Insert { values, .. } = &plan else {
+            panic!("expected Plan::Insert");
+        };
+        // Should have a Cast wrapping the integer literal
+        let BoundExpr::Cast { ty, .. } = &values[0][0] else {
+            panic!("expected Cast expression for type coercion, got {:?}", &values[0][0]);
+        };
+        assert_eq!(*ty, Type::Smallint);
+    }
+
+    #[tokio::test]
+    async fn test_plan_insert_multi_row() {
+        let (db, snapshot) =
+            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let insert =
+            parse_insert("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')");
+
+        let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
+
+        let Plan::Insert { values, .. } = &plan else {
+            panic!("expected Plan::Insert");
+        };
+        assert_eq!(values.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_plan_insert_null_no_cast() {
+        let (db, snapshot) =
+            setup_db_with_table("CREATE TABLE t (val INTEGER)").await;
+        // NULL should pass through without a Cast wrapper
+        let insert = parse_insert("INSERT INTO t VALUES (NULL)");
+
+        let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
+
+        let Plan::Insert { values, .. } = &plan else {
+            panic!("expected Plan::Insert");
+        };
+        assert!(matches!(&values[0][0], BoundExpr::Null));
+    }
+
+    #[tokio::test]
+    async fn test_plan_insert_explain() {
+        let (db, snapshot) =
+            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let insert =
+            parse_insert("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')");
+
+        let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
+        assert_eq!(plan.explain(), "Insert on users (2 rows)");
     }
 }
