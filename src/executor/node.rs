@@ -109,8 +109,8 @@ impl<C: ExecContext> ExecutorNode<C> {
 /// avoiding holding page latches across `next()` calls and keeping memory
 /// usage proportional to a single page rather than the entire table.
 ///
-/// NOTE: Multi-page support will read next_page from the page header here.
-/// Currently only the first page is scanned.
+/// The scan follows the heap page chain via `HeapPage::next_page()` linkage,
+/// advancing through all pages until the chain is exhausted.
 pub struct SeqScan<C: ExecContext> {
     /// Table name (for identification).
     pub table_name: String,
@@ -146,6 +146,9 @@ impl<C: ExecContext> SeqScan<C> {
     }
 
     /// Returns the next visible tuple, loading pages lazily as needed.
+    ///
+    /// Follows the heap page chain automatically: when a page is exhausted,
+    /// advances to the next page via the chain linkage.
     async fn next(&mut self) -> Result<Option<Row>, ExecutorError> {
         loop {
             if let Some(tuple) = self.buffer.next() {
@@ -155,8 +158,9 @@ impl<C: ExecContext> SeqScan<C> {
                 Some(id) => id,
                 None => return Ok(None),
             };
-            let tuples = self.ctx.scan_heap_page(page_id, &self.schema).await?;
-            // NOTE: Multi-page support will read next_page from page header here.
+            let (tuples, next_page) =
+                self.ctx.scan_heap_page(page_id, &self.schema).await?;
+            self.next_page_id = next_page;
             self.buffer = tuples.into_iter();
         }
     }

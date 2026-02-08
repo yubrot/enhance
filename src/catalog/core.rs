@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 use super::error::CatalogError;
 use super::schema::{ColumnInfo, SequenceInfo, SystemCatalogTable, TableInfo};
 use super::superblock::Superblock;
-use crate::heap::HeapPage;
+use crate::heap::{HeapPage, HeapScanner};
 use crate::sql::{CreateTableStmt, DataType};
 use crate::storage::{BufferPool, PageId, Replacer, Storage};
 use crate::tx::{CommandId, Snapshot, TransactionManager, TxId};
@@ -22,9 +22,6 @@ use crate::tx::{CommandId, Snapshot, TransactionManager, TxId};
 ///
 /// This is a low-level store without caching. Use `catalog::cached::Catalog`
 /// wrapper for efficient access.
-///
-/// Each catalog table uses a single page for simplicity. Multi-page
-/// support will be added in Step 15 with FSM.
 pub struct Catalog<S: Storage, R: Replacer> {
     /// Buffer pool for page access.
     pool: Arc<BufferPool<S, R>>,
@@ -182,32 +179,34 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
 
     /// Looks up a table by name.
     ///
-    /// Scans sys_tables to find the table metadata.
+    /// Scans the full sys_tables page chain to find the table metadata.
     pub async fn get_table(
         &self,
         snapshot: &Snapshot,
         name: &str,
     ) -> Result<Option<TableInfo>, CatalogError> {
         let sys_tables_page = self.superblock.read().sys_tables_page;
-        let page = HeapPage::new(self.pool.fetch_page(sys_tables_page).await?);
+        let mut scanner = HeapScanner::new(&self.pool, TableInfo::SCHEMA, sys_tables_page);
 
-        for (_slot_id, header, record) in page.scan(TableInfo::SCHEMA) {
-            if !snapshot.is_tuple_visible(&header, &self.tx_manager) {
-                continue;
-            }
+        while let Some(page_tuples) = scanner.next_page().await? {
+            for (_page_id, _slot_id, header, record) in page_tuples {
+                if !snapshot.is_tuple_visible(&header, &self.tx_manager) {
+                    continue;
+                }
 
-            let Some(info) = TableInfo::from_record(&record) else {
-                // NOTE: from_record() returns None when deserialization fails, indicating
-                // possible data corruption. For learning purposes, we silently skip.
-                // Production systems should either:
-                // - Log corruption warnings and attempt recovery
-                // - Return CatalogError::CorruptedMetadata to fail fast
-                // - Use checksums (Step 13) to detect corruption earlier
-                continue;
-            };
+                let Some(info) = TableInfo::from_record(&record) else {
+                    // NOTE: from_record() returns None when deserialization fails, indicating
+                    // possible data corruption. For learning purposes, we silently skip.
+                    // Production systems should either:
+                    // - Log corruption warnings and attempt recovery
+                    // - Return CatalogError::CorruptedMetadata to fail fast
+                    // - Use checksums (Step 13) to detect corruption earlier
+                    continue;
+                };
 
-            if info.table_name == name {
-                return Ok(Some(info));
+                if info.table_name == name {
+                    return Ok(Some(info));
+                }
             }
         }
 
@@ -216,31 +215,33 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
 
     /// Gets columns for a table.
     ///
-    /// Scans sys_columns to find the column metadata.
+    /// Scans the full sys_columns page chain to find the column metadata.
     pub async fn get_columns(
         &self,
         snapshot: &Snapshot,
         table_id: u32,
     ) -> Result<Vec<ColumnInfo>, CatalogError> {
         let sys_columns_page = self.superblock.read().sys_columns_page;
-        let page = HeapPage::new(self.pool.fetch_page(sys_columns_page).await?);
+        let mut scanner = HeapScanner::new(&self.pool, ColumnInfo::SCHEMA, sys_columns_page);
 
         let mut columns = Vec::new();
-        for (_slot_id, header, record) in page.scan(ColumnInfo::SCHEMA) {
-            if !snapshot.is_tuple_visible(&header, &self.tx_manager) {
-                continue;
+        while let Some(page_tuples) = scanner.next_page().await? {
+            for (_page_id, _slot_id, header, record) in page_tuples {
+                if !snapshot.is_tuple_visible(&header, &self.tx_manager) {
+                    continue;
+                }
+
+                let Some(col) = ColumnInfo::from_record(&record) else {
+                    // NOTE: Silently skipping corrupted records. See get_table() for details.
+                    continue;
+                };
+
+                if col.table_id != table_id {
+                    continue;
+                }
+
+                columns.push(col);
             }
-
-            let Some(col) = ColumnInfo::from_record(&record) else {
-                // NOTE: Silently skipping corrupted records. See get_table() for details.
-                continue;
-            };
-
-            if col.table_id != table_id {
-                continue;
-            }
-
-            columns.push(col);
         }
 
         // Sort by column_num

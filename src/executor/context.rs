@@ -22,13 +22,20 @@ use super::row::Row;
 pub trait ExecContext: Send + Clone {
     /// Scans a single heap page and returns all visible tuples.
     ///
+    /// Also returns the next page ID in the chain (if any) so that the
+    /// caller can continue scanning multi-page tables.
+    ///
     /// Visibility is determined by the snapshot embedded in the context.
     /// The caller provides the column schema for record deserialization.
+    ///
+    /// NOTE: Page chain traversal is currently pushed to the caller (SeqScan).
+    /// A future refactor could wrap this as `scan_table` that uses HeapScanner
+    /// internally, keeping chain logic in the context layer.
     fn scan_heap_page(
         &self,
         page_id: PageId,
         schema: &[Type],
-    ) -> impl Future<Output = Result<Vec<Row>, ExecutorError>> + Send;
+    ) -> impl Future<Output = Result<(Vec<Row>, Option<PageId>), ExecutorError>> + Send;
 }
 
 /// Concrete [`ExecContext`] backed by a [`BufferPool`] and [`TransactionManager`].
@@ -78,8 +85,9 @@ impl<S: Storage, R: Replacer> ExecContext for ExecContextImpl<S, R> {
         &self,
         page_id: PageId,
         schema: &[Type],
-    ) -> Result<Vec<Row>, ExecutorError> {
+    ) -> Result<(Vec<Row>, Option<PageId>), ExecutorError> {
         let page = HeapPage::new(self.pool.fetch_page(page_id).await?);
+        let next_page = page.next_page();
 
         let mut tuples = Vec::new();
         for (slot_id, header, record) in page.scan(schema) {
@@ -90,7 +98,7 @@ impl<S: Storage, R: Replacer> ExecContext for ExecContextImpl<S, R> {
             tuples.push(Row::from_heap(tid, record));
         }
 
-        Ok(tuples)
+        Ok((tuples, next_page))
     }
 }
 
@@ -125,10 +133,13 @@ mod tests {
 
         let ctx = db.exec_context(snapshot);
 
-        let tuples = ctx
+        let (tuples, next_page) = ctx
             .scan_heap_page(table_info.first_page, &TableInfo::SCHEMA)
             .await
             .unwrap();
+
+        // Single-page catalog: no next page
+        assert_eq!(next_page, None);
 
         // Should find at least 3 catalog tables (sys_tables, sys_columns, sys_sequences)
         assert!(

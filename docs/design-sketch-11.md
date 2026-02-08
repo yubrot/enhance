@@ -216,7 +216,7 @@ No circular dependencies. `heap/writer` and `heap/scanner` are shared by both `e
   - Tests: HeapPage next_page roundtrip, init sets next_page to None, SlottedPage insert/get/scan still work with new offset, MAX_RECORD_SIZE decreased by 4, existing HeapPage tests pass (regression)
   - Edge cases: next_page = 0 sentinel, SlottedPage data_offset correctness
 
-- [ ] **Commit 2: HeapScanner — multi-page scan** — Implement `HeapScanner` that walks the page chain and yields all tuples (without MVCC filtering). Refactor `ExecContext::scan_heap_page` to use `HeapScanner` for multi-page scan, update `SeqScan` node accordingly. Refactor `Catalog::get_table/get_columns` to use `HeapScanner`.
+- [x] **Commit 2: HeapScanner — multi-page scan** — Implement `HeapScanner` that walks the page chain and yields all tuples (without MVCC filtering). Refactor `ExecContext::scan_heap_page` to use `HeapScanner` for multi-page scan, update `SeqScan` node accordingly. Refactor `Catalog::get_table/get_columns` to use `HeapScanner`.
   - Tests: scan single page (regression), scan across 2-3 linked pages, scan empty table, scan table with empty intermediate pages, catalog get_table/get_columns still work
   - Edge cases: page chain traversal terminates at next_page=0
 
