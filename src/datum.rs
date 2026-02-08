@@ -44,6 +44,26 @@ impl fmt::Display for SerializationError {
 
 impl std::error::Error for SerializationError {}
 
+/// Reason for a failed [`Value::cast`] operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastError {
+    /// The value type cannot be cast to the target type.
+    Invalid,
+    /// The numeric value is out of range for the target type.
+    NumericOutOfRange,
+}
+
+impl fmt::Display for CastError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CastError::Invalid => write!(f, "invalid cast"),
+            CastError::NumericOutOfRange => write!(f, "numeric value out of range"),
+        }
+    }
+}
+
+impl std::error::Error for CastError {}
+
 /// Returns `SerializationError::BufferTooSmall` if the buffer is too small.
 #[macro_export]
 macro_rules! ensure_buf_len {
@@ -376,6 +396,132 @@ impl Value {
             }
         }
     }
+
+    /// Casts this value to the specified type.
+    ///
+    /// NULL passes through unchanged. On success, returns the converted value.
+    /// On failure, returns the original value along with a [`CastError`]
+    /// describing why the cast failed.
+    ///
+    /// Float-to-integer casts round to the nearest integer (ties away from
+    /// zero) and return [`CastError::NumericOutOfRange`] for NaN, infinity,
+    /// or values outside the target range.
+    pub fn cast(self, target: &Type) -> Result<Value, (Value, CastError)> {
+        if self.is_null() {
+            return Ok(Value::Null);
+        }
+        match target {
+            Type::Bool => match self {
+                Value::Boolean(_) => Ok(self),
+                Value::Text(s) => match s.to_lowercase().as_str() {
+                    "true" | "t" | "yes" | "y" | "1" | "on" => Ok(Value::Boolean(true)),
+                    "false" | "f" | "no" | "n" | "0" | "off" => Ok(Value::Boolean(false)),
+                    _ => Err((Value::Text(s), CastError::Invalid)),
+                },
+                Value::Int16(n) => Ok(Value::Boolean(n != 0)),
+                Value::Int32(n) => Ok(Value::Boolean(n != 0)),
+                Value::Int64(n) => Ok(Value::Boolean(n != 0)),
+                other => Err((other, CastError::Invalid)),
+            },
+            Type::Int2 => match self {
+                Value::Int16(_) => Ok(self),
+                Value::Int32(n) => i16::try_from(n)
+                    .map(Value::Int16)
+                    .map_err(|_| (Value::Int32(n), CastError::NumericOutOfRange)),
+                Value::Int64(n) => i16::try_from(n)
+                    .map(Value::Int16)
+                    .map_err(|_| (Value::Int64(n), CastError::NumericOutOfRange)),
+                Value::Float32(n) => cast_float_to_int(n as f64, i16::MIN as i64, i16::MAX as i64)
+                    .map(|i| Value::Int16(i as i16))
+                    .map_err(|e| (Value::Float32(n), e)),
+                Value::Float64(n) => cast_float_to_int(n, i16::MIN as i64, i16::MAX as i64)
+                    .map(|i| Value::Int16(i as i16))
+                    .map_err(|e| (Value::Float64(n), e)),
+                Value::Text(s) => match s.trim().parse::<i16>() {
+                    Ok(n) => Ok(Value::Int16(n)),
+                    Err(_) => Err((Value::Text(s), CastError::Invalid)),
+                },
+                Value::Boolean(b) => Ok(Value::Int16(if b { 1 } else { 0 })),
+                other => Err((other, CastError::Invalid)),
+            },
+            Type::Int4 => match self {
+                Value::Int32(_) => Ok(self),
+                Value::Int16(n) => Ok(Value::Int32(n as i32)),
+                Value::Int64(n) => i32::try_from(n)
+                    .map(Value::Int32)
+                    .map_err(|_| (Value::Int64(n), CastError::NumericOutOfRange)),
+                Value::Float32(n) => cast_float_to_int(n as f64, i32::MIN as i64, i32::MAX as i64)
+                    .map(|i| Value::Int32(i as i32))
+                    .map_err(|e| (Value::Float32(n), e)),
+                Value::Float64(n) => cast_float_to_int(n, i32::MIN as i64, i32::MAX as i64)
+                    .map(|i| Value::Int32(i as i32))
+                    .map_err(|e| (Value::Float64(n), e)),
+                Value::Text(s) => match s.trim().parse::<i32>() {
+                    Ok(n) => Ok(Value::Int32(n)),
+                    Err(_) => Err((Value::Text(s), CastError::Invalid)),
+                },
+                Value::Boolean(b) => Ok(Value::Int32(if b { 1 } else { 0 })),
+                other => Err((other, CastError::Invalid)),
+            },
+            Type::Int8 => match self {
+                Value::Int64(_) => Ok(self),
+                Value::Int16(n) => Ok(Value::Int64(n as i64)),
+                Value::Int32(n) => Ok(Value::Int64(n as i64)),
+                Value::Float32(n) => cast_float_to_int(n as f64, i64::MIN, i64::MAX)
+                    .map(Value::Int64)
+                    .map_err(|e| (Value::Float32(n), e)),
+                Value::Float64(n) => cast_float_to_int(n, i64::MIN, i64::MAX)
+                    .map(Value::Int64)
+                    .map_err(|e| (Value::Float64(n), e)),
+                Value::Text(s) => match s.trim().parse::<i64>() {
+                    Ok(n) => Ok(Value::Int64(n)),
+                    Err(_) => Err((Value::Text(s), CastError::Invalid)),
+                },
+                Value::Boolean(b) => Ok(Value::Int64(if b { 1 } else { 0 })),
+                other => Err((other, CastError::Invalid)),
+            },
+            Type::Float4 => match self {
+                Value::Float32(_) => Ok(self),
+                Value::Float64(n) => {
+                    let result = n as f32;
+                    if result.is_infinite() && !n.is_infinite() {
+                        Err((Value::Float64(n), CastError::NumericOutOfRange))
+                    } else {
+                        Ok(Value::Float32(result))
+                    }
+                }
+                Value::Int16(n) => Ok(Value::Float32(n as f32)),
+                Value::Int32(n) => Ok(Value::Float32(n as f32)),
+                Value::Int64(n) => Ok(Value::Float32(n as f32)),
+                Value::Text(s) => match s.trim().parse::<f32>() {
+                    Ok(n) => Ok(Value::Float32(n)),
+                    Err(_) => Err((Value::Text(s), CastError::Invalid)),
+                },
+                other => Err((other, CastError::Invalid)),
+            },
+            Type::Float8 => match self {
+                Value::Float64(_) => Ok(self),
+                Value::Float32(n) => Ok(Value::Float64(n as f64)),
+                Value::Int16(n) => Ok(Value::Float64(n as f64)),
+                Value::Int32(n) => Ok(Value::Float64(n as f64)),
+                Value::Int64(n) => Ok(Value::Float64(n as f64)),
+                Value::Text(s) => match s.trim().parse::<f64>() {
+                    Ok(n) => Ok(Value::Float64(n)),
+                    Err(_) => Err((Value::Text(s), CastError::Invalid)),
+                },
+                other => Err((other, CastError::Invalid)),
+            },
+            Type::Text | Type::Varchar | Type::Bpchar => match self {
+                Value::Text(_) => Ok(self),
+                other => Ok(Value::Text(other.to_text())),
+            },
+            Type::Bytea => match self {
+                Value::Bytea(_) => Ok(self),
+                Value::Text(s) => Ok(Value::Bytea(s.into_bytes())),
+                other => Err((other, CastError::Invalid)),
+            },
+        }
+    }
 }
 
 /// Formats a float value matching PostgreSQL output conventions.
@@ -395,6 +541,25 @@ fn format_float(n: f64) -> String {
         // Use default Rust formatting which is close to PostgreSQL's output
         format!("{}", n)
     }
+}
+
+/// Casts a float to an integer value with rounding and range checking.
+///
+/// Rounds to the nearest integer (ties away from zero), then verifies the
+/// result fits within `[min, max]`. Returns [`CastError::NumericOutOfRange`]
+/// for NaN, infinity, or out-of-range values.
+fn cast_float_to_int(n: f64, min: i64, max: i64) -> Result<i64, CastError> {
+    if !n.is_finite() {
+        return Err(CastError::NumericOutOfRange);
+    }
+    let rounded = n.round();
+    // Use i128 for the range comparison to avoid f64 precision loss at i64
+    // boundaries (i64::MAX is not exactly representable in f64).
+    let wide = rounded as i128;
+    if wide < min as i128 || wide > max as i128 {
+        return Err(CastError::NumericOutOfRange);
+    }
+    Ok(wide as i64)
 }
 
 /// Widened numeric representation for cross-type comparison.
@@ -758,5 +923,208 @@ mod tests {
             Value::Boolean(true).partial_cmp(&Value::Text("true".into())),
             None
         );
+    }
+
+    // ========================================================================
+    // Value::cast
+    // ========================================================================
+
+    #[test]
+    fn test_cast_null_passthrough() {
+        assert_eq!(Value::Null.cast(&Type::Bool).unwrap(), Value::Null);
+        assert_eq!(Value::Null.cast(&Type::Int2).unwrap(), Value::Null);
+        assert_eq!(Value::Null.cast(&Type::Int4).unwrap(), Value::Null);
+        assert_eq!(Value::Null.cast(&Type::Int8).unwrap(), Value::Null);
+        assert_eq!(Value::Null.cast(&Type::Float4).unwrap(), Value::Null);
+        assert_eq!(Value::Null.cast(&Type::Float8).unwrap(), Value::Null);
+        assert_eq!(Value::Null.cast(&Type::Text).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_cast_bool_from_text() {
+        for (input, expected) in [
+            ("true", true),
+            ("t", true),
+            ("yes", true),
+            ("1", true),
+            ("on", true),
+            ("false", false),
+            ("f", false),
+            ("no", false),
+            ("0", false),
+            ("off", false),
+        ] {
+            assert_eq!(
+                Value::Text(input.into()).cast(&Type::Bool).unwrap(),
+                Value::Boolean(expected),
+                "CAST('{}' AS BOOLEAN)",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn test_cast_int_narrowing_overflow() {
+        // Int64 → Int16: out of range
+        assert!(matches!(
+            Value::Int64(70000).cast(&Type::Int2),
+            Err((_, CastError::NumericOutOfRange))
+        ));
+        assert!(matches!(
+            Value::Int64(-70000).cast(&Type::Int2),
+            Err((_, CastError::NumericOutOfRange))
+        ));
+        // Int32 → Int16: out of range
+        assert!(matches!(
+            Value::Int32(70000).cast(&Type::Int2),
+            Err((_, CastError::NumericOutOfRange))
+        ));
+        // Int64 → Int32: out of range
+        assert!(matches!(
+            Value::Int64(3_000_000_000).cast(&Type::Int4),
+            Err((_, CastError::NumericOutOfRange))
+        ));
+
+        // Boundary values should succeed
+        assert_eq!(
+            Value::Int64(i16::MAX as i64).cast(&Type::Int2).unwrap(),
+            Value::Int16(i16::MAX)
+        );
+        assert_eq!(
+            Value::Int64(i16::MIN as i64).cast(&Type::Int2).unwrap(),
+            Value::Int16(i16::MIN)
+        );
+        assert_eq!(
+            Value::Int64(i32::MAX as i64).cast(&Type::Int4).unwrap(),
+            Value::Int32(i32::MAX)
+        );
+        assert_eq!(
+            Value::Int64(i32::MIN as i64).cast(&Type::Int4).unwrap(),
+            Value::Int32(i32::MIN)
+        );
+    }
+
+    #[test]
+    fn test_cast_float_to_int_rounds() {
+        // Float rounds to nearest integer (ties away from zero)
+        assert_eq!(
+            Value::Float64(3.9).cast(&Type::Int8).unwrap(),
+            Value::Int64(4)
+        );
+        assert_eq!(
+            Value::Float64(-3.9).cast(&Type::Int8).unwrap(),
+            Value::Int64(-4)
+        );
+        assert_eq!(
+            Value::Float64(0.5).cast(&Type::Int8).unwrap(),
+            Value::Int64(1)
+        );
+        assert_eq!(
+            Value::Float64(-0.5).cast(&Type::Int8).unwrap(),
+            Value::Int64(-1)
+        );
+        assert_eq!(
+            Value::Float64(2.4).cast(&Type::Int4).unwrap(),
+            Value::Int32(2)
+        );
+    }
+
+    #[test]
+    fn test_cast_float_to_int_overflow() {
+        // Float too large for integer type
+        assert!(matches!(
+            Value::Float64(1e100).cast(&Type::Int8),
+            Err((_, CastError::NumericOutOfRange))
+        ));
+        assert!(matches!(
+            Value::Float64(f64::INFINITY).cast(&Type::Int8),
+            Err((_, CastError::NumericOutOfRange))
+        ));
+        assert!(matches!(
+            Value::Float64(f64::NAN).cast(&Type::Int4),
+            Err((_, CastError::NumericOutOfRange))
+        ));
+        assert!(matches!(
+            Value::Float64(40000.0).cast(&Type::Int2),
+            Err((_, CastError::NumericOutOfRange))
+        ));
+    }
+
+    #[test]
+    fn test_cast_float64_to_float32_overflow() {
+        // Float64 value too large for Float32
+        assert!(matches!(
+            Value::Float64(1.7976931348623157e308).cast(&Type::Float4),
+            Err((_, CastError::NumericOutOfRange))
+        ));
+        // Infinity is preserved (not an overflow)
+        assert_eq!(
+            Value::Float64(f64::INFINITY).cast(&Type::Float4).unwrap(),
+            Value::Float32(f32::INFINITY)
+        );
+        // NaN is preserved
+        let result = Value::Float64(f64::NAN).cast(&Type::Float4).unwrap();
+        assert!(matches!(result, Value::Float32(n) if n.is_nan()));
+    }
+
+    #[test]
+    fn test_cast_text_to_numeric() {
+        assert_eq!(
+            Value::Text("42".into()).cast(&Type::Int4).unwrap(),
+            Value::Int32(42)
+        );
+        assert_eq!(
+            Value::Text(" -7 ".into()).cast(&Type::Int8).unwrap(),
+            Value::Int64(-7)
+        );
+        assert_eq!(
+            Value::Text("3.14".into()).cast(&Type::Float8).unwrap(),
+            Value::Float64(3.14)
+        );
+    }
+
+    #[test]
+    fn test_cast_text_to_numeric_invalid() {
+        assert!(matches!(
+            Value::Text("abc".into()).cast(&Type::Int4),
+            Err((_, CastError::Invalid))
+        ));
+        assert!(matches!(
+            Value::Text("".into()).cast(&Type::Int8),
+            Err((_, CastError::Invalid))
+        ));
+    }
+
+    #[test]
+    fn test_cast_to_text() {
+        assert_eq!(
+            Value::Int64(42).cast(&Type::Text).unwrap(),
+            Value::Text("42".into())
+        );
+        assert_eq!(
+            Value::Boolean(true).cast(&Type::Text).unwrap(),
+            Value::Text("t".into())
+        );
+        assert_eq!(
+            Value::Float64(3.14).cast(&Type::Text).unwrap(),
+            Value::Text("3.14".into())
+        );
+    }
+
+    #[test]
+    fn test_cast_to_varchar() {
+        assert_eq!(
+            Value::Int64(42).cast(&Type::Varchar).unwrap(),
+            Value::Text("42".into())
+        );
+    }
+
+    #[test]
+    fn test_cast_returns_original_value_on_error() {
+        let Err((original, err)) = Value::Text("not_a_number".into()).cast(&Type::Int4) else {
+            panic!("expected error");
+        };
+        assert_eq!(original, Value::Text("not_a_number".into()));
+        assert_eq!(err, CastError::Invalid);
     }
 }
