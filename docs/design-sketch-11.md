@@ -220,7 +220,7 @@ No circular dependencies. `heap/writer` and `heap/scanner` are shared by both `e
   - Tests: scan single page (regression), scan across 2-3 linked pages, scan empty table, scan table with empty intermediate pages, catalog get_table/get_columns still work
   - Edge cases: page chain traversal terminates at next_page=0
 
-- [ ] **Commit 3: HeapWriter — multi-page insert** — Implement `HeapWriter` that walks the page chain to find free space, allocates and links new pages when full. Refactor `Catalog::insert_table/insert_column/create_sequence` to use `HeapWriter`.
+- [x] **Commit 3: HeapWriter — multi-page insert** — Implement `HeapWriter` that walks the page chain to find free space, allocates and links new pages when full. Refactor `Catalog::insert_table/insert_column/create_sequence` to use `HeapWriter`.
   - Tests: insert into page with space, insert triggers new page allocation and linkage, catalog create_table + get_table roundtrip after refactor, insert many rows spanning multiple pages, verify page chain integrity after multiple inserts
   - Edge cases: page full → new page allocation, catalog multi-page scenario (many tables/columns)
 

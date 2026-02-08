@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 use super::error::CatalogError;
 use super::schema::{ColumnInfo, SequenceInfo, SystemCatalogTable, TableInfo};
 use super::superblock::Superblock;
-use crate::heap::{HeapPage, HeapScanner};
+use crate::heap::{HeapPage, HeapScanner, heap_insert};
 use crate::sql::{CreateTableStmt, DataType};
 use crate::storage::{BufferPool, PageId, Replacer, Storage};
 use crate::tx::{CommandId, Snapshot, TransactionManager, TxId};
@@ -260,11 +260,14 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         first_page: PageId,
     ) -> Result<(), CatalogError> {
         let sys_tables_page = self.superblock.read().sys_tables_page;
-        HeapPage::new(self.pool.fetch_page_mut(sys_tables_page, true).await?).insert(
+        heap_insert(
+            &self.pool,
+            sys_tables_page,
             &TableInfo::new(table_id, name.to_string(), first_page).to_record(),
             txid,
             cid,
-        )?;
+        )
+        .await?;
         Ok(())
     }
 
@@ -276,11 +279,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         col: &ColumnInfo,
     ) -> Result<(), CatalogError> {
         let sys_columns_page = self.superblock.read().sys_columns_page;
-        HeapPage::new(self.pool.fetch_page_mut(sys_columns_page, true).await?).insert(
-            &col.to_record(),
-            txid,
-            cid,
-        )?;
+        heap_insert(&self.pool, sys_columns_page, &col.to_record(), txid, cid).await?;
         Ok(())
     }
 
@@ -373,11 +372,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         let seq = SequenceInfo::new(seq_id, name.to_string(), 1); // Start at 1
 
         let sys_sequences_page = self.superblock.read().sys_sequences_page;
-        HeapPage::new(self.pool.fetch_page_mut(sys_sequences_page, true).await?).insert(
-            &seq.to_record(),
-            txid,
-            cid,
-        )?;
+        heap_insert(&self.pool, sys_sequences_page, &seq.to_record(), txid, cid).await?;
         Ok(seq_id)
     }
 
