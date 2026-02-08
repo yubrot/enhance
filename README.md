@@ -6,19 +6,21 @@ This project is designed as an intensive learning journey, focusing on core data
 
 ## Project Vision & Philosophy
 
+- **PostgreSQL as Reference**: When design decisions arise, we look to PostgreSQL's architecture as a primary reference. This is not about compatibility—it's about learning from a mature, well-documented system. We adopt concepts like MVCC tuple headers (xmin/xmax), the wire protocol, and page structures because understanding _why_ PostgreSQL made these choices deepens our learning.
 - **Minimal Dependencies**: Rely on Tokio for the async runtime and a few essential crates. Avoid large frameworks to focus on manual implementation of core logic.
-- **Wire Protocol**: Implement the PostgreSQL wire protocol manually so that standard tools like `psql` can be used for testing.
-- **Concurrency First**: Implement page-level locking and asynchronous I/O from the start to fully utilize Rust's safety and performance.
-- **Transparency**: Every layer—from the byte-level storage to the SQL parser—is handwritten to ensure deep understanding.
-- **PostgreSQL as Reference**: When design decisions arise, we look to PostgreSQL's architecture as a primary reference. This is not about compatibility—it's about learning from a mature, well-documented system. We adopt concepts like MVCC tuple headers (xmin/xmax), the wire protocol, and page structures because understanding *why* PostgreSQL made these choices deepens our learning.
+- **Concurrency First**: Implement page-level latching and asynchronous I/O from the start to fully utilize Rust's safety and performance.
+- **Standard Tooling**: Implement the PostgreSQL wire protocol manually so that standard tools like `psql` can be used for testing — no custom client required.
+
+### Production Readiness
+
+This project is designed for learning and experimentation, not production use. However, the architecture is intentionally production-reachable: the gap between this codebase and a production system is _scope_ (fewer features, simpler algorithms), not _structure_ (fake data paths, bypassed layers). Throughout the codebase, inline `NOTE:` comments document what would be necessary to make each component production-ready (e.g., graceful shutdown, connection limiting, proper authentication, input validation). These comments serve as a roadmap for future hardening while keeping the learning-focused implementation minimal and understandable.
 
 ### Architectural Decisions
 
 | Component           | Decision                           | Rationale                                                                                 |
 | ------------------- | ---------------------------------- | ----------------------------------------------------------------------------------------- |
 | Language & Runtime  | Rust + Tokio (Async)               | Deep dive into async Rust; suitable for handling concurrent database sessions.            |
-| Protocol            | PostgreSQL v3.0 (Handwritten)      | Support for Extended Query Protocol (Parse/Bind/Execute) to work with modern drivers.     |
-| Storage Unit        | 8KB Fixed-size Pages               | Aligns with OS page sizes. Intentionally uses the same 8KB as PostgreSQL for learning.   |
+| Storage Unit        | 8KB Fixed-size Pages               | Aligns with OS page sizes. Intentionally uses the same 8KB as PostgreSQL for learning.    |
 | Storage Abstraction | Trait-based                        | Allows seamless switching between MemoryStorage and FileStorage (Disk).                   |
 | Concurrency Control | Page-level Latching                | High concurrency using Arc<RwLock<Page>>. Requires strict latch hierarchy.                |
 | Transaction Model   | MVCC (Multi-Version)               | Uses xmin/xmax tuple header fields (matching PostgreSQL's design for learning).           |
@@ -32,6 +34,7 @@ This project is designed as an intensive learning journey, focusing on core data
 | Execution Model     | Volcano Model                      | Standard iterator-based processing; composable and intuitive for single-query efficiency. |
 | Durability          | WAL + REDO Recovery                | Write-ahead logging with checkpoint. UNDO not needed due to MVCC design.                  |
 | Storage Maintenance | VACUUM                             | Dead tuple cleanup essential for MVCC. Reclaims space within pages.                       |
+| Protocol            | PostgreSQL v3.0                    | Support for Extended Query Protocol (Parse/Bind/Execute) to work with modern drivers.     |
 
 ### Technical Constraints & Guardrails
 
@@ -104,7 +107,3 @@ This project is built using an AI-Driven, Understanding-First approach.
 - AI as Driver: The AI generates implementation code based on specific architectural requirements.
 - User as Navigator: I review every line, ensure it adheres to the ADR, and verify the memory/concurrency safety.
 - Iteration: Use `psql` and unit tests at every week's end to verify the "Vertical Slice" of the system.
-
-## Production Readiness
-
-This project is designed for learning and experimentation, not production use. Throughout the codebase, inline `NOTE:` comments document what would be necessary to make each component production-ready (e.g., graceful shutdown, connection limiting, proper authentication, input validation). These comments serve as a roadmap for future hardening while keeping the learning-focused implementation minimal and understandable.
