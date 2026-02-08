@@ -178,7 +178,7 @@ impl fmt::Display for Type {
 /// - Numeric/Decimal type for exact decimal arithmetic
 /// - Date/Time types
 /// - Array types
-#[derive(Debug, Clone, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// SQL NULL (type is unknown/any).
     Null,
@@ -397,6 +397,75 @@ fn format_float(n: f64) -> String {
     }
 }
 
+/// Widened numeric representation for cross-type comparison.
+enum WideNumeric {
+    Int64(i64),
+    Float64(f64),
+}
+
+/// Widens a numeric [`Value`] for comparison.
+///
+/// Returns `None` for non-numeric types (Boolean, Text, Bytea, Null).
+fn to_wide_numeric(v: &Value) -> Option<WideNumeric> {
+    match v {
+        Value::Int16(n) => Some(WideNumeric::Int64(*n as i64)),
+        Value::Int32(n) => Some(WideNumeric::Int64(*n as i64)),
+        Value::Int64(n) => Some(WideNumeric::Int64(*n)),
+        Value::Float32(n) => Some(WideNumeric::Float64(*n as f64)),
+        Value::Float64(n) => Some(WideNumeric::Float64(*n)),
+        _ => None,
+    }
+}
+
+/// Compares two f64 values with NaN-aware total ordering.
+///
+/// NaN is treated as greater than all non-NaN values, and NaN == NaN.
+fn compare_f64(a: f64, b: f64) -> std::cmp::Ordering {
+    match a.partial_cmp(&b) {
+        Some(ord) => ord,
+        None => match (a.is_nan(), b.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => unreachable!(),
+        },
+    }
+}
+
+impl PartialOrd for Value {
+    /// Compares two values with numeric type promotion.
+    ///
+    /// Returns `None` for incomparable types (e.g., Text vs Integer) and any
+    /// comparison involving NULL.
+    ///
+    /// Numeric types are promoted to a common wide type before comparison:
+    /// Int16/Int32 → Int64, Float32 → Float64, and if either operand is float
+    /// both are compared as Float64.
+    ///
+    /// Float ordering follows NaN-aware total ordering: NaN is greater than all
+    /// non-NaN values, and NaN == NaN.
+    ///
+    /// Boolean ordering: false < true.
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Value::Null, _) | (_, Value::Null) => None,
+            (Value::Boolean(a), Value::Boolean(b)) => Some(a.cmp(b)),
+            (Value::Text(a), Value::Text(b)) => Some(a.cmp(b)),
+            (Value::Bytea(a), Value::Bytea(b)) => Some(a.cmp(b)),
+            _ => {
+                let l = to_wide_numeric(self)?;
+                let r = to_wide_numeric(other)?;
+                Some(match (l, r) {
+                    (WideNumeric::Int64(a), WideNumeric::Int64(b)) => a.cmp(&b),
+                    (WideNumeric::Float64(a), WideNumeric::Float64(b)) => compare_f64(a, b),
+                    (WideNumeric::Float64(a), WideNumeric::Int64(b)) => compare_f64(a, b as f64),
+                    (WideNumeric::Int64(a), WideNumeric::Float64(b)) => compare_f64(a as f64, b),
+                })
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,5 +617,146 @@ mod tests {
         assert_eq!(Value::Int64(100).to_text(), "100");
         assert_eq!(Value::Text("hello".into()).to_text(), "hello");
         assert_eq!(Value::Bytea(vec![0xDE, 0xAD]).to_text(), "\\xdead");
+    }
+
+    // ========================================================================
+    // PartialOrd – cross-type comparison & numeric promotion
+    // ========================================================================
+
+    #[test]
+    fn test_ordering_same_type_integers() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            Value::Int64(5).partial_cmp(&Value::Int64(5)),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            Value::Int64(3).partial_cmp(&Value::Int64(5)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            Value::Int64(5).partial_cmp(&Value::Int64(3)),
+            Some(Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn test_ordering_strings() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            Value::Text("abc".into()).partial_cmp(&Value::Text("abd".into())),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            Value::Text("abc".into()).partial_cmp(&Value::Text("abc".into())),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            Value::Text("b".into()).partial_cmp(&Value::Text("a".into())),
+            Some(Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn test_ordering_booleans() {
+        use std::cmp::Ordering;
+        // false < true
+        assert_eq!(
+            Value::Boolean(false).partial_cmp(&Value::Boolean(true)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            Value::Boolean(true).partial_cmp(&Value::Boolean(true)),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            Value::Boolean(false).partial_cmp(&Value::Boolean(false)),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            Value::Boolean(true).partial_cmp(&Value::Boolean(false)),
+            Some(Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn test_ordering_mixed_int_float() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            Value::Int64(5).partial_cmp(&Value::Float64(5.0)),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            Value::Int64(5).partial_cmp(&Value::Float64(5.5)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            Value::Float64(5.5).partial_cmp(&Value::Int64(5)),
+            Some(Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn test_ordering_cross_int_widths() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            Value::Int16(5).partial_cmp(&Value::Int64(5)),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            Value::Int32(3).partial_cmp(&Value::Int64(5)),
+            Some(Ordering::Less)
+        );
+    }
+
+    #[test]
+    fn test_ordering_nan() {
+        use std::cmp::Ordering;
+        let nan = Value::Float64(f64::NAN);
+        let inf = Value::Float64(f64::INFINITY);
+        let neg_inf = Value::Float64(f64::NEG_INFINITY);
+        let zero = Value::Float64(0.0);
+
+        // NaN > any non-NaN value
+        assert_eq!(nan.partial_cmp(&zero), Some(Ordering::Greater));
+        assert_eq!(nan.partial_cmp(&inf), Some(Ordering::Greater));
+        assert_eq!(nan.partial_cmp(&neg_inf), Some(Ordering::Greater));
+
+        // any non-NaN value < NaN
+        assert_eq!(zero.partial_cmp(&nan), Some(Ordering::Less));
+        assert_eq!(inf.partial_cmp(&nan), Some(Ordering::Less));
+        assert_eq!(neg_inf.partial_cmp(&nan), Some(Ordering::Less));
+
+        // NaN == NaN
+        assert_eq!(nan.partial_cmp(&nan), Some(Ordering::Equal));
+
+        // Cross-type: NaN > integer (promotion)
+        assert_eq!(nan.partial_cmp(&Value::Int64(100)), Some(Ordering::Greater));
+        assert_eq!(Value::Int64(100).partial_cmp(&nan), Some(Ordering::Less));
+    }
+
+    #[test]
+    fn test_ordering_null() {
+        // NULL is not comparable to anything
+        assert_eq!(Value::Null.partial_cmp(&Value::Null), None);
+        assert_eq!(Value::Null.partial_cmp(&Value::Int64(1)), None);
+        assert_eq!(Value::Int64(1).partial_cmp(&Value::Null), None);
+    }
+
+    #[test]
+    fn test_ordering_incompatible_types() {
+        // Different type families are not comparable
+        assert_eq!(
+            Value::Text("abc".into()).partial_cmp(&Value::Int64(1)),
+            None
+        );
+        assert_eq!(
+            Value::Boolean(true).partial_cmp(&Value::Int64(1)),
+            None
+        );
+        assert_eq!(
+            Value::Boolean(true).partial_cmp(&Value::Text("true".into())),
+            None
+        );
     }
 }

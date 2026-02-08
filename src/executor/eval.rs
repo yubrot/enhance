@@ -363,45 +363,13 @@ fn widen_numeric(v: &Value) -> Result<Value, ExecutorError> {
 
 /// Compares two values, returning their ordering.
 ///
-/// Values are promoted to a common type before comparison.
-/// Boolean ordering: false < true.
-/// Float ordering: NaN is greater than all non-NaN values; NaN == NaN.
+/// Delegates to [`Value::partial_cmp`] and converts incomparable types to
+/// a [`ExecutorError::TypeMismatch`] error.
 fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering, ExecutorError> {
-    match (left, right) {
-        (Value::Boolean(a), Value::Boolean(b)) => Ok(a.cmp(b)),
-        (Value::Text(a), Value::Text(b)) => Ok(a.cmp(b)),
-        (Value::Bytea(a), Value::Bytea(b)) => Ok(a.cmp(b)),
-        _ => {
-            // Try numeric comparison
-            let l = widen_numeric(left)?;
-            let r = widen_numeric(right)?;
-            match (&l, &r) {
-                (Value::Int64(a), Value::Int64(b)) => Ok(a.cmp(b)),
-                (Value::Float64(a), Value::Float64(b)) => Ok(compare_f64(*a, *b)),
-                (Value::Float64(a), Value::Int64(b)) => Ok(compare_f64(*a, *b as f64)),
-                (Value::Int64(a), Value::Float64(b)) => Ok(compare_f64(*a as f64, *b)),
-                _ => Err(ExecutorError::TypeMismatch {
-                    expected: "comparable types".to_string(),
-                    found: format!("{}, {}", value_type_name(left), value_type_name(right)),
-                }),
-            }
-        }
-    }
-}
-
-/// Compares two f64 values with NaN-aware total ordering.
-///
-/// NaN is treated as greater than all non-NaN values, and NaN == NaN.
-fn compare_f64(a: f64, b: f64) -> std::cmp::Ordering {
-    match a.partial_cmp(&b) {
-        Some(ord) => ord,
-        None => match (a.is_nan(), b.is_nan()) {
-            (true, true) => std::cmp::Ordering::Equal,
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            (false, false) => unreachable!(),
-        },
-    }
+    left.partial_cmp(right).ok_or_else(|| ExecutorError::TypeMismatch {
+        expected: "comparable types".to_string(),
+        found: format!("{}, {}", value_type_name(left), value_type_name(right)),
+    })
 }
 
 /// Evaluates a unary operation.
@@ -881,81 +849,11 @@ mod tests {
     }
 
     #[test]
-    fn test_comparison_strings() {
-        assert_eq!(eval("'abc' < 'abd'").unwrap(), Value::Boolean(true));
-        assert_eq!(eval("'abc' = 'abc'").unwrap(), Value::Boolean(true));
-        assert_eq!(eval("'b' > 'a'").unwrap(), Value::Boolean(true));
-    }
-
-    #[test]
-    fn test_comparison_booleans() {
-        // false < true
-        assert_eq!(eval("FALSE < TRUE").unwrap(), Value::Boolean(true));
-        assert_eq!(eval("TRUE = TRUE").unwrap(), Value::Boolean(true));
-        assert_eq!(eval("FALSE = FALSE").unwrap(), Value::Boolean(true));
-        assert_eq!(eval("TRUE > FALSE").unwrap(), Value::Boolean(true));
-    }
-
-    #[test]
-    fn test_comparison_mixed_int_float() {
-        assert_eq!(eval("5 = 5.0").unwrap(), Value::Boolean(true));
-        assert_eq!(eval("5 < 5.5").unwrap(), Value::Boolean(true));
-        assert_eq!(eval("5.5 > 5").unwrap(), Value::Boolean(true));
-    }
-
-    #[test]
     fn test_comparison_null_propagation() {
         // Any comparison with NULL returns NULL
         assert_eq!(eval("1 = NULL").unwrap(), Value::Null);
         assert_eq!(eval("NULL < 1").unwrap(), Value::Null);
         assert_eq!(eval("NULL <> NULL").unwrap(), Value::Null);
-    }
-
-    #[test]
-    fn test_nan_ordering() {
-        // NaN > any non-NaN value
-        assert_eq!(
-            eval("CAST('NaN' AS DOUBLE PRECISION) > 0.0").unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval("CAST('NaN' AS DOUBLE PRECISION) > CAST('inf' AS DOUBLE PRECISION)").unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval("CAST('NaN' AS DOUBLE PRECISION) > CAST('-inf' AS DOUBLE PRECISION)").unwrap(),
-            Value::Boolean(true)
-        );
-
-        // any non-NaN value < NaN
-        assert_eq!(
-            eval("0.0 < CAST('NaN' AS DOUBLE PRECISION)").unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval("CAST('inf' AS DOUBLE PRECISION) < CAST('NaN' AS DOUBLE PRECISION)").unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval("CAST('-inf' AS DOUBLE PRECISION) < CAST('NaN' AS DOUBLE PRECISION)").unwrap(),
-            Value::Boolean(true)
-        );
-
-        // NaN == NaN
-        assert_eq!(
-            eval("CAST('NaN' AS DOUBLE PRECISION) = CAST('NaN' AS DOUBLE PRECISION)").unwrap(),
-            Value::Boolean(true)
-        );
-
-        // Cross-type: NaN > integer (promotion)
-        assert_eq!(
-            eval("CAST('NaN' AS DOUBLE PRECISION) > 100").unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval("100 < CAST('NaN' AS DOUBLE PRECISION)").unwrap(),
-            Value::Boolean(true)
-        );
     }
 
     // ========================================================================
