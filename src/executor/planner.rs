@@ -4,7 +4,10 @@ use std::collections::HashSet;
 
 use crate::catalog::{Catalog, ColumnInfo};
 use crate::datum::Type;
-use crate::sql::{BinaryOperator, Expr, FromClause, InsertStmt, SelectItem, SelectStmt, TableRef};
+use crate::sql::{
+    BinaryOperator, DeleteStmt, Expr, FromClause, InsertStmt, SelectItem, SelectStmt, TableRef,
+    UpdateStmt,
+};
 use crate::storage::{Replacer, Storage};
 use crate::tx::Snapshot;
 
@@ -175,6 +178,112 @@ pub async fn plan_insert<S: Storage, R: Replacer>(
             .into_iter()
             .filter(|(i, _)| !provided_columns.contains(i))
             .collect(),
+    })
+}
+
+/// Plans an UPDATE statement into a logical [`Plan::Update`].
+///
+/// Builds a SeqScan (with optional Filter for WHERE), resolves SET assignment
+/// column names, binds value expressions against the scan schema, and applies
+/// type coercion for target column types.
+///
+/// # Errors
+///
+/// Returns [`ExecutorError`] for unknown tables/columns, or expression binding
+/// errors.
+pub async fn plan_update<S: Storage, R: Replacer>(
+    update: &UpdateStmt,
+    catalog: &Catalog<S, R>,
+    snapshot: &Snapshot,
+) -> Result<Plan, ExecutorError> {
+    // Build the input scan plan
+    let scan_plan = build_seq_scan_plan(&update.table, None, catalog, snapshot).await?;
+
+    // Wrap with Filter if WHERE clause exists
+    let input = if let Some(where_clause) = &update.where_clause {
+        let columns = scan_plan.columns().to_vec();
+        let bound_predicate = where_clause.bind(&columns)?;
+        Plan::Filter {
+            input: Box::new(scan_plan),
+            predicate: bound_predicate,
+        }
+    } else {
+        scan_plan
+    };
+
+    let input_columns = input.columns().to_vec();
+
+    // Get column metadata for type coercion
+    let table_info = catalog
+        .get_table(snapshot, &update.table)
+        .await?
+        .ok_or_else(|| ExecutorError::TableNotFound {
+            name: update.table.clone(),
+        })?;
+    let column_infos = catalog.get_columns(snapshot, table_info.table_id).await?;
+    let schema: Vec<Type> = column_infos.iter().map(|c| c.ty).collect();
+
+    // Build assignments: start with identity (preserve original values)
+    let mut bound_assignments: Vec<BoundExpr> = (0..column_infos.len())
+        .map(|i| BoundExpr::Column {
+            index: i,
+            name: Some(column_infos[i].column_name.clone()),
+        })
+        .collect();
+
+    // Apply SET assignments
+    for assignment in &update.assignments {
+        let col_idx = column_infos
+            .iter()
+            .position(|c| c.column_name.to_lowercase() == assignment.column.to_lowercase())
+            .ok_or_else(|| ExecutorError::ColumnNotFound {
+                name: assignment.column.clone(),
+            })?;
+
+        let bound = assignment.value.bind(&input_columns)?;
+        let target_type = schema[col_idx];
+        bound_assignments[col_idx] = coerce_expr(bound, target_type);
+    }
+
+    Ok(Plan::Update {
+        table_name: update.table.clone(),
+        input: Box::new(input),
+        assignments: bound_assignments,
+        schema,
+        first_page: table_info.first_page,
+    })
+}
+
+/// Plans a DELETE statement into a logical [`Plan::Delete`].
+///
+/// Builds a SeqScan (with optional Filter for WHERE) as the input plan.
+///
+/// # Errors
+///
+/// Returns [`ExecutorError`] for unknown tables or expression binding errors.
+pub async fn plan_delete<S: Storage, R: Replacer>(
+    delete: &DeleteStmt,
+    catalog: &Catalog<S, R>,
+    snapshot: &Snapshot,
+) -> Result<Plan, ExecutorError> {
+    // Build the input scan plan
+    let scan_plan = build_seq_scan_plan(&delete.table, None, catalog, snapshot).await?;
+
+    // Wrap with Filter if WHERE clause exists
+    let input = if let Some(where_clause) = &delete.where_clause {
+        let columns = scan_plan.columns().to_vec();
+        let bound_predicate = where_clause.bind(&columns)?;
+        Plan::Filter {
+            input: Box::new(scan_plan),
+            predicate: bound_predicate,
+        }
+    } else {
+        scan_plan
+    };
+
+    Ok(Plan::Delete {
+        table_name: delete.table.clone(),
+        input: Box::new(input),
     })
 }
 
@@ -1050,5 +1159,172 @@ mod tests {
 
         let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
         assert_eq!(plan.explain(), "Insert on users (2 rows)");
+    }
+
+    // --- UPDATE planner tests ---
+
+    fn parse_update(sql: &str) -> UpdateStmt {
+        let stmt = Parser::new(sql).parse().unwrap().unwrap();
+        let Statement::Update(update) = stmt else {
+            panic!("expected UPDATE statement");
+        };
+        *update
+    }
+
+    #[tokio::test]
+    async fn test_plan_update_basic() {
+        let (db, snapshot) =
+            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let update = parse_update("UPDATE users SET name = 'Bob'");
+
+        let plan = plan_update(&update, db.catalog(), &snapshot).await.unwrap();
+
+        let Plan::Update {
+            table_name,
+            schema,
+            assignments,
+            ..
+        } = &plan
+        else {
+            panic!("expected Plan::Update");
+        };
+        assert_eq!(table_name, "users");
+        assert_eq!(schema, &[Type::Integer, Type::Text]);
+        assert_eq!(assignments.len(), 2);
+        // id should be identity (Column { index: 0 })
+        assert!(matches!(&assignments[0], BoundExpr::Column { index: 0, .. }));
+        // name should be the string literal 'Bob'
+        assert!(matches!(&assignments[1], BoundExpr::String(s) if s == "Bob"));
+    }
+
+    #[tokio::test]
+    async fn test_plan_update_with_where() {
+        let (db, snapshot) =
+            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let update = parse_update("UPDATE users SET name = 'Bob' WHERE id = 1");
+
+        let plan = plan_update(&update, db.catalog(), &snapshot).await.unwrap();
+
+        let Plan::Update { input, .. } = &plan else {
+            panic!("expected Plan::Update");
+        };
+        // Input should be a Filter wrapping a SeqScan
+        assert!(matches!(input.as_ref(), Plan::Filter { .. }));
+        assert_eq!(
+            plan.explain(),
+            "Update on users\n  Filter: ($col0 (users.id) = 1)\n    SeqScan on users (cols: id, name)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_update_type_coercion() {
+        let (db, snapshot) =
+            setup_db_with_table("CREATE TABLE t (val SMALLINT)").await;
+        // Integer literal 42 (Bigint) → should be coerced to Smallint
+        let update = parse_update("UPDATE t SET val = 42");
+
+        let plan = plan_update(&update, db.catalog(), &snapshot).await.unwrap();
+
+        let Plan::Update { assignments, .. } = &plan else {
+            panic!("expected Plan::Update");
+        };
+        let BoundExpr::Cast { ty, .. } = &assignments[0] else {
+            panic!("expected Cast for type coercion, got {:?}", &assignments[0]);
+        };
+        assert_eq!(*ty, Type::Smallint);
+    }
+
+    #[tokio::test]
+    async fn test_plan_update_referencing_column() {
+        let (db, snapshot) =
+            setup_db_with_table("CREATE TABLE counters (id INTEGER, count INTEGER)").await;
+        // SET count = count + 1 — references existing column
+        let update = parse_update("UPDATE counters SET count = count + 1");
+
+        let plan = plan_update(&update, db.catalog(), &snapshot).await.unwrap();
+
+        let Plan::Update { assignments, .. } = &plan else {
+            panic!("expected Plan::Update");
+        };
+        // id should be identity
+        assert!(matches!(&assignments[0], BoundExpr::Column { index: 0, .. }));
+        // count should be a Cast(BinaryOp(Column + Integer)) since count+1 infers as Bigint
+        // and target is Integer
+        assert!(matches!(&assignments[1], BoundExpr::Cast { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_plan_update_column_not_found() {
+        let (db, snapshot) =
+            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let update = parse_update("UPDATE users SET nonexistent = 1");
+
+        let result = plan_update(&update, db.catalog(), &snapshot).await;
+        assert!(matches!(result, Err(ExecutorError::ColumnNotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_plan_update_table_not_found() {
+        let (db, snapshot) = setup_test_db().await;
+        let update = parse_update("UPDATE nonexistent SET x = 1");
+
+        let result = plan_update(&update, db.catalog(), &snapshot).await;
+        assert!(matches!(result, Err(ExecutorError::TableNotFound { .. })));
+    }
+
+    // --- DELETE planner tests ---
+
+    fn parse_delete(sql: &str) -> DeleteStmt {
+        let stmt = Parser::new(sql).parse().unwrap().unwrap();
+        let Statement::Delete(delete) = stmt else {
+            panic!("expected DELETE statement");
+        };
+        *delete
+    }
+
+    #[tokio::test]
+    async fn test_plan_delete_basic() {
+        let (db, snapshot) =
+            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let delete = parse_delete("DELETE FROM users");
+
+        let plan = plan_delete(&delete, db.catalog(), &snapshot).await.unwrap();
+
+        let Plan::Delete {
+            table_name, input, ..
+        } = &plan
+        else {
+            panic!("expected Plan::Delete");
+        };
+        assert_eq!(table_name, "users");
+        // No WHERE → input is bare SeqScan
+        assert!(matches!(input.as_ref(), Plan::SeqScan { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_plan_delete_with_where() {
+        let (db, snapshot) =
+            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let delete = parse_delete("DELETE FROM users WHERE id = 1");
+
+        let plan = plan_delete(&delete, db.catalog(), &snapshot).await.unwrap();
+
+        let Plan::Delete { input, .. } = &plan else {
+            panic!("expected Plan::Delete");
+        };
+        assert!(matches!(input.as_ref(), Plan::Filter { .. }));
+        assert_eq!(
+            plan.explain(),
+            "Delete on users\n  Filter: ($col0 (users.id) = 1)\n    SeqScan on users (cols: id, name)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_delete_table_not_found() {
+        let (db, snapshot) = setup_test_db().await;
+        let delete = parse_delete("DELETE FROM nonexistent");
+
+        let result = plan_delete(&delete, db.catalog(), &snapshot).await;
+        assert!(matches!(result, Err(ExecutorError::TableNotFound { .. })));
     }
 }

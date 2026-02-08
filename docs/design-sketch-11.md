@@ -232,7 +232,7 @@ No circular dependencies. `heap/writer` and `heap/scanner` are shared by both `e
   - Tests: basic INSERT plan, INSERT with column list, INSERT with column reordering, INSERT with SERIAL skip, column count mismatch error, duplicate column error, type coercion (integer→smallint, float→integer, incompatible types error), multi-row INSERT
   - Edge cases: column list ordering, SERIAL auto-populate, type coercion
 
-- [ ] **Commit 6: DML planner — plan_update and plan_delete** — Add `Plan::Update`, `Plan::Delete`, `plan_update()`, `plan_delete()` with shared scan construction
+- [x] **Commit 6: DML planner — plan_update and plan_delete** — Add `Plan::Update`, `Plan::Delete`, `plan_update()`, `plan_delete()` with shared scan construction
   - Tests: basic UPDATE plan, UPDATE with WHERE, DELETE plan, DELETE with WHERE, UPDATE type coercion on SET values, UPDATE referencing existing columns
   - Edge cases: UPDATE type coercion, expression referencing other columns
 

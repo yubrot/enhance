@@ -64,6 +64,28 @@ pub enum Plan {
         /// Only includes SERIAL columns NOT explicitly provided in the INSERT column list.
         serial_columns: Vec<(usize, u32)>,
     },
+    /// UPDATE on a table.
+    Update {
+        /// Table name (for EXPLAIN output and command tags).
+        table_name: String,
+        /// Input plan that scans the rows to update (SeqScan + optional Filter).
+        input: Box<Plan>,
+        /// Bound SET expressions in table-schema order (one per column).
+        /// Columns not in the SET clause contain `BoundExpr::Column { index }` to
+        /// preserve the original value.
+        assignments: Vec<BoundExpr>,
+        /// Column data types in table-schema order.
+        schema: Vec<Type>,
+        /// First heap page of the table.
+        first_page: PageId,
+    },
+    /// DELETE from a table.
+    Delete {
+        /// Table name (for EXPLAIN output and command tags).
+        table_name: String,
+        /// Input plan that scans the rows to delete (SeqScan + optional Filter).
+        input: Box<Plan>,
+    },
 }
 
 impl Plan {
@@ -75,6 +97,8 @@ impl Plan {
             Plan::Projection { columns, .. } => columns,
             Plan::ValuesScan => &[],
             Plan::Insert { .. } => &[],
+            Plan::Update { .. } => &[],
+            Plan::Delete { .. } => &[],
         }
     }
 
@@ -134,6 +158,18 @@ impl Plan {
                     row_count,
                     if row_count == 1 { "" } else { "s" }
                 )
+            }
+            Plan::Update {
+                table_name, input, ..
+            } => {
+                let child_str = input.format_explain(indent + 1);
+                format!("{}Update on {}\n{}", prefix, table_name, child_str)
+            }
+            Plan::Delete {
+                table_name, input, ..
+            } => {
+                let child_str = input.format_explain(indent + 1);
+                format!("{}Delete on {}\n{}", prefix, table_name, child_str)
             }
         }
     }
