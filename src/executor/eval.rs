@@ -4,7 +4,7 @@
 //! [`Value`] result. Supports arithmetic, comparison, logical, string, NULL,
 //! LIKE, CASE, and CAST operations.
 
-use crate::datum::{CastError, Value, WideNumeric, to_wide_numeric};
+use crate::datum::{CastError, Value, WideNumeric};
 use crate::heap::Record;
 use crate::sql::{BinaryOperator, UnaryOperator};
 
@@ -133,7 +133,7 @@ impl BoundExpr {
                     _ => {
                         return Err(ExecutorError::TypeMismatch {
                             expected: "text".to_string(),
-                            found: format!("{:?}", v),
+                            found: v.ty(),
                         });
                     }
                 };
@@ -175,12 +175,8 @@ impl BoundExpr {
                 let v = expr.evaluate(record)?;
                 v.cast(data_type).map_err(|(original, err)| match err {
                     CastError::Invalid => ExecutorError::InvalidCast {
-                        from: match &original {
-                            Value::Text(s) => format!("'{}'", s),
-                            _ => original
-                                .type_name().to_string(),
-                        },
-                        to: data_type.display_name().to_string(),
+                        from: original.ty(),
+                        to: *data_type,
                     },
                     CastError::NumericOutOfRange => ExecutorError::NumericOutOfRange {
                         type_name: data_type.display_name().to_string(),
@@ -274,7 +270,7 @@ fn to_bool_or_type_error(v: &Value) -> Result<Option<bool>, ExecutorError> {
     v.to_bool_nullable()
         .map_err(|()| ExecutorError::TypeMismatch {
             expected: "boolean".to_string(),
-            found: v.type_name().to_string(),
+            found: v.ty(),
         })
 }
 
@@ -313,28 +309,24 @@ fn eval_arithmetic(
     int_op: impl FnOnce(i64, i64) -> Result<i64, ExecutorError>,
     float_op: impl FnOnce(f64, f64) -> Result<f64, ExecutorError>,
 ) -> Result<Value, ExecutorError> {
-    match (to_wide_numeric(left), to_wide_numeric(right)) {
-        (Some(WideNumeric::Int64(a)), Some(WideNumeric::Int64(b))) => {
-            Ok(Value::Int64(int_op(a, b)?))
-        }
-        (Some(WideNumeric::Float64(a)), Some(WideNumeric::Float64(b))) => {
-            Ok(Value::Float64(float_op(a, b)?))
-        }
-        (Some(WideNumeric::Float64(a)), Some(WideNumeric::Int64(b))) => {
-            Ok(Value::Float64(float_op(a, b as f64)?))
-        }
-        (Some(WideNumeric::Int64(a)), Some(WideNumeric::Float64(b))) => {
-            Ok(Value::Float64(float_op(a as f64, b)?))
-        }
-        _ => Err(ExecutorError::TypeMismatch {
+    let Some(left) = left.to_wide_numeric() else {
+        return Err(ExecutorError::TypeMismatch {
             expected: "numeric".to_string(),
-            found: format!(
-                "{}, {}",
-                left.type_name(),
-                right.type_name()
-            ),
-        }),
-    }
+            found: left.ty(),
+        });
+    };
+    let Some(right) = right.to_wide_numeric() else {
+        return Err(ExecutorError::TypeMismatch {
+            expected: "numeric".to_string(),
+            found: right.ty(),
+        });
+    };
+    Ok(match (left, right) {
+        (WideNumeric::Int64(a), WideNumeric::Int64(b)) => Value::Int64(int_op(a, b)?),
+        (WideNumeric::Float64(a), WideNumeric::Float64(b)) => Value::Float64(float_op(a, b)?),
+        (WideNumeric::Float64(a), WideNumeric::Int64(b)) => Value::Float64(float_op(a, b as f64)?),
+        (WideNumeric::Int64(a), WideNumeric::Float64(b)) => Value::Float64(float_op(a as f64, b)?),
+    })
 }
 
 /// Compares two values, returning their ordering.
@@ -343,13 +335,9 @@ fn eval_arithmetic(
 /// a [`ExecutorError::TypeMismatch`] error.
 fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering, ExecutorError> {
     left.partial_cmp(right)
-        .ok_or_else(|| ExecutorError::TypeMismatch {
-            expected: "comparable types".to_string(),
-            found: format!(
-                "{}, {}",
-                left.type_name(),
-                right.type_name()
-            ),
+        .ok_or_else(|| ExecutorError::IncomparableTypes {
+            lhs: left.ty(),
+            rhs: right.ty(),
         })
 }
 
@@ -358,13 +346,12 @@ fn eval_unary_op(op: UnaryOperator, val: &Value) -> Result<Value, ExecutorError>
     if val.is_null() {
         return Ok(Value::Null);
     }
-    let type_name = || val.type_name().to_string();
     match op {
         UnaryOperator::Not => match val {
             Value::Boolean(b) => Ok(Value::Boolean(!b)),
             _ => Err(ExecutorError::TypeMismatch {
                 expected: "boolean".to_string(),
-                found: type_name(),
+                found: val.ty(),
             }),
         },
         UnaryOperator::Minus => match val {
@@ -378,7 +365,7 @@ fn eval_unary_op(op: UnaryOperator, val: &Value) -> Result<Value, ExecutorError>
             Value::Float64(n) => Ok(Value::Float64(-n)),
             _ => Err(ExecutorError::TypeMismatch {
                 expected: "numeric".to_string(),
-                found: type_name(),
+                found: val.ty(),
             }),
         },
         UnaryOperator::Plus => match val {
@@ -389,7 +376,7 @@ fn eval_unary_op(op: UnaryOperator, val: &Value) -> Result<Value, ExecutorError>
             | Value::Float64(_) => Ok(val.clone()),
             _ => Err(ExecutorError::TypeMismatch {
                 expected: "numeric".to_string(),
-                found: type_name(),
+                found: val.ty(),
             }),
         },
     }

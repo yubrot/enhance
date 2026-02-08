@@ -1,6 +1,7 @@
 //! Executor-specific errors.
 
 use crate::catalog::CatalogError;
+use crate::datum::Type;
 use crate::storage::BufferPoolError;
 
 /// Errors that can occur during query execution.
@@ -16,7 +17,10 @@ pub enum ExecutorError {
     AmbiguousColumn { name: String },
 
     /// Type mismatch in expression evaluation.
-    TypeMismatch { expected: String, found: String },
+    TypeMismatch {
+        expected: String,
+        found: Option<Type>,
+    },
 
     /// Integer overflow.
     IntegerOverflow,
@@ -24,8 +28,14 @@ pub enum ExecutorError {
     /// Division by zero in arithmetic expression.
     DivisionByZero,
 
+    /// Two values have incomparable types.
+    IncomparableTypes {
+        lhs: Option<Type>,
+        rhs: Option<Type>,
+    },
+
     /// Invalid type cast.
-    InvalidCast { from: String, to: String },
+    InvalidCast { from: Option<Type>, to: Type },
 
     /// Numeric value out of range for the target type.
     NumericOutOfRange { type_name: String },
@@ -56,7 +66,15 @@ impl std::fmt::Display for ExecutorError {
                 write!(f, "column reference \"{}\" is ambiguous", name)
             }
             ExecutorError::TypeMismatch { expected, found } => {
-                write!(f, "type mismatch: expected {}, found {}", expected, found)
+                write!(
+                    f,
+                    "type mismatch: expected {}, found {}",
+                    expected,
+                    ty_str(*found)
+                )
+            }
+            ExecutorError::IncomparableTypes { lhs, rhs } => {
+                write!(f, "cannot compare {} with {}", ty_str(*lhs), ty_str(*rhs))
             }
             ExecutorError::ColumnIndexOutOfBounds { index, len } => {
                 write!(
@@ -68,7 +86,7 @@ impl std::fmt::Display for ExecutorError {
             ExecutorError::IntegerOverflow => write!(f, "integer overflow"),
             ExecutorError::DivisionByZero => write!(f, "division by zero"),
             ExecutorError::InvalidCast { from, to } => {
-                write!(f, "cannot cast {} to {}", from, to)
+                write!(f, "cannot cast {} to {}", ty_str(*from), ty_str(Some(*to)))
             }
             ExecutorError::NumericOutOfRange { type_name } => {
                 write!(f, "{} out of range", type_name)
@@ -78,6 +96,10 @@ impl std::fmt::Display for ExecutorError {
             ExecutorError::BufferPool(e) => write!(f, "{}", e),
         }
     }
+}
+
+fn ty_str(ty: Option<Type>) -> &'static str {
+    ty.map_or("NULL", Type::display_name)
 }
 
 impl std::error::Error for ExecutorError {

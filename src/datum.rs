@@ -80,7 +80,6 @@ macro_rules! ensure_buf_len {
 /// Database data type identifier.
 ///
 /// Each variant maps to a PostgreSQL type OID. See `oid` and `from_oid`.
-/// [`TryFrom<i32>`](Type#impl-TryFrom<i32>-for-Type).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Type {
     /// Boolean type.
@@ -189,6 +188,14 @@ impl fmt::Display for Type {
     }
 }
 
+/// Widened numeric representation for cross-type numeric operations.
+pub enum WideNumeric {
+    /// 64-bit integer (widened from Int16, Int32, or Int64).
+    Int64(i64),
+    /// 64-bit float (widened from Float32 or Float64).
+    Float64(f64),
+}
+
 /// A typed database value.
 ///
 /// This represents a single column value with its concrete type.
@@ -221,8 +228,13 @@ pub enum Value {
 }
 
 impl Value {
-    /// Returns the data type for this value, or `None` for Null.
-    pub fn data_type(&self) -> Option<Type> {
+    /// Returns true if this value is NULL.
+    pub fn is_null(&self) -> bool {
+        matches!(self, Value::Null)
+    }
+
+    /// Returns the type for this value, or `None` for Null.
+    pub fn ty(&self) -> Option<Type> {
         match self {
             Value::Null => None,
             Value::Boolean(_) => Some(Type::Bool),
@@ -234,16 +246,6 @@ impl Value {
             Value::Text(_) => Some(Type::Text),
             Value::Bytea(_) => Some(Type::Bytea),
         }
-    }
-
-    /// Returns true if this value is NULL.
-    pub fn is_null(&self) -> bool {
-        matches!(self, Value::Null)
-    }
-
-    /// Returns the SQL type display name, or `"NULL"` for null values.
-    pub fn type_name(&self) -> &'static str {
-        self.data_type().map_or("NULL", Type::display_name)
     }
 
     /// Interprets this value as a nullable boolean.
@@ -416,6 +418,20 @@ impl Value {
         }
     }
 
+    /// Widens a numeric [`Value`] for cross-type operations.
+    ///
+    /// Returns `None` for non-numeric types (Boolean, Text, Bytea, Null).
+    pub fn to_wide_numeric(&self) -> Option<WideNumeric> {
+        match self {
+            Value::Int16(n) => Some(WideNumeric::Int64(*n as i64)),
+            Value::Int32(n) => Some(WideNumeric::Int64(*n as i64)),
+            Value::Int64(n) => Some(WideNumeric::Int64(*n)),
+            Value::Float32(n) => Some(WideNumeric::Float64(*n as f64)),
+            Value::Float64(n) => Some(WideNumeric::Float64(*n)),
+            _ => None,
+        }
+    }
+
     /// Casts this value to the specified type.
     ///
     /// NULL passes through unchanged. On success, returns the converted value.
@@ -581,28 +597,6 @@ fn cast_float_to_int(n: f64, min: i64, max: i64) -> Result<i64, CastError> {
     Ok(wide as i64)
 }
 
-/// Widened numeric representation for cross-type numeric operations.
-pub(crate) enum WideNumeric {
-    /// 64-bit integer (widened from Int16, Int32, or Int64).
-    Int64(i64),
-    /// 64-bit float (widened from Float32 or Float64).
-    Float64(f64),
-}
-
-/// Widens a numeric [`Value`] for cross-type operations.
-///
-/// Returns `None` for non-numeric types (Boolean, Text, Bytea, Null).
-pub(crate) fn to_wide_numeric(v: &Value) -> Option<WideNumeric> {
-    match v {
-        Value::Int16(n) => Some(WideNumeric::Int64(*n as i64)),
-        Value::Int32(n) => Some(WideNumeric::Int64(*n as i64)),
-        Value::Int64(n) => Some(WideNumeric::Int64(*n)),
-        Value::Float32(n) => Some(WideNumeric::Float64(*n as f64)),
-        Value::Float64(n) => Some(WideNumeric::Float64(*n)),
-        _ => None,
-    }
-}
-
 /// Compares two f64 values with NaN-aware total ordering.
 ///
 /// NaN is treated as greater than all non-NaN values, and NaN == NaN.
@@ -650,8 +644,8 @@ impl PartialOrd for Value {
             (Value::Text(a), Value::Text(b)) => Some(a.cmp(b)),
             (Value::Bytea(a), Value::Bytea(b)) => Some(a.cmp(b)),
             _ => {
-                let l = to_wide_numeric(self)?;
-                let r = to_wide_numeric(other)?;
+                let l = self.to_wide_numeric()?;
+                let r = other.to_wide_numeric()?;
                 Some(match (l, r) {
                     (WideNumeric::Int64(a), WideNumeric::Int64(b)) => a.cmp(&b),
                     (WideNumeric::Float64(a), WideNumeric::Float64(b)) => compare_f64(a, b),
@@ -718,15 +712,15 @@ mod tests {
 
     #[test]
     fn test_value_data_type() {
-        assert_eq!(Value::Null.data_type(), None);
-        assert_eq!(Value::Boolean(true).data_type(), Some(Type::Bool));
-        assert_eq!(Value::Int16(0).data_type(), Some(Type::Int2));
-        assert_eq!(Value::Int32(0).data_type(), Some(Type::Int4));
-        assert_eq!(Value::Int64(0).data_type(), Some(Type::Int8));
-        assert_eq!(Value::Float32(0.0).data_type(), Some(Type::Float4));
-        assert_eq!(Value::Float64(0.0).data_type(), Some(Type::Float8));
-        assert_eq!(Value::Text(String::new()).data_type(), Some(Type::Text));
-        assert_eq!(Value::Bytea(vec![]).data_type(), Some(Type::Bytea));
+        assert_eq!(Value::Null.ty(), None);
+        assert_eq!(Value::Boolean(true).ty(), Some(Type::Bool));
+        assert_eq!(Value::Int16(0).ty(), Some(Type::Int2));
+        assert_eq!(Value::Int32(0).ty(), Some(Type::Int4));
+        assert_eq!(Value::Int64(0).ty(), Some(Type::Int8));
+        assert_eq!(Value::Float32(0.0).ty(), Some(Type::Float4));
+        assert_eq!(Value::Float64(0.0).ty(), Some(Type::Float8));
+        assert_eq!(Value::Text(String::new()).ty(), Some(Type::Text));
+        assert_eq!(Value::Bytea(vec![]).ty(), Some(Type::Bytea));
     }
 
     #[test]
@@ -753,7 +747,7 @@ mod tests {
             Value::Bytea(vec![0, 255, 128]),
         ];
         for value in values {
-            let ty = value.data_type().unwrap();
+            let ty = value.ty().unwrap();
             let mut buf = vec![0u8; value.serialized_size().max(1)];
             let written = value.serialize(&mut buf).unwrap();
             let (parsed, consumed) = Value::deserialize(&buf, ty).unwrap();
@@ -767,7 +761,7 @@ mod tests {
         assert!(Value::Null.is_null());
         assert!(!Value::Int32(0).is_null());
         assert_eq!(Value::Null.serialized_size(), 0);
-        assert_eq!(Value::Null.data_type(), None);
+        assert_eq!(Value::Null.ty(), None);
         assert_eq!(Value::Null.serialize(&mut [0u8; 1]).unwrap(), 0);
     }
 
@@ -947,10 +941,7 @@ mod tests {
             Value::Text("abc".into()).partial_cmp(&Value::Int64(1)),
             None
         );
-        assert_eq!(
-            Value::Boolean(true).partial_cmp(&Value::Int64(1)),
-            None
-        );
+        assert_eq!(Value::Boolean(true).partial_cmp(&Value::Int64(1)), None);
         assert_eq!(
             Value::Boolean(true).partial_cmp(&Value::Text("true".into())),
             None
@@ -972,7 +963,10 @@ mod tests {
             Type::Float8,
             Type::Text,
         ] {
-            assert!(Value::Null.cast(&ty).unwrap().is_null(), "CAST(NULL AS {ty})");
+            assert!(
+                Value::Null.cast(&ty).unwrap().is_null(),
+                "CAST(NULL AS {ty})"
+            );
         }
     }
 
