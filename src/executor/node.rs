@@ -445,6 +445,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_filter_null_predicate_skips_row() {
+        let (db, first_page) = setup_int_table(vec![1, 2, 3]).await;
+        let ctx = read_ctx(&db);
+        let scan = ExecutorNode::SeqScan(SeqScan::new(
+            "test".to_string(),
+            vec![int_col("id")],
+            ctx,
+            vec![Type::Int8],
+            first_page,
+        ));
+
+        // Predicate that always evaluates to NULL: $col0 = NULL
+        // NULL comparisons return NULL, which Filter must skip (not treat as true)
+        let predicate = BoundExpr::BinaryOp {
+            left: Box::new(BoundExpr::Column {
+                index: 0,
+                name: None,
+            }),
+            op: BinaryOperator::Eq,
+            right: Box::new(BoundExpr::Null),
+        };
+        let mut node = ExecutorNode::Filter(Filter::new(scan, predicate));
+
+        // All rows should be skipped because NULL is not true
+        assert!(node.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn test_projection() {
         let (db, first_page) = setup_two_col_table(vec![(1, "alice"), (2, "bob")]).await;
         let ctx = read_ctx(&db);

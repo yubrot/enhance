@@ -482,6 +482,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_infer_data_type_literals() {
+        let (db, snapshot) = setup_test_db().await;
+
+        // Integer literal → Int8
+        let select = parse_select("SELECT 42");
+        let plan = plan_select(&select, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::Int8);
+
+        // Float literal → Float8
+        let select = parse_select("SELECT 3.14");
+        let plan = plan_select(&select, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::Float8);
+
+        // Boolean literal → Bool
+        let select = parse_select("SELECT TRUE");
+        let plan = plan_select(&select, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::Bool);
+
+        // String literal → Text
+        let select = parse_select("SELECT 'hello'");
+        let plan = plan_select(&select, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::Text);
+
+        // NULL → Text (fallback)
+        let select = parse_select("SELECT NULL");
+        let plan = plan_select(&select, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::Text);
+    }
+
+    #[tokio::test]
+    async fn test_infer_data_type_operators() {
+        let (db, snapshot) = setup_test_db().await;
+
+        // Comparison → Bool
+        let select = parse_select("SELECT 1 = 1");
+        let plan = plan_select(&select, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::Bool);
+
+        // Arithmetic → inherits left operand type (Int8)
+        let select = parse_select("SELECT 1 + 2");
+        let plan = plan_select(&select, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::Int8);
+
+        // Concatenation → Text
+        let select = parse_select("SELECT 'a' || 'b'");
+        let plan = plan_select(&select, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::Text);
+
+        // IS NULL → Bool
+        let select = parse_select("SELECT 1 IS NULL");
+        let plan = plan_select(&select, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::Bool);
+
+        // IN list → Bool
+        let select = parse_select("SELECT 1 IN (1, 2)");
+        let plan = plan_select(&select, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::Bool);
+
+        // BETWEEN → Bool
+        let select = parse_select("SELECT 1 BETWEEN 0 AND 2");
+        let plan = plan_select(&select, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::Bool);
+
+        // LIKE → Bool
+        let select = parse_select("SELECT 'a' LIKE '%'");
+        let plan = plan_select(&select, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::Bool);
+
+        // CAST → target type
+        let select = parse_select("SELECT CAST(1 AS TEXT)");
+        let plan = plan_select(&select, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::Text);
+
+        // Unary minus → inherits operand type
+        let select = parse_select("SELECT -42");
+        let plan = plan_select(&select, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::Int8);
+    }
+
+    #[tokio::test]
+    async fn test_infer_data_type_column_ref() {
+        let (db, snapshot) = setup_test_db().await;
+
+        // Column reference preserves source type
+        let select = parse_select("SELECT table_id FROM sys_tables");
+        let plan = plan_select(&select, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::Int4);
+
+        let select = parse_select("SELECT table_name FROM sys_tables");
+        let plan = plan_select(&select, db.catalog(), &snapshot)
+            .await
+            .unwrap();
+        assert_eq!(plan.columns()[0].data_type, Type::Text);
+    }
+
+    #[tokio::test]
     async fn test_plan_select_alias_qualified_wildcard() {
         let (db, snapshot) = setup_test_db().await;
         let select = parse_select("SELECT t.* FROM sys_tables AS t");

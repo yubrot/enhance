@@ -636,6 +636,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_explicit_transaction_error_sets_failed_flag() {
+        let storage = Arc::new(MemoryStorage::new());
+        let db = Arc::new(Database::open(storage, 100).await.unwrap());
+        let mut session = Session::new(db);
+
+        // Start explicit transaction
+        session.execute_query("BEGIN").await.unwrap();
+        assert!(matches!(
+            session.transaction(),
+            Some(tx) if !tx.failed
+        ));
+
+        // Cause an error within the transaction
+        let result = session.execute_query("SELECT * FROM nonexistent").await;
+        assert!(matches!(result, Err(DatabaseError::Executor(_))));
+
+        // Transaction should be marked as failed
+        assert!(matches!(
+            session.transaction(),
+            Some(tx) if tx.failed
+        ));
+
+        // Subsequent commands should be rejected with TransactionAborted
+        let result = session.execute_query("SELECT 1").await;
+        assert!(matches!(result, Err(DatabaseError::TransactionAborted)));
+
+        // ROLLBACK should clear the failed state
+        session.execute_query("ROLLBACK").await.unwrap();
+        assert!(session.transaction().is_none());
+
+        // After rollback, normal operations should work again
+        let result = session.execute_query("SELECT 1").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
     async fn test_select_table_not_found() {
         let storage = Arc::new(MemoryStorage::new());
         let db = Arc::new(Database::open(storage, 100).await.unwrap());
