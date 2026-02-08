@@ -168,7 +168,7 @@ impl ColumnInfo {
             _ => return None,
         };
         let data_type = match record.values.get(Self::COL_DATA_TYPE)? {
-            Value::Int32(oid) => Type::try_from(*oid).ok()?,
+            Value::Int32(oid) => Type::from_oid(*oid)?,
             _ => return None,
         };
         let seq_id = match record.values.get(Self::COL_SEQ_ID)? {
@@ -211,13 +211,7 @@ impl SystemCatalogTable for ColumnInfo {
         "type_oid",
         "seq_id",
     ];
-    const SCHEMA: &'static [Type] = &[
-        Type::Int4,
-        Type::Int4,
-        Type::Text,
-        Type::Int4,
-        Type::Int4,
-    ];
+    const SCHEMA: &'static [Type] = &[Type::Int4, Type::Int4, Type::Text, Type::Int4, Type::Int4];
 }
 
 /// Metadata for a sequence stored in the catalog (sys_sequences row).

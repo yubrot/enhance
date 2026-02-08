@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use super::error::DatabaseError;
 use crate::catalog::Catalog;
+use crate::executor::ExecContextImpl;
 use crate::storage::{BufferPool, LruReplacer, Replacer, Storage};
-use crate::tx::TransactionManager;
+use crate::tx::{Snapshot, TransactionManager};
 
 /// Database orchestrates the core components: BufferPool, TransactionManager, and Catalog.
 ///
@@ -84,6 +85,15 @@ impl<S: Storage, R: Replacer> Database<S, R> {
     /// Returns a reference to the catalog.
     pub fn catalog(&self) -> &Catalog<S, R> {
         &self.catalog
+    }
+
+    /// Creates an [`ExecContextImpl`] for query execution with the given snapshot.
+    pub fn exec_context(&self, snapshot: Snapshot) -> ExecContextImpl<S, R> {
+        ExecContextImpl::new(
+            Arc::clone(&self.pool),
+            Arc::clone(&self.tx_manager),
+            snapshot,
+        )
     }
 
     /// Flushes all dirty pages to storage.

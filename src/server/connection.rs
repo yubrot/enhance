@@ -10,11 +10,12 @@ use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
+use crate::datum::Value;
 use crate::db::{Database, QueryResult, Session};
 use crate::protocol::{
-    BackendMessage, BindMessage, CloseMessage, CloseTarget, DescribeMessage, DescribeTarget,
-    ErrorInfo, ExecuteMessage, FrontendMessage, ParseMessage, PostgresCodec, TransactionStatus,
-    sql_state,
+    BackendMessage, BindMessage, CloseMessage, CloseTarget, DataValue, DescribeMessage,
+    DescribeTarget, ErrorInfo, ExecuteMessage, FieldDescription, FormatCode, FrontendMessage,
+    ParseMessage, PostgresCodec, TransactionStatus, sql_state,
 };
 use crate::sql::Parser;
 use crate::storage::{Replacer, Storage};
@@ -131,25 +132,16 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
                 self.framed.send(BackendMessage::EmptyQueryResponse).await?;
             }
             Ok(Some(QueryResult::Command { tag })) => {
-                // For SELECT, send RowDescription before CommandComplete
-                // NOTE: Real row data will be sent in Step 10 (Basic Executor)
-                if tag.starts_with("SELECT") {
-                    self.framed
-                        .send(BackendMessage::RowDescription { fields: vec![] })
-                        .await?;
-                }
-                self.framed
-                    .send(BackendMessage::CommandComplete { tag })
+                self.send_command_complete(tag).await?;
+            }
+            Ok(Some(QueryResult::Rows { columns, rows })) => {
+                self.send_row_description(&columns).await?;
+                self.send_data_rows(&rows).await?;
+                self.send_command_complete(format!("SELECT {}", rows.len()))
                     .await?;
             }
-            Err(crate::db::DatabaseError::Parse(err)) => {
-                let error = ErrorInfo::new(sql_state::SYNTAX_ERROR, &err.message)
-                    .with_position(err.position());
-                self.framed.send(error.into()).await?;
-            }
             Err(e) => {
-                let error = ErrorInfo::new(sql_state::INTERNAL_ERROR, e.to_string());
-                self.framed.send(error.into()).await?;
+                self.framed.send(e.to_error_info().into()).await?;
             }
         }
 
@@ -199,14 +191,7 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
         );
 
         // Verify statement exists
-        if self.state.get_statement(&msg.statement_name).is_none() {
-            let error = ErrorInfo::new(
-                sql_state::INVALID_SQL_STATEMENT_NAME,
-                format!(
-                    "prepared statement \"{}\" does not exist",
-                    msg.statement_name
-                ),
-            );
+        if let Err(error) = self.state.resolve_statement(&msg.statement_name) {
             return self.send_error(error, true).await;
         }
 
@@ -230,41 +215,35 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
             self.pid, msg.target_type, msg.name
         );
 
-        match msg.target_type {
+        let stmt = match msg.target_type {
             DescribeTarget::Statement => {
-                let Some(stmt) = self.state.get_statement(&msg.name) else {
-                    let error = ErrorInfo::new(
-                        sql_state::INVALID_SQL_STATEMENT_NAME,
-                        format!("prepared statement \"{}\" does not exist", msg.name),
-                    );
-                    return self.send_error(error, true).await;
-                };
+                match self.state.resolve_statement(&msg.name) {
+                    Ok(stmt) => {
+                        // Send ParameterDescription
+                        let param_types = stmt.param_types.clone();
+                        self.framed
+                            .send(BackendMessage::ParameterDescription { param_types })
+                            .await?;
 
-                // Send ParameterDescription
-                self.framed
-                    .send(BackendMessage::ParameterDescription {
-                        param_types: stmt.param_types.clone(),
-                    })
-                    .await?;
-
-                // For stub: Send NoData (no result columns yet)
-                // NOTE: Real implementation analyzes query to determine columns
-                self.framed.send(BackendMessage::NoData).await?;
+                        &stmt.ast
+                    }
+                    Err(error) => return self.send_error(error, true).await,
+                }
             }
-            DescribeTarget::Portal => {
-                let Some(_portal) = self.state.get_portal(&msg.name) else {
-                    let error = ErrorInfo::new(
-                        sql_state::INVALID_CURSOR_NAME,
-                        format!("portal \"{}\" does not exist", msg.name),
-                    );
-                    return self.send_error(error, true).await;
-                };
+            DescribeTarget::Portal => match self.state.resolve_portal_statement(&msg.name) {
+                Ok(stmt) => &stmt.ast,
+                Err(error) => return self.send_error(error, true).await,
+            },
+        };
 
-                // For stub: Send NoData (no result columns yet)
+        match self.session.describe_statement(stmt).await {
+            Ok(Some(columns)) => self.send_row_description(&columns).await,
+            Ok(None) => {
                 self.framed.send(BackendMessage::NoData).await?;
+                Ok(())
             }
+            Err(e) => self.send_error(e.to_error_info(), true).await,
         }
-        Ok(())
     }
 
     /// Handle an Execute message - execute a portal.
@@ -274,37 +253,25 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
             self.pid, msg.portal_name, msg.max_rows
         );
 
-        let Some(portal) = self.state.get_portal(&msg.portal_name) else {
-            let error = ErrorInfo::new(
-                sql_state::INVALID_CURSOR_NAME,
-                format!("portal \"{}\" does not exist", msg.portal_name),
-            );
-            return self.send_error(error, true).await;
+        let stmt = match self.state.resolve_portal_statement(&msg.portal_name) {
+            Ok(stmt) => stmt,
+            Err(error) => return self.send_error(error, true).await,
         };
 
-        let statement_name = portal.statement_name.clone();
-
-        let Some(stmt) = self.state.get_statement(&statement_name) else {
-            let error = ErrorInfo::new(
-                sql_state::INVALID_SQL_STATEMENT_NAME,
-                "statement for portal does not exist",
-            );
-            return self.send_error(error, true).await;
-        };
-
-        // Clone AST to avoid borrow issues
-        let ast = stmt.ast.clone();
-
-        // Execute the statement via Session
-        match self.session.execute_statement(&ast).await {
+        // Execute the statement via Session.
+        // In the Extended Query Protocol, RowDescription is sent by Describe,
+        // so Execute only sends DataRow messages and CommandComplete.
+        match self.session.execute_statement(&stmt.ast).await {
             Ok(QueryResult::Command { tag }) => {
-                self.framed
-                    .send(BackendMessage::CommandComplete { tag })
-                    .await?;
+                self.send_command_complete(tag).await?;
+            }
+            Ok(QueryResult::Rows { rows, .. }) => {
+                self.send_data_rows(&rows).await?;
+                let tag = format!("SELECT {}", rows.len());
+                self.send_command_complete(tag).await?;
             }
             Err(e) => {
-                let error = ErrorInfo::new(sql_state::INTERNAL_ERROR, e.to_string());
-                return self.send_error(error, true).await;
+                return self.send_error(e.to_error_info(), true).await;
             }
         }
 
@@ -319,12 +286,8 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
         );
 
         match msg.target_type {
-            CloseTarget::Statement => {
-                self.state.close_statement(&msg.name);
-            }
-            CloseTarget::Portal => {
-                self.state.close_portal(&msg.name);
-            }
+            CloseTarget::Statement => self.state.close_statement(&msg.name),
+            CloseTarget::Portal => self.state.close_portal(&msg.name),
         }
 
         self.framed.send(BackendMessage::CloseComplete).await?;
@@ -352,6 +315,66 @@ impl<S: Storage, R: Replacer> Connection<S, R> {
     ) -> Result<(), ConnectionError> {
         self.framed.send(error.into()).await?;
         self.state.in_error = into_error_state;
+        Ok(())
+    }
+
+    /// Sends a RowDescription message describing the output columns.
+    async fn send_row_description(
+        &mut self,
+        columns: &[crate::executor::ColumnDesc],
+    ) -> Result<(), ConnectionError> {
+        let row_description = BackendMessage::RowDescription {
+            fields: columns
+                .iter()
+                .map(|col| {
+                    let (table_oid, column_id) = match &col.source {
+                        Some(s) => (s.table_oid as i32, s.column_id),
+                        None => (0, 0),
+                    };
+                    FieldDescription {
+                        name: col.name.clone(),
+                        table_oid,
+                        column_id,
+                        type_oid: col.data_type.oid(),
+                        type_size: col.data_type.fixed_size().map(|s| s as i16).unwrap_or(-1),
+                        type_modifier: -1,
+                        format_code: FormatCode::Text,
+                    }
+                })
+                .collect(),
+        };
+        self.framed.send(row_description).await?;
+        Ok(())
+    }
+
+    /// Sends Row messages for each row in the result set.
+    ///
+    /// Used by Extended Query Protocol where RowDescription is sent
+    /// separately by Describe, and Execute only sends DataRow messages.
+    async fn send_data_rows(
+        &mut self,
+        rows: &[crate::executor::Row],
+    ) -> Result<(), ConnectionError> {
+        for row in rows {
+            let values: Vec<DataValue> = row
+                .record
+                .values
+                .iter()
+                .map(|v| match v {
+                    Value::Null => DataValue::Null,
+                    _ => DataValue::Data(v.to_text().into_bytes()),
+                })
+                .collect();
+            self.framed.send(BackendMessage::DataRow { values }).await?;
+        }
+        Ok(())
+    }
+
+    /// Sends a CommandComplete message with the given tag.
+    async fn send_command_complete(&mut self, tag: String) -> Result<(), ConnectionError> {
+        self.framed
+            .send(BackendMessage::CommandComplete { tag })
+            .await?;
         Ok(())
     }
 

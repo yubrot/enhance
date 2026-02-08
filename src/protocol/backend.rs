@@ -22,6 +22,10 @@ pub mod sql_state {
     /// Invalid cursor name (e.g., portal/cursor does not exist)
     pub const INVALID_CURSOR_NAME: &str = "34000";
 
+    // Class 25 - Invalid Transaction State
+    /// Current transaction is aborted, commands ignored until end of transaction block
+    pub const IN_FAILED_SQL_TRANSACTION: &str = "25P02";
+
     // Class 42 - Syntax Error or Access Rule Violation
     /// Syntax error
     pub const SYNTAX_ERROR: &str = "42601";
@@ -315,8 +319,8 @@ impl From<ErrorInfo> for BackendMessage {
 pub enum DataValue {
     /// SQL NULL value (encoded as length -1)
     Null,
-    /// Binary data (encoded as length + data bytes)
-    Binary(Vec<u8>),
+    /// Non-NULL value (encoded as length + data bytes)
+    Data(Vec<u8>),
 }
 
 impl DataValue {
@@ -324,7 +328,7 @@ impl DataValue {
     fn encode(&self, dst: &mut BytesMut) {
         match self {
             DataValue::Null => dst.put_i32(-1),
-            DataValue::Binary(bytes) => {
+            DataValue::Data(bytes) => {
                 dst.put_i32(bytes.len() as i32);
                 dst.put_slice(bytes);
             }
@@ -515,8 +519,8 @@ mod tests {
     fn test_write_data_row() {
         let msg = BackendMessage::DataRow {
             values: vec![
-                DataValue::Binary(b"hello".to_vec()), // non-empty value
-                DataValue::Binary(vec![]),            // empty value
+                DataValue::Data(b"hello".to_vec()), // non-empty value
+                DataValue::Data(vec![]),            // empty value
                 DataValue::Null,                      // NULL
             ],
         };

@@ -9,7 +9,7 @@ use psql_test_support::PsqlTestServer;
 async fn test_psql_connect_and_quit() {
     let server = PsqlTestServer::start().await;
 
-    let result = server.run_psql("\\q");
+    let result = server.run_psql("\\q\n");
     result.assert_success();
 }
 
@@ -18,7 +18,7 @@ async fn test_psql_multiple_connections() {
     let server = PsqlTestServer::start().await;
 
     for _ in 0..3 {
-        let result = server.run_psql("\\q");
+        let result = server.run_psql("\\q\n");
         result.assert_success();
     }
 }
@@ -28,7 +28,7 @@ async fn test_psql_connection_completes_quickly() {
     let server = PsqlTestServer::start().await;
 
     let start = Instant::now();
-    let result = server.run_psql("\\q");
+    let result = server.run_psql("\\q\n");
     let elapsed = start.elapsed();
 
     result.assert_success();
@@ -97,7 +97,7 @@ async fn test_psql_cancel_request() {
 async fn test_psql_set_command() {
     let server = PsqlTestServer::start().await;
 
-    let result = server.run_psql("SET client_encoding = 'UTF8';\\q");
+    let result = server.run_psql_c("SET client_encoding = 'UTF8';");
     result.assert_success();
 }
 
@@ -105,7 +105,7 @@ async fn test_psql_set_command() {
 async fn test_psql_simple_query() {
     let server = PsqlTestServer::start().await;
 
-    let result = server.run_psql("SELECT 1;\\q");
+    let result = server.run_psql_c("SELECT 1;");
     result.assert_success();
 }
 
@@ -113,7 +113,7 @@ async fn test_psql_simple_query() {
 async fn test_psql_multiple_queries() {
     let server = PsqlTestServer::start().await;
 
-    let result = server.run_psql("SELECT 1; SELECT 2; SELECT 3;\\q");
+    let result = server.run_psql("SELECT 1; SELECT 2; SELECT 3;\n\\q\n");
     result.assert_success();
 }
 
@@ -121,7 +121,7 @@ async fn test_psql_multiple_queries() {
 async fn test_psql_create_table() {
     let server = PsqlTestServer::start().await;
 
-    let result = server.run_psql("CREATE TABLE test (id INT);\\q");
+    let result = server.run_psql_c("CREATE TABLE test (id INT);");
     result.assert_success();
 }
 
@@ -130,7 +130,7 @@ async fn test_psql_insert_update_delete() {
     let server = PsqlTestServer::start().await;
 
     let result = server
-        .run_psql("INSERT INTO test VALUES (1); UPDATE test SET id = 2; DELETE FROM test;\\q");
+        .run_psql("INSERT INTO test VALUES (1); UPDATE test SET id = 2; DELETE FROM test;\n\\q\n");
     result.assert_success();
 }
 
@@ -138,7 +138,7 @@ async fn test_psql_insert_update_delete() {
 async fn test_psql_transaction_commands() {
     let server = PsqlTestServer::start().await;
 
-    let result = server.run_psql("BEGIN; SELECT 1; COMMIT;\\q");
+    let result = server.run_psql("BEGIN; SELECT 1; COMMIT;\n\\q\n");
     result.assert_success();
 }
 
@@ -147,7 +147,7 @@ async fn test_psql_empty_query() {
     let server = PsqlTestServer::start().await;
 
     // Empty query should be handled gracefully
-    let result = server.run_psql(";\\q");
+    let result = server.run_psql(";\n\\q\n");
     result.assert_success();
 }
 
@@ -159,7 +159,8 @@ async fn test_psql_extended_parse_bind_execute() {
         r#"
 SELECT $1::int \parse stmt1
 \bind_named stmt1 42 \g
-\q"#,
+\q
+"#,
     );
     result.assert_success();
 }
@@ -174,7 +175,8 @@ SELECT $1::int \parse stmt1
 \bind_named stmt1 1 \g
 \bind_named stmt1 2 \g
 \bind_named stmt1 3 \g
-\q"#,
+\q
+"#,
     );
     result.assert_success();
 }
@@ -187,7 +189,8 @@ async fn test_psql_extended_close_prepared() {
         r#"
 SELECT 1 \parse stmt1
 \close_prepared stmt1
-\q"#,
+\q
+"#,
     );
     result.assert_success();
 }
@@ -203,7 +206,8 @@ async fn test_psql_extended_error_recovery() {
 \bind_named nonexistent 42 \g
 SELECT 1 \parse stmt1
 \bind_named stmt1 \g
-\q"#,
+\q
+"#,
     );
     // The first bind fails with error, but Sync resets error state,
     // so subsequent parse/bind/execute succeed
@@ -215,12 +219,12 @@ async fn test_psql_syntax_error_with_position() {
     let server = PsqlTestServer::start().await;
 
     // Test that syntax errors include position information
-    let result = server.run_psql(r#"SELECT FROM "users";"#);
+    let result = server.run_psql_c("SELECT FROM users;");
     // psql displays position with caret (^) pointing to error location
     result.assert_output_contains(
-        r#"
-LINE 1: SELECT FROM "users";
-               ^"#,
+        "
+LINE 1: SELECT FROM users;
+               ^",
     );
 }
 
@@ -228,13 +232,90 @@ LINE 1: SELECT FROM "users";
 async fn test_psql_complex_select() {
     let server = PsqlTestServer::start().await;
 
-    // Test that complex SELECT statements parse correctly
-    let result = server.run_psql(
+    // ORDER BY is not yet supported (Step 12), so this should return an error
+    let result = server.run_psql_c(
         "SELECT id, name, age FROM users WHERE active = TRUE AND age >= 18 ORDER BY name ASC LIMIT 10;",
     );
-    // psql shows "(0 rows)" for empty result sets
+
+    result.assert_output_contains("unsupported");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_select_from_catalog() {
+    let server = PsqlTestServer::start().await;
+
+    // Test SELECT * FROM sys_tables returns actual catalog data
+    let result = server.run_psql_c("SELECT * FROM sys_tables;");
     result.assert_success();
-    result.assert_output_contains("(0 rows)");
+    result.assert_output_contains("sys_tables");
+    result.assert_output_contains("sys_columns");
+    result.assert_output_contains("sys_sequences");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_select_with_where() {
+    let server = PsqlTestServer::start().await;
+
+    // Test SELECT with WHERE filter
+    let result = server.run_psql_c("SELECT table_name FROM sys_tables WHERE table_id = 1;");
+    result.assert_success();
+    result.assert_output_contains("sys_tables");
+    result.assert_output_contains("(1 row)");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_select_expression() {
+    let server = PsqlTestServer::start().await;
+
+    // Test SELECT with arithmetic expression (no FROM)
+    let result = server.run_psql_c("SELECT 1 + 2;");
+    result.assert_success();
+    result.assert_output_contains("3");
+    result.assert_output_contains("(1 row)");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_select_concat() {
+    let server = PsqlTestServer::start().await;
+
+    let result = server.run_psql_c("SELECT 'hello' || ' world';");
+    result.assert_success();
+    result.assert_output_contains("hello world");
+    result.assert_output_contains("(1 row)");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_explain_select() {
+    let server = PsqlTestServer::start().await;
+
+    // Test EXPLAIN output
+    let result = server.run_psql_c("EXPLAIN SELECT * FROM sys_tables;");
+    result.assert_success();
+    result.assert_output_contains("SeqScan");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_explain_extended_query() {
+    let server = PsqlTestServer::start().await;
+
+    // Test EXPLAIN via Extended Query Protocol (Parse/Bind/Execute)
+    let result = server.run_psql(
+        r#"
+EXPLAIN SELECT * FROM sys_tables \parse explain_stmt
+\bind_named explain_stmt \g
+\q
+"#,
+    );
+    result.assert_success();
+    result.assert_output_contains("SeqScan");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_psql_select_table_not_found() {
+    let server = PsqlTestServer::start().await;
+
+    let result = server.run_psql_c("SELECT * FROM nonexistent;");
+    result.assert_output_contains("does not exist");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -242,7 +323,8 @@ async fn test_psql_comments() {
     let server = PsqlTestServer::start().await;
 
     // Test that SQL comments are handled correctly
-    let result = server.run_psql("SELECT 1 /* this is a comment */ + 2; -- line comment");
+    // SELECT 1+2 evaluates to 3
+    let result = server.run_psql_c("SELECT 1 /* this is a comment */ + 2; -- line comment");
     result.assert_success();
-    result.assert_output_contains("(0 rows)");
+    result.assert_output_contains("(1 row)");
 }

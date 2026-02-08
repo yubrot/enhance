@@ -1,3 +1,39 @@
+//! Wire protocol type definitions.
+//!
+//! This module defines types and constants used by the PostgreSQL wire protocol
+//! implementation. It serves as the canonical source for protocol-level constants
+//! that other modules (e.g., `datum`, `executor`) reference.
+
+/// PostgreSQL type OID constants for the wire protocol.
+///
+/// These OIDs identify data types in protocol messages such as `RowDescription`
+/// and `ParameterDescription`.
+///
+/// References:
+/// - <https://github.com/postgres/postgres/blob/master/src/include/catalog/pg_type.dat>
+pub mod type_oid {
+    /// `boolean` — logical boolean (true/false)
+    pub const BOOL: i32 = 16;
+    /// `bytea` — variable-length binary string
+    pub const BYTEA: i32 = 17;
+    /// `int8` — 8-byte signed integer
+    pub const INT8: i32 = 20;
+    /// `int2` — 2-byte signed integer
+    pub const INT2: i32 = 21;
+    /// `int4` — 4-byte signed integer
+    pub const INT4: i32 = 23;
+    /// `text` — variable-length string
+    pub const TEXT: i32 = 25;
+    /// `float4` — single-precision floating-point number
+    pub const FLOAT4: i32 = 700;
+    /// `float8` — double-precision floating-point number
+    pub const FLOAT8: i32 = 701;
+    /// `bpchar` — fixed-length blank-padded string (CHAR)
+    pub const BPCHAR: i32 = 1042;
+    /// `varchar` — variable-length string with limit
+    pub const VARCHAR: i32 = 1043;
+}
+
 /// Format code for parameter and result values in the PostgreSQL protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(i16)]

@@ -3,6 +3,7 @@
 //! This module implements the PostgreSQL v3.0 wire protocol, enabling
 //! communication with standard PostgreSQL clients like `psql`. Both Simple
 //! Query and Extended Query protocols are supported.
+//! This module also serves as the foundation for PostgreSQL protocol-level constants.
 //!
 //! ## Architecture
 //!
@@ -30,7 +31,8 @@ pub mod frontend;
 pub mod types;
 
 pub use backend::{
-    BackendMessage, ErrorField, ErrorInfo, FieldDescription, TransactionStatus, sql_state,
+    BackendMessage, DataValue, ErrorField, ErrorInfo, FieldDescription, TransactionStatus,
+    sql_state,
 };
 pub use codec::{PostgresCodec, StartupCodec};
 pub use error::ProtocolError;
@@ -38,4 +40,4 @@ pub use frontend::{
     BindMessage, CloseMessage, CloseTarget, DescribeMessage, DescribeTarget, ExecuteMessage,
     FrontendMessage, ParseMessage, StartupMessage, StartupParameters,
 };
-pub use types::{ErrorFieldCode, FormatCode};
+pub use types::{ErrorFieldCode, FormatCode, type_oid};

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::protocol::FormatCode;
+use crate::protocol::{ErrorInfo, FormatCode, sql_state};
 use crate::sql::Statement;
 
 /// Per-connection state for Extended Query Protocol.
@@ -30,9 +30,14 @@ impl ConnectionState {
         self.statements.insert(name, stmt);
     }
 
-    /// Get a prepared statement by name.
-    pub fn get_statement(&self, name: &str) -> Option<&PreparedStatement> {
-        self.statements.get(name)
+    /// Resolves a prepared statement by name.
+    pub fn resolve_statement(&self, name: &str) -> Result<&PreparedStatement, ErrorInfo> {
+        self.statements.get(name).ok_or_else(|| {
+            ErrorInfo::new(
+                sql_state::INVALID_SQL_STATEMENT_NAME,
+                format!("prepared statement \"{}\" does not exist", name),
+            )
+        })
     }
 
     /// Close a prepared statement. Also closes all portals referencing it.
@@ -48,14 +53,28 @@ impl ConnectionState {
         self.portals.insert(name, portal);
     }
 
-    /// Get a portal by name.
-    pub fn get_portal(&self, name: &str) -> Option<&Portal> {
-        self.portals.get(name)
+    /// Resolves a portal by name.
+    fn resolve_portal(&self, name: &str) -> Result<&Portal, ErrorInfo> {
+        self.portals.get(name).ok_or_else(|| {
+            ErrorInfo::new(
+                sql_state::INVALID_CURSOR_NAME,
+                format!("portal \"{}\" does not exist", name),
+            )
+        })
     }
 
     /// Close a portal by name.
     pub fn close_portal(&mut self, name: &str) {
         self.portals.remove(name);
+    }
+
+    /// Resolves a portal name to its backing prepared statement.
+    pub fn resolve_portal_statement(
+        &self,
+        portal_name: &str,
+    ) -> Result<&PreparedStatement, ErrorInfo> {
+        let portal = self.resolve_portal(portal_name)?;
+        self.resolve_statement(&portal.statement_name)
     }
 
     /// Clear all unnamed statement/portal (called at end of extended query).
@@ -95,37 +114,45 @@ mod tests {
     use super::*;
 
     fn dummy_stmt() -> PreparedStatement {
-        use crate::sql::{SelectItem, SelectStmt};
+        use crate::sql::Parser;
         PreparedStatement {
-            ast: Statement::Select(Box::new(SelectStmt {
-                distinct: false,
-                columns: vec![SelectItem::Wildcard],
-                from: None,
-                where_clause: None,
-                group_by: vec![],
-                having: None,
-                order_by: vec![],
-                limit: None,
-                offset: None,
-                locking: None,
-            })),
+            ast: Parser::new("SELECT *").parse().unwrap().unwrap(),
             param_types: vec![],
         }
     }
 
     #[test]
-    fn test_statement_lifecycle() {
+    fn test_resolve_statement() {
         let mut state = ConnectionState::new();
 
-        // Create statement
+        // Non-existent statement → error
+        let err = state.resolve_statement("test").unwrap_err();
+        assert_eq!(err.code, sql_state::INVALID_SQL_STATEMENT_NAME);
+
+        // Create and resolve
         state.put_statement("test".to_string(), dummy_stmt());
+        assert!(state.resolve_statement("test").is_ok());
 
-        assert!(state.get_statement("test").is_some());
-        assert!(state.get_statement("nonexistent").is_none());
-
-        // Close statement
+        // Close statement → error again
         state.close_statement("test");
-        assert!(state.get_statement("test").is_none());
+        assert!(state.resolve_statement("test").is_err());
+    }
+
+    #[test]
+    fn test_resolve_portal() {
+        let mut state = ConnectionState::new();
+
+        // Non-existent portal → error
+        let err = state.resolve_portal("p").unwrap_err();
+        assert_eq!(err.code, sql_state::INVALID_CURSOR_NAME);
+
+        // Create and resolve
+        state.put_portal("p".to_string(), dummy_portal("s"));
+        assert!(state.resolve_portal("p").is_ok());
+
+        // Close portal → error again
+        state.close_portal("p");
+        assert!(state.resolve_portal("p").is_err());
     }
 
     #[test]
@@ -136,22 +163,42 @@ mod tests {
         state.put_statement("stmt".to_string(), dummy_stmt());
 
         // Create portal from named statement
-        state.put_portal(
-            "portal1".to_string(),
-            Portal {
-                statement_name: "stmt".to_string(),
-                _param_values: vec![],
-                _param_format_codes: vec![],
-                _result_format_codes: vec![],
-            },
-        );
+        state.put_portal("portal1".to_string(), dummy_portal("stmt"));
 
-        assert!(state.get_portal("portal1").is_some());
+        assert!(state.resolve_portal("portal1").is_ok());
 
         // Replace named statement - should also close dependent portals
         state.put_statement("stmt".to_string(), dummy_stmt());
 
-        assert!(state.get_portal("portal1").is_none());
+        assert!(state.resolve_portal("portal1").is_err());
+    }
+
+    fn dummy_portal(statement_name: &str) -> Portal {
+        Portal {
+            statement_name: statement_name.to_string(),
+            _param_values: vec![],
+            _param_format_codes: vec![],
+            _result_format_codes: vec![],
+        }
+    }
+
+    #[test]
+    fn test_resolve_portal_statement() {
+        let mut state = ConnectionState::new();
+
+        // Portal without statement → error
+        state.put_portal("p".to_string(), dummy_portal("s"));
+        let err = state.resolve_portal_statement("p").unwrap_err();
+        assert_eq!(err.code, sql_state::INVALID_SQL_STATEMENT_NAME);
+
+        // Non-existent portal → error
+        let err = state.resolve_portal_statement("no_such").unwrap_err();
+        assert_eq!(err.code, sql_state::INVALID_CURSOR_NAME);
+
+        // Valid portal → returns the prepared statement
+        state.put_statement("s".to_string(), dummy_stmt());
+        let resolved = state.resolve_portal_statement("p").unwrap();
+        assert!(matches!(resolved.ast, Statement::Select(_)));
     }
 
     #[test]
@@ -163,32 +210,16 @@ mod tests {
         state.put_statement("named".to_string(), dummy_stmt());
 
         // Create both named and unnamed portals
-        state.put_portal(
-            "".to_string(),
-            Portal {
-                statement_name: "".to_string(),
-                _param_values: vec![],
-                _param_format_codes: vec![],
-                _result_format_codes: vec![],
-            },
-        );
-        state.put_portal(
-            "named_portal".to_string(),
-            Portal {
-                statement_name: "named".to_string(),
-                _param_values: vec![],
-                _param_format_codes: vec![],
-                _result_format_codes: vec![],
-            },
-        );
+        state.put_portal("".to_string(), dummy_portal(""));
+        state.put_portal("named_portal".to_string(), dummy_portal("named"));
 
         // Clear unnamed
         state.clear_unnamed();
 
         // Unnamed should be gone, named should remain
-        assert!(state.get_statement("").is_none());
-        assert!(state.get_statement("named").is_some());
-        assert!(state.get_portal("").is_none());
-        assert!(state.get_portal("named_portal").is_some());
+        assert!(state.resolve_statement("").is_err());
+        assert!(state.resolve_statement("named").is_ok());
+        assert!(state.resolve_portal("").is_err());
+        assert!(state.resolve_portal("named_portal").is_ok());
     }
 }

@@ -50,5 +50,5 @@ mod superblock;
 
 pub use core::Catalog;
 pub use error::CatalogError;
-pub use schema::{ColumnInfo, LAST_RESERVED_TABLE_ID, SequenceInfo, TableInfo};
+pub use schema::{ColumnInfo, LAST_RESERVED_TABLE_ID, SequenceInfo, SystemCatalogTable, TableInfo};
 pub use superblock::Superblock;
