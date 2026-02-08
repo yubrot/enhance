@@ -240,6 +240,6 @@ No circular dependencies. `heap/writer` and `heap/scanner` are shared by both `e
   - Tests: INSERT executes and returns correct affected count, DELETE filters and returns count, UPDATE delete+insert, multi-row INSERT, UPDATE/DELETE without WHERE, EXPLAIN INSERT/UPDATE/DELETE
   - Edge cases: empty table operations, multi-page INSERT
 
-- [ ] **Commit 8: Session integration and end-to-end tests** — Wire DML through `Session::execute_statement`, correct command tags, full SQL round-trip tests
+- [x] **Commit 8: Session integration and end-to-end tests** — Wire DML through `Session::execute_statement`, correct command tags, full SQL round-trip tests
   - Tests: `INSERT INTO t VALUES (...)` → SELECT verifies data, UPDATE modifies data → SELECT verifies, DELETE removes data → SELECT verifies, multi-statement transaction (BEGIN → INSERT → UPDATE → DELETE → SELECT → COMMIT), auto-commit DML, failed DML sets failed flag, EXPLAIN DML, SERIAL column auto-increment, multi-page INSERT (many rows) → SELECT returns all
   - Edge cases: transaction abort visibility, command tag format, CommandId increment
