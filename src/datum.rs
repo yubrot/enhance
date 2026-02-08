@@ -59,9 +59,7 @@ macro_rules! ensure_buf_len {
 
 /// Database data type identifier.
 ///
-/// Each variant maps to a PostgreSQL type OID defined in
-/// [`protocol::types::type_oid`](crate::protocol::types::type_oid).
-/// The OID mapping is provided by [`oid()`](Type::oid) and
+/// Each variant maps to a PostgreSQL type OID. See `oid` and `from_oid`.
 /// [`TryFrom<i32>`](Type#impl-TryFrom<i32>-for-Type).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Type {

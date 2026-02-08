@@ -20,6 +20,9 @@ pub enum QueryResult {
     /// Command completed successfully (DDL, DML, transaction control).
     Command {
         /// Command completion tag (e.g., "CREATE TABLE", "INSERT 0 1").
+        ///
+        /// This tag is sent as-is in the wire protocol's `CommandComplete` message.
+        /// The format follows PostgreSQL's command tag conventions.
         tag: String,
     },
     /// Query returned rows (SELECT, EXPLAIN).
@@ -507,35 +510,17 @@ mod tests {
         let db = Arc::new(Database::open(storage, 100).await.unwrap());
         let mut session = Session::new(db);
 
-        let result = session
-            .execute_query("SELECT 1 + 1")
-            .await
-            .unwrap()
-            .unwrap();
-
-        let QueryResult::Rows { columns, rows } = result else {
-            panic!("expected Rows result");
-        };
-        assert_eq!(columns.len(), 1);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].record.values[0], crate::datum::Value::Int64(2));
-    }
-
-    #[tokio::test]
-    async fn test_select_expressions() {
-        let storage = Arc::new(MemoryStorage::new());
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let mut session = Session::new(db);
-
         // Arithmetic
         let result = session
             .execute_query("SELECT 2 * 3 + 1")
             .await
             .unwrap()
             .unwrap();
-        let QueryResult::Rows { rows, .. } = result else {
+        let QueryResult::Rows { rows, columns } = result else {
             panic!("expected Rows result");
         };
+        assert_eq!(columns.len(), 1);
+        assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].record.values[0], crate::datum::Value::Int64(7));
 
         // String concatenation
