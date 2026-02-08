@@ -224,7 +224,7 @@ No circular dependencies. `heap/writer` and `heap/scanner` are shared by both `e
   - Tests: insert into page with space, insert triggers new page allocation and linkage, catalog create_table + get_table roundtrip after refactor, insert many rows spanning multiple pages, verify page chain integrity after multiple inserts
   - Edge cases: page full → new page allocation, catalog multi-page scenario (many tables/columns)
 
-- [ ] **Commit 4: ExecContext DML operations** — Extend `ExecContext` trait and `ExecContextImpl` with `insert_tuple` (via HeapWriter), `delete_tuple` (set xmax), `update_tuple` (delete + insert with same-page priority), `nextval`
+- [x] **Commit 4: ExecContext DML operations** — Extend `ExecContext` trait and `ExecContextImpl` with `insert_tuple` (via HeapWriter), `delete_tuple` (set xmax), `update_tuple` (delete + insert with same-page priority), `nextval`
   - Tests: insert a tuple via context and verify it's readable, delete a tuple and verify not visible, update a tuple and verify new version, nextval returns incrementing values, insert triggers page extension
   - Edge cases: same-page UPDATE priority, cross-page UPDATE fallback
 

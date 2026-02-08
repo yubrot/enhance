@@ -92,6 +92,7 @@ impl<S: Storage, R: Replacer> Database<S, R> {
         ExecContextImpl::new(
             Arc::clone(&self.pool),
             Arc::clone(&self.tx_manager),
+            self.catalog.clone(),
             snapshot,
         )
     }

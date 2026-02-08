@@ -2,6 +2,7 @@
 
 use crate::catalog::CatalogError;
 use crate::datum::Type;
+use crate::heap::HeapError;
 use crate::storage::BufferPoolError;
 
 /// Errors that can occur during query execution.
@@ -51,6 +52,9 @@ pub enum ExecutorError {
 
     /// Buffer pool error during page access.
     BufferPool(BufferPoolError),
+
+    /// Heap operation error (insert, delete, update).
+    Heap(HeapError),
 }
 
 impl std::fmt::Display for ExecutorError {
@@ -94,6 +98,7 @@ impl std::fmt::Display for ExecutorError {
             ExecutorError::Unsupported(msg) => write!(f, "unsupported: {}", msg),
             ExecutorError::Catalog(e) => write!(f, "{}", e),
             ExecutorError::BufferPool(e) => write!(f, "{}", e),
+            ExecutorError::Heap(e) => write!(f, "{}", e),
         }
     }
 }
@@ -107,6 +112,7 @@ impl std::error::Error for ExecutorError {
         match self {
             ExecutorError::Catalog(e) => Some(e),
             ExecutorError::BufferPool(e) => Some(e),
+            ExecutorError::Heap(e) => Some(e),
             _ => None,
         }
     }
@@ -121,5 +127,11 @@ impl From<CatalogError> for ExecutorError {
 impl From<BufferPoolError> for ExecutorError {
     fn from(e: BufferPoolError) -> Self {
         ExecutorError::BufferPool(e)
+    }
+}
+
+impl From<HeapError> for ExecutorError {
+    fn from(e: HeapError) -> Self {
+        ExecutorError::Heap(e)
     }
 }

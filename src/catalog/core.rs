@@ -28,7 +28,18 @@ pub struct Catalog<S: Storage, R: Replacer> {
     /// Transaction manager for MVCC.
     tx_manager: Arc<TransactionManager>,
     /// Superblock with catalog metadata (protected for updates).
-    superblock: RwLock<Superblock>,
+    superblock: Arc<RwLock<Superblock>>,
+}
+
+// Manual Clone impl: all fields are Arc-based, so cloning is lightweight.
+impl<S: Storage, R: Replacer> Clone for Catalog<S, R> {
+    fn clone(&self) -> Self {
+        Self {
+            pool: Arc::clone(&self.pool),
+            tx_manager: Arc::clone(&self.tx_manager),
+            superblock: Arc::clone(&self.superblock),
+        }
+    }
 }
 
 impl<S: Storage, R: Replacer> Catalog<S, R> {
@@ -44,7 +55,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         Self {
             pool,
             tx_manager,
-            superblock: RwLock::new(superblock),
+            superblock: Arc::new(RwLock::new(superblock)),
         }
     }
 

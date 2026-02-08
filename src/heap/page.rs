@@ -481,6 +481,14 @@ impl<T: AsRef<[u8]>> HeapPage<T> {
         Some((header, record))
     }
 
+    /// Returns the tuple header at the given slot, without deserializing the record.
+    ///
+    /// Returns `None` if the slot is out of bounds or deleted.
+    pub fn get_header(&self, slot_id: SlotId) -> Option<TupleHeader> {
+        let raw = self.page.get(slot_id)?;
+        Some(TupleHeader::read(&raw[..TUPLE_HEADER_SIZE]))
+    }
+
     /// Returns an iterator over all tuples with headers.
     ///
     /// Yields `(SlotId, TupleHeader, Record)` for each valid (non-deleted) slot.
