@@ -562,16 +562,18 @@ fn cast_float_to_int(n: f64, min: i64, max: i64) -> Result<i64, CastError> {
     Ok(wide as i64)
 }
 
-/// Widened numeric representation for cross-type comparison.
-enum WideNumeric {
+/// Widened numeric representation for cross-type numeric operations.
+pub(crate) enum WideNumeric {
+    /// 64-bit integer (widened from Int16, Int32, or Int64).
     Int64(i64),
+    /// 64-bit float (widened from Float32 or Float64).
     Float64(f64),
 }
 
-/// Widens a numeric [`Value`] for comparison.
+/// Widens a numeric [`Value`] for cross-type operations.
 ///
 /// Returns `None` for non-numeric types (Boolean, Text, Bytea, Null).
-fn to_wide_numeric(v: &Value) -> Option<WideNumeric> {
+pub(crate) fn to_wide_numeric(v: &Value) -> Option<WideNumeric> {
     match v {
         Value::Int16(n) => Some(WideNumeric::Int64(*n as i64)),
         Value::Int32(n) => Some(WideNumeric::Int64(*n as i64)),

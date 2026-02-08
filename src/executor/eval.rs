@@ -4,7 +4,7 @@
 //! [`Value`] result. Supports arithmetic, comparison, logical, string, NULL,
 //! LIKE, CASE, and CAST operations.
 
-use crate::datum::{CastError, Type, Value};
+use crate::datum::{CastError, Type, Value, WideNumeric, to_wide_numeric};
 use crate::heap::Record;
 use crate::sql::{BinaryOperator, UnaryOperator};
 
@@ -173,7 +173,21 @@ impl BoundExpr {
 
             BoundExpr::Cast { expr, data_type } => {
                 let v = expr.evaluate(record)?;
-                eval_cast(v, data_type)
+                v.cast(data_type).map_err(|(original, err)| match err {
+                    CastError::Invalid => ExecutorError::InvalidCast {
+                        from: match &original {
+                            Value::Text(s) => format!("'{}'", s),
+                            _ => original
+                                .data_type()
+                                .map_or("NULL", Type::display_name)
+                                .to_string(),
+                        },
+                        to: data_type.display_name().to_string(),
+                    },
+                    CastError::NumericOutOfRange => ExecutorError::NumericOutOfRange {
+                        type_name: data_type.display_name().to_string(),
+                    },
+                })
             }
         }
     }
@@ -265,8 +279,32 @@ fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) -> Result<Val
 
 /// Evaluates AND with 3-value NULL logic.
 fn eval_and(left: &Value, right: &Value) -> Result<Value, ExecutorError> {
-    let l = value_to_bool_nullable(left)?;
-    let r = value_to_bool_nullable(right)?;
+    let l = match left {
+        Value::Null => None,
+        Value::Boolean(b) => Some(*b),
+        _ => {
+            return Err(ExecutorError::TypeMismatch {
+                expected: "boolean".to_string(),
+                found: left
+                    .data_type()
+                    .map_or("NULL", Type::display_name)
+                    .to_string(),
+            })
+        }
+    };
+    let r = match right {
+        Value::Null => None,
+        Value::Boolean(b) => Some(*b),
+        _ => {
+            return Err(ExecutorError::TypeMismatch {
+                expected: "boolean".to_string(),
+                found: right
+                    .data_type()
+                    .map_or("NULL", Type::display_name)
+                    .to_string(),
+            })
+        }
+    };
     match (l, r) {
         (Some(false), _) | (_, Some(false)) => Ok(Value::Boolean(false)),
         (Some(true), Some(true)) => Ok(Value::Boolean(true)),
@@ -276,24 +314,36 @@ fn eval_and(left: &Value, right: &Value) -> Result<Value, ExecutorError> {
 
 /// Evaluates OR with 3-value NULL logic.
 fn eval_or(left: &Value, right: &Value) -> Result<Value, ExecutorError> {
-    let l = value_to_bool_nullable(left)?;
-    let r = value_to_bool_nullable(right)?;
+    let l = match left {
+        Value::Null => None,
+        Value::Boolean(b) => Some(*b),
+        _ => {
+            return Err(ExecutorError::TypeMismatch {
+                expected: "boolean".to_string(),
+                found: left
+                    .data_type()
+                    .map_or("NULL", Type::display_name)
+                    .to_string(),
+            })
+        }
+    };
+    let r = match right {
+        Value::Null => None,
+        Value::Boolean(b) => Some(*b),
+        _ => {
+            return Err(ExecutorError::TypeMismatch {
+                expected: "boolean".to_string(),
+                found: right
+                    .data_type()
+                    .map_or("NULL", Type::display_name)
+                    .to_string(),
+            })
+        }
+    };
     match (l, r) {
         (Some(true), _) | (_, Some(true)) => Ok(Value::Boolean(true)),
         (Some(false), Some(false)) => Ok(Value::Boolean(false)),
         _ => Ok(Value::Null),
-    }
-}
-
-/// Converts a Value to an optional boolean (None for NULL).
-fn value_to_bool_nullable(v: &Value) -> Result<Option<bool>, ExecutorError> {
-    match v {
-        Value::Null => Ok(None),
-        Value::Boolean(b) => Ok(Some(*b)),
-        _ => Err(ExecutorError::TypeMismatch {
-            expected: "boolean".to_string(),
-            found: value_type_name(v),
-        }),
     }
 }
 
@@ -314,49 +364,26 @@ fn eval_arithmetic(
     int_op: impl FnOnce(i64, i64) -> Result<i64, ExecutorError>,
     float_op: impl FnOnce(f64, f64) -> Result<f64, ExecutorError>,
 ) -> Result<Value, ExecutorError> {
-    let (l, r) = promote_numeric(left, right)?;
-    match (&l, &r) {
-        (Value::Int64(a), Value::Int64(b)) => Ok(Value::Int64(int_op(*a, *b)?)),
-        (Value::Float64(a), Value::Float64(b)) => Ok(Value::Float64(float_op(*a, *b)?)),
+    match (to_wide_numeric(left), to_wide_numeric(right)) {
+        (Some(WideNumeric::Int64(a)), Some(WideNumeric::Int64(b))) => {
+            Ok(Value::Int64(int_op(a, b)?))
+        }
+        (Some(WideNumeric::Float64(a)), Some(WideNumeric::Float64(b))) => {
+            Ok(Value::Float64(float_op(a, b)?))
+        }
+        (Some(WideNumeric::Float64(a)), Some(WideNumeric::Int64(b))) => {
+            Ok(Value::Float64(float_op(a, b as f64)?))
+        }
+        (Some(WideNumeric::Int64(a)), Some(WideNumeric::Float64(b))) => {
+            Ok(Value::Float64(float_op(a as f64, b)?))
+        }
         _ => Err(ExecutorError::TypeMismatch {
             expected: "numeric".to_string(),
-            found: format!("{}, {}", value_type_name(left), value_type_name(right)),
-        }),
-    }
-}
-
-/// Promotes two numeric values to a common type for arithmetic.
-///
-/// - Int16/Int32 are promoted to Int64.
-/// - If either operand is Float, both are promoted to Float64.
-fn promote_numeric(left: &Value, right: &Value) -> Result<(Value, Value), ExecutorError> {
-    let l = widen_numeric(left)?;
-    let r = widen_numeric(right)?;
-
-    // If either is float, promote both to float
-    match (&l, &r) {
-        (Value::Float64(_), Value::Float64(_)) => Ok((l, r)),
-        (Value::Float64(_), Value::Int64(n)) => Ok((l, Value::Float64(*n as f64))),
-        (Value::Int64(n), Value::Float64(_)) => Ok((Value::Float64(*n as f64), r)),
-        (Value::Int64(_), Value::Int64(_)) => Ok((l, r)),
-        _ => Err(ExecutorError::TypeMismatch {
-            expected: "numeric".to_string(),
-            found: format!("{}, {}", value_type_name(left), value_type_name(right)),
-        }),
-    }
-}
-
-/// Widens narrow numeric types to their widest form (Int64 or Float64).
-fn widen_numeric(v: &Value) -> Result<Value, ExecutorError> {
-    match v {
-        Value::Int16(n) => Ok(Value::Int64(*n as i64)),
-        Value::Int32(n) => Ok(Value::Int64(*n as i64)),
-        Value::Int64(_) => Ok(v.clone()),
-        Value::Float32(n) => Ok(Value::Float64(*n as f64)),
-        Value::Float64(_) => Ok(v.clone()),
-        _ => Err(ExecutorError::TypeMismatch {
-            expected: "numeric".to_string(),
-            found: value_type_name(v),
+            found: format!(
+                "{}, {}",
+                left.data_type().map_or("NULL", Type::display_name),
+                right.data_type().map_or("NULL", Type::display_name)
+            ),
         }),
     }
 }
@@ -368,7 +395,11 @@ fn widen_numeric(v: &Value) -> Result<Value, ExecutorError> {
 fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering, ExecutorError> {
     left.partial_cmp(right).ok_or_else(|| ExecutorError::TypeMismatch {
         expected: "comparable types".to_string(),
-        found: format!("{}, {}", value_type_name(left), value_type_name(right)),
+        found: format!(
+            "{}, {}",
+            left.data_type().map_or("NULL", Type::display_name),
+            right.data_type().map_or("NULL", Type::display_name)
+        ),
     })
 }
 
@@ -377,12 +408,17 @@ fn eval_unary_op(op: UnaryOperator, val: &Value) -> Result<Value, ExecutorError>
     if val.is_null() {
         return Ok(Value::Null);
     }
+    let type_name = || {
+        val.data_type()
+            .map_or("NULL", Type::display_name)
+            .to_string()
+    };
     match op {
         UnaryOperator::Not => match val {
             Value::Boolean(b) => Ok(Value::Boolean(!b)),
             _ => Err(ExecutorError::TypeMismatch {
                 expected: "boolean".to_string(),
-                found: value_type_name(val),
+                found: type_name(),
             }),
         },
         UnaryOperator::Minus => match val {
@@ -396,7 +432,7 @@ fn eval_unary_op(op: UnaryOperator, val: &Value) -> Result<Value, ExecutorError>
             Value::Float64(n) => Ok(Value::Float64(-n)),
             _ => Err(ExecutorError::TypeMismatch {
                 expected: "numeric".to_string(),
-                found: value_type_name(val),
+                found: type_name(),
             }),
         },
         UnaryOperator::Plus => match val {
@@ -407,43 +443,9 @@ fn eval_unary_op(op: UnaryOperator, val: &Value) -> Result<Value, ExecutorError>
             | Value::Float64(_) => Ok(val.clone()),
             _ => Err(ExecutorError::TypeMismatch {
                 expected: "numeric".to_string(),
-                found: value_type_name(val),
+                found: type_name(),
             }),
         },
-    }
-}
-
-/// Evaluates a type cast (CAST(expr AS type)).
-///
-/// Delegates to [`Value::cast`] and converts [`CastError`] to
-/// [`ExecutorError`] with detailed error messages.
-fn eval_cast(v: Value, target: &Type) -> Result<Value, ExecutorError> {
-    v.cast(target).map_err(|(original, err)| match err {
-        CastError::Invalid => ExecutorError::InvalidCast {
-            from: match &original {
-                Value::Text(s) => format!("'{}'", s),
-                _ => value_type_name(&original),
-            },
-            to: target.to_string(),
-        },
-        CastError::NumericOutOfRange => ExecutorError::NumericOutOfRange {
-            type_name: target.to_string(),
-        },
-    })
-}
-
-/// Returns a human-readable type name for a value.
-fn value_type_name(v: &Value) -> String {
-    match v {
-        Value::Null => "null".to_string(),
-        Value::Boolean(_) => "boolean".to_string(),
-        Value::Int16(_) => "smallint".to_string(),
-        Value::Int32(_) => "integer".to_string(),
-        Value::Int64(_) => "bigint".to_string(),
-        Value::Float32(_) => "real".to_string(),
-        Value::Float64(_) => "double precision".to_string(),
-        Value::Text(_) => "text".to_string(),
-        Value::Bytea(_) => "bytea".to_string(),
     }
 }
 
