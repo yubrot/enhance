@@ -15,8 +15,9 @@ use super::error::ExecutorError;
 /// An expression tree with column references resolved to positional indices.
 ///
 /// Unlike the AST [`Expr`](crate::sql::Expr), `BoundExpr` replaces
-/// `ColumnRef { table, column }` with `Column { index, name }`, enabling O(1) column
+/// `ColumnRef { table, column }` with `Column { index, name, ty }`, enabling O(1) column
 /// access during evaluation instead of O(n) name matching on every row.
+/// Each variant carries enough information to compute its output [`Type`] via [`BoundExpr::ty()`].
 #[derive(Debug, Clone)]
 pub enum BoundExpr {
     /// NULL literal.
@@ -35,6 +36,8 @@ pub enum BoundExpr {
         index: usize,
         /// Optional resolved column name for display purposes.
         name: Option<String>,
+        /// Output type of the referenced column.
+        ty: Type,
     },
     /// Binary operation.
     BinaryOp {
@@ -90,6 +93,47 @@ pub struct BoundWhenClause {
 }
 
 impl BoundExpr {
+    /// Returns the output type of this expression.
+    ///
+    /// Every variant carries enough structural information to determine
+    /// its output type without consulting external metadata.
+    pub fn ty(&self) -> Type {
+        match self {
+            // NOTE: NULL has no inherent type. Type::Text is a fallback similar to
+            // PostgreSQL's "unknown" type. Callers that need type-aware NULL handling
+            // (e.g., coerce()) should short-circuit on BoundExpr::Null before calling ty().
+            BoundExpr::Null => Type::Text,
+            BoundExpr::Boolean(_) => Type::Bool,
+            BoundExpr::Integer(_) => Type::Bigint,
+            BoundExpr::Float(_) => Type::Double,
+            BoundExpr::String(_) => Type::Text,
+            BoundExpr::Column { ty, .. } => *ty,
+            BoundExpr::BinaryOp { op, left, right } => binary_op_type(*op, left.ty(), right.ty()),
+            BoundExpr::UnaryOp { op, operand } => match op {
+                UnaryOperator::Not => Type::Bool,
+                UnaryOperator::Minus | UnaryOperator::Plus => operand.ty(),
+            },
+            BoundExpr::IsNull { .. }
+            | BoundExpr::InList { .. }
+            | BoundExpr::Between { .. }
+            | BoundExpr::Like { .. } => Type::Bool,
+            BoundExpr::Case {
+                when_clauses,
+                else_result,
+                ..
+            } => {
+                if let Some(clause) = when_clauses.first() {
+                    clause.result.ty()
+                } else if let Some(e) = else_result {
+                    e.ty()
+                } else {
+                    Type::Text
+                }
+            }
+            BoundExpr::Cast { ty, .. } => *ty,
+        }
+    }
+
     /// Wraps this expression in a [`BoundExpr::Cast`] if its type doesn't match
     /// the target type.
     ///
@@ -99,7 +143,7 @@ impl BoundExpr {
         if matches!(&self, BoundExpr::Null) {
             return self;
         }
-        if self.matches_type(target_type) {
+        if self.ty() == target_type {
             return self;
         }
         BoundExpr::Cast {
@@ -107,16 +151,34 @@ impl BoundExpr {
             ty: target_type,
         }
     }
+}
 
-    /// Returns true if this expression is known to already produce `target_type`.
-    fn matches_type(&self, target_type: Type) -> bool {
-        match self {
-            BoundExpr::Cast { ty, .. } => *ty == target_type,
-            BoundExpr::Integer(_) => target_type == Type::Bigint,
-            BoundExpr::Float(_) => target_type == Type::Double,
-            BoundExpr::Boolean(_) => target_type == Type::Bool,
-            BoundExpr::String(_) => target_type == Type::Text,
-            _ => false,
+/// Computes the output type of a binary operation from its operator and operand types.
+fn binary_op_type(op: BinaryOperator, left: Type, right: Type) -> Type {
+    match op {
+        BinaryOperator::Eq
+        | BinaryOperator::Neq
+        | BinaryOperator::Lt
+        | BinaryOperator::LtEq
+        | BinaryOperator::Gt
+        | BinaryOperator::GtEq
+        | BinaryOperator::And
+        | BinaryOperator::Or => Type::Bool,
+        BinaryOperator::Concat => Type::Text,
+        BinaryOperator::Add
+        | BinaryOperator::Sub
+        | BinaryOperator::Mul
+        | BinaryOperator::Div
+        | BinaryOperator::Mod => {
+            let (Some(left), Some(right)) = (left.to_wide_numeric(), right.to_wide_numeric())
+            else {
+                // Non-numeric operand: keep the inferred type and let eval report the error.
+                return left;
+            };
+            match (left, right) {
+                (Type::Bigint, Type::Bigint) => Type::Bigint,
+                _ => Type::Double,
+            }
         }
     }
 }
@@ -137,8 +199,11 @@ impl Expr {
 
             Expr::ColumnRef { table, column } => {
                 let idx = resolve_column_index(table.as_deref(), column, columns)?;
-                let name = Some(columns[idx].display_name());
-                Ok(BoundExpr::Column { index: idx, name })
+                Ok(BoundExpr::Column {
+                    index: idx,
+                    name: Some(columns[idx].display_name()),
+                    ty: columns[idx].ty,
+                })
             }
 
             Expr::BinaryOp { left, op, right } => Ok(BoundExpr::BinaryOp {
@@ -262,7 +327,7 @@ impl fmt::Display for BoundExpr {
             BoundExpr::Integer(n) => write!(f, "{}", n),
             BoundExpr::Float(n) => write!(f, "{}", n),
             BoundExpr::String(s) => write!(f, "'{}'", s),
-            BoundExpr::Column { index, name } => match name {
+            BoundExpr::Column { index, name, .. } => match name {
                 Some(n) => write!(f, "$col{} ({})", index, n),
                 None => write!(f, "$col{}", index),
             },
@@ -337,7 +402,7 @@ impl fmt::Display for BoundExpr {
 ///
 /// Uses case-insensitive matching. Returns [`ExecutorError::AmbiguousColumn`]
 /// if multiple columns match an unqualified name.
-pub(super) fn resolve_column_index(
+fn resolve_column_index(
     table: Option<&str>,
     column: &str,
     columns: &[ColumnDesc],
@@ -487,13 +552,13 @@ mod tests {
         // "name" is unique, should resolve to index 1 with qualified display name
         let bound = bind_expr("name", &columns);
         assert!(
-            matches!(bound, BoundExpr::Column { index: 1, name: Some(ref n) } if n == "users.name")
+            matches!(&bound, BoundExpr::Column { index: 1, name: Some(n), ty: Type::Text } if n == "users.name")
         );
 
         // "user_id" is unique, should resolve to index 3
         let bound = bind_expr("user_id", &columns);
         assert!(
-            matches!(bound, BoundExpr::Column { index: 3, name: Some(ref n) } if n == "orders.user_id")
+            matches!(&bound, BoundExpr::Column { index: 3, name: Some(n), ty: Type::Bigint } if n == "orders.user_id")
         );
     }
 
@@ -513,13 +578,13 @@ mod tests {
         // "users.id" should resolve to index 0
         let bound = bind_expr("users.id", &columns);
         assert!(
-            matches!(bound, BoundExpr::Column { index: 0, name: Some(ref n) } if n == "users.id")
+            matches!(&bound, BoundExpr::Column { index: 0, name: Some(n), ty: Type::Bigint } if n == "users.id")
         );
 
         // "orders.id" should resolve to index 2
         let bound = bind_expr("orders.id", &columns);
         assert!(
-            matches!(bound, BoundExpr::Column { index: 2, name: Some(ref n) } if n == "orders.id")
+            matches!(&bound, BoundExpr::Column { index: 2, name: Some(n), ty: Type::Bigint } if n == "orders.id")
         );
     }
 
