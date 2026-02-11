@@ -1,4 +1,11 @@
-//! Executor nodes implementing the Volcano iterator model.
+//! Query execution runner.
+//!
+//! This module provides the physical execution layer:
+//!
+//! - [`QueryNode`] — Volcano iterator nodes with async `next()`
+//! - [`DmlResult`] — result of executing a [`DmlPlan`]
+//! - [`DmlPlan::execute_dml`] — DML execution entry point
+//! - [`QueryPlan::prepare_for_execute`] — plan-to-executor conversion
 //!
 //! All nodes are generic over [`ExecContext`], which provides storage
 //! operations. This keeps executor logic decoupled from concrete storage types.
@@ -11,11 +18,45 @@ use super::ColumnDesc;
 use super::context::ExecContext;
 use super::error::ExecutorError;
 use super::expr::BoundExpr;
-use super::plan::{DmlPlan, DmlResult, QueryPlan};
+use super::plan::{DmlPlan, QueryPlan};
 use super::row::Row;
 
+/// Result of executing a DML plan.
+///
+/// Each variant corresponds to its DML operation, allowing type-safe
+/// access to operation-specific results (e.g., future extensions like
+/// returning generated IDs for INSERT).
+pub enum DmlResult {
+    /// INSERT completed.
+    Insert {
+        /// Number of rows inserted.
+        count: u64,
+    },
+    /// UPDATE completed.
+    Update {
+        /// Number of rows updated.
+        count: u64,
+    },
+    /// DELETE completed.
+    Delete {
+        /// Number of rows deleted.
+        count: u64,
+    },
+}
+
+impl DmlResult {
+    /// Formats the PostgreSQL-style command completion tag.
+    pub fn command_tag(&self) -> String {
+        match self {
+            DmlResult::Insert { count } => format!("INSERT 0 {count}"),
+            DmlResult::Update { count } => format!("UPDATE {count}"),
+            DmlResult::Delete { count } => format!("DELETE {count}"),
+        }
+    }
+}
+
 /// A query executor node.
-pub enum ExecutorNode<C: ExecContext> {
+pub enum QueryNode<C: ExecContext> {
     /// Sequential heap scan with lazy page loading.
     SeqScan(SeqScan<C>),
     /// Tuple filter (WHERE clause).
@@ -27,11 +68,11 @@ pub enum ExecutorNode<C: ExecContext> {
 }
 
 impl QueryPlan {
-    /// Converts a logical [`QueryPlan`] into a physical [`ExecutorNode`] tree.
+    /// Converts a logical [`QueryPlan`] into a physical [`QueryNode`] tree.
     ///
     /// This is a synchronous function — no I/O happens here. All storage access
-    /// is deferred to [`ExecutorNode::next()`] via the [`ExecContext`].
-    pub fn prepare_for_execute<C: ExecContext>(self, ctx: &C) -> ExecutorNode<C> {
+    /// is deferred to [`QueryNode::next()`] via the [`ExecContext`].
+    pub fn prepare_for_execute<C: ExecContext>(self, ctx: &C) -> QueryNode<C> {
         match self {
             QueryPlan::SeqScan {
                 table_name,
@@ -39,7 +80,7 @@ impl QueryPlan {
                 schema,
                 columns,
                 ..
-            } => ExecutorNode::SeqScan(SeqScan::new(
+            } => QueryNode::SeqScan(SeqScan::new(
                 table_name,
                 columns,
                 ctx.clone(),
@@ -47,18 +88,18 @@ impl QueryPlan {
                 first_page,
             )),
             QueryPlan::Filter { input, predicate } => {
-                ExecutorNode::Filter(Filter::new(input.prepare_for_execute(ctx), predicate))
+                QueryNode::Filter(Filter::new(input.prepare_for_execute(ctx), predicate))
             }
             QueryPlan::Projection {
                 input,
                 exprs,
                 columns,
-            } => ExecutorNode::Projection(Projection::new(
+            } => QueryNode::Projection(Projection::new(
                 input.prepare_for_execute(ctx),
                 exprs,
                 columns,
             )),
-            QueryPlan::ValuesScan => ExecutorNode::ValuesScan(ValuesScan::new()),
+            QueryPlan::ValuesScan => QueryNode::ValuesScan(ValuesScan::new()),
         }
     }
 }
@@ -183,14 +224,14 @@ async fn execute_delete<C: ExecContext>(ctx: &C, input: QueryPlan) -> Result<u64
     Ok(count)
 }
 
-impl<C: ExecContext> ExecutorNode<C> {
+impl<C: ExecContext> QueryNode<C> {
     /// Returns the next tuple, or `None` if exhausted.
     ///
     /// This method follows the Volcano iterator model naming convention,
     /// not `std::iter::Iterator`, because it returns `Result<Option<_>>`.
     ///
     /// Uses `Pin<Box<...>>` to break the recursive future cycle
-    /// (ExecutorNode -> Filter -> ExecutorNode).
+    /// (QueryNode -> Filter -> QueryNode).
     ///
     /// NOTE: Each call heap-allocates a `Box<dyn Future>`. For large scans
     /// (Sort/Aggregate in Step 12), this per-row overhead may be significant.
@@ -204,10 +245,10 @@ impl<C: ExecContext> ExecutorNode<C> {
     > {
         Box::pin(async move {
             match self {
-                ExecutorNode::SeqScan(n) => n.next().await,
-                ExecutorNode::Filter(n) => n.next().await,
-                ExecutorNode::Projection(n) => n.next().await,
-                ExecutorNode::ValuesScan(n) => n.next().await,
+                QueryNode::SeqScan(n) => n.next().await,
+                QueryNode::Filter(n) => n.next().await,
+                QueryNode::Projection(n) => n.next().await,
+                QueryNode::ValuesScan(n) => n.next().await,
             }
         })
     }
@@ -215,10 +256,10 @@ impl<C: ExecContext> ExecutorNode<C> {
     /// Returns the column descriptors for this node's output.
     pub fn columns(&self) -> &[ColumnDesc] {
         match self {
-            ExecutorNode::SeqScan(n) => &n.columns,
-            ExecutorNode::Filter(n) => n.child.columns(),
-            ExecutorNode::Projection(n) => &n.columns,
-            ExecutorNode::ValuesScan(n) => &n.columns,
+            QueryNode::SeqScan(n) => &n.columns,
+            QueryNode::Filter(n) => n.child.columns(),
+            QueryNode::Projection(n) => &n.columns,
+            QueryNode::ValuesScan(n) => &n.columns,
         }
     }
 }
@@ -292,14 +333,14 @@ impl<C: ExecContext> SeqScan<C> {
 /// Filter node that applies a predicate to each tuple from its child.
 pub struct Filter<C: ExecContext> {
     /// Child node to pull tuples from.
-    child: Box<ExecutorNode<C>>,
+    child: Box<QueryNode<C>>,
     /// Bound predicate expression (must evaluate to boolean).
     predicate: BoundExpr,
 }
 
 impl<C: ExecContext> Filter<C> {
     /// Creates a new Filter node.
-    pub fn new(child: ExecutorNode<C>, predicate: BoundExpr) -> Self {
+    pub fn new(child: QueryNode<C>, predicate: BoundExpr) -> Self {
         Self {
             child: Box::new(child),
             predicate,
@@ -326,7 +367,7 @@ impl<C: ExecContext> Filter<C> {
 /// Projection node that evaluates bound expressions to produce output columns.
 pub struct Projection<C: ExecContext> {
     /// Child node to pull tuples from.
-    child: Box<ExecutorNode<C>>,
+    child: Box<QueryNode<C>>,
     /// Bound expressions to evaluate for each output column.
     exprs: Vec<BoundExpr>,
     /// Output column descriptors.
@@ -335,7 +376,7 @@ pub struct Projection<C: ExecContext> {
 
 impl<C: ExecContext> Projection<C> {
     /// Creates a new Projection node.
-    pub fn new(child: ExecutorNode<C>, exprs: Vec<BoundExpr>, columns: Vec<ColumnDesc>) -> Self {
+    pub fn new(child: QueryNode<C>, exprs: Vec<BoundExpr>, columns: Vec<ColumnDesc>) -> Self {
         Self {
             child: Box::new(child),
             exprs,
@@ -516,7 +557,7 @@ mod tests {
     async fn test_seq_scan_lazy_loading() {
         let (db, first_page) = setup_int_table(vec![1, 2, 3]).await;
         let ctx = read_ctx(&db);
-        let mut node = ExecutorNode::SeqScan(SeqScan::new(
+        let mut node = QueryNode::SeqScan(SeqScan::new(
             "test".to_string(),
             vec![int_col("id")],
             ctx,
@@ -544,7 +585,7 @@ mod tests {
     async fn test_filter_predicate() {
         let (db, first_page) = setup_int_table(vec![1, 2, 3, 4]).await;
         let ctx = read_ctx(&db);
-        let scan = ExecutorNode::SeqScan(SeqScan::new(
+        let scan = QueryNode::SeqScan(SeqScan::new(
             "test".to_string(),
             vec![int_col("id")],
             ctx,
@@ -554,7 +595,7 @@ mod tests {
 
         // Filter: id > 2
         let predicate = bind_expr("id > 2", &[int_col("id")]);
-        let mut node = ExecutorNode::Filter(Filter::new(scan, predicate));
+        let mut node = QueryNode::Filter(Filter::new(scan, predicate));
 
         assert_eq!(
             node.next().await.unwrap().unwrap().record.values,
@@ -571,7 +612,7 @@ mod tests {
     async fn test_filter_null_predicate_skips_row() {
         let (db, first_page) = setup_int_table(vec![1, 2, 3]).await;
         let ctx = read_ctx(&db);
-        let scan = ExecutorNode::SeqScan(SeqScan::new(
+        let scan = QueryNode::SeqScan(SeqScan::new(
             "test".to_string(),
             vec![int_col("id")],
             ctx,
@@ -582,7 +623,7 @@ mod tests {
         // Predicate that always evaluates to NULL: id = NULL
         // NULL comparisons return NULL, which Filter must skip (not treat as true)
         let predicate = bind_expr("id = NULL", &[int_col("id")]);
-        let mut node = ExecutorNode::Filter(Filter::new(scan, predicate));
+        let mut node = QueryNode::Filter(Filter::new(scan, predicate));
 
         // All rows should be skipped because NULL is not true
         assert!(node.next().await.unwrap().is_none());
@@ -592,7 +633,7 @@ mod tests {
     async fn test_projection() {
         let (db, first_page) = setup_two_col_table(vec![(1, "alice"), (2, "bob")]).await;
         let ctx = read_ctx(&db);
-        let scan = ExecutorNode::SeqScan(SeqScan::new(
+        let scan = QueryNode::SeqScan(SeqScan::new(
             "test".to_string(),
             vec![
                 int_col("id"),
@@ -614,7 +655,7 @@ mod tests {
             source: None,
             ty: Type::Text,
         }];
-        let mut node = ExecutorNode::Projection(Projection::new(scan, exprs, out_cols));
+        let mut node = QueryNode::Projection(Projection::new(scan, exprs, out_cols));
 
         assert_eq!(
             node.next().await.unwrap().unwrap().record.values,
@@ -629,7 +670,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_values_scan() {
-        let mut node: ExecutorNode<TestCtx> = ExecutorNode::ValuesScan(ValuesScan::new());
+        let mut node: QueryNode<TestCtx> = QueryNode::ValuesScan(ValuesScan::new());
         let tuple = node.next().await.unwrap().unwrap();
         assert!(tuple.record.values.is_empty());
         assert!(tuple.tid.is_none());

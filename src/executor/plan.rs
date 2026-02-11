@@ -3,12 +3,10 @@
 //! Plans describe *what* to execute without loading any data:
 //!
 //! - [`QueryPlan`] — row-producing plans (SELECT, scan sub-plans) converted
-//!   into [`ExecutorNode`](super::node::ExecutorNode) via
+//!   into [`QueryNode`](super::runner::QueryNode) via
 //!   [`QueryPlan::prepare_for_execute`].
 //! - [`DmlPlan`] — data-modifying plans (INSERT/UPDATE/DELETE) executed via
 //!   [`DmlPlan::execute_dml`].
-//! - [`DmlResult`] — result of executing a DML plan, carrying the affected
-//!   row count and formatting the command completion tag.
 
 use crate::datum::Type;
 use crate::storage::PageId;
@@ -18,7 +16,7 @@ use super::expr::BoundExpr;
 
 /// A row-producing logical query plan node.
 ///
-/// Unlike [`ExecutorNode`](super::node::ExecutorNode), a `QueryPlan` contains
+/// Unlike [`QueryNode`](super::runner::QueryNode), a `QueryPlan` contains
 /// no pre-loaded data — only the metadata needed to describe the scan, filter,
 /// and projection operations.
 pub enum QueryPlan {
@@ -96,40 +94,6 @@ pub enum DmlPlan {
         /// Input plan that scans the rows to delete (SeqScan + optional Filter).
         input: Box<QueryPlan>,
     },
-}
-
-/// Result of executing a DML plan.
-///
-/// Each variant corresponds to its DML operation, allowing type-safe
-/// access to operation-specific results (e.g., future extensions like
-/// returning generated IDs for INSERT).
-pub enum DmlResult {
-    /// INSERT completed.
-    Insert {
-        /// Number of rows inserted.
-        count: u64,
-    },
-    /// UPDATE completed.
-    Update {
-        /// Number of rows updated.
-        count: u64,
-    },
-    /// DELETE completed.
-    Delete {
-        /// Number of rows deleted.
-        count: u64,
-    },
-}
-
-impl DmlResult {
-    /// Formats the PostgreSQL-style command completion tag.
-    pub fn command_tag(&self) -> String {
-        match self {
-            DmlResult::Insert { count } => format!("INSERT 0 {count}"),
-            DmlResult::Update { count } => format!("UPDATE {count}"),
-            DmlResult::Delete { count } => format!("DELETE {count}"),
-        }
-    }
 }
 
 impl QueryPlan {
@@ -308,12 +272,5 @@ mod tests {
     #[test]
     fn test_explain_values_scan() {
         assert_eq!(QueryPlan::ValuesScan.explain(), "ValuesScan (1 row)");
-    }
-
-    #[test]
-    fn test_dml_result_command_tag() {
-        assert_eq!(DmlResult::Insert { count: 3 }.command_tag(), "INSERT 0 3");
-        assert_eq!(DmlResult::Update { count: 1 }.command_tag(), "UPDATE 1");
-        assert_eq!(DmlResult::Delete { count: 5 }.command_tag(), "DELETE 5");
     }
 }

@@ -20,7 +20,7 @@
 //!             | prepare_for_execute()         | execute_dml() -> DmlResult
 //!             v                               v
 //! +------------------------+       +------------------------+
-//! |      ExecutorNode      |       |       DmlResult        |
+//! |      QueryNode         |       |       DmlResult        |
 //! |  (lazy page I/O)       |       |  (affected row count)  |
 //! +------------------------+       +------------------------+
 //! ```
@@ -28,9 +28,9 @@
 //! # Components
 //!
 //! - [`QueryPlan`]: Logical query plan for row-producing operations (no data)
+//! - [`QueryNode`]: Physical executor nodes with async `next()` (Volcano model)
 //! - [`DmlPlan`]: Logical plan for data-modifying operations (INSERT/UPDATE/DELETE)
 //! - [`DmlResult`]: Result of executing a DML plan (affected row count + command tag)
-//! - [`ExecutorNode`]: Physical executor nodes with async `next()` (Volcano model)
 //! - [`ExecContext`]: Trait providing catalog/heap/transaction access to executor nodes
 //! - [`Row`]: A single row produced by executor nodes (record + optional physical location)
 //! - [`ColumnDesc`]: Metadata describing a result column (name, type, source table info)
@@ -40,16 +40,16 @@ mod context;
 mod error;
 mod eval;
 mod expr;
-mod node;
 mod plan;
 mod planner;
 mod row;
+mod runner;
 
 pub use column::{ColumnDesc, ColumnSource};
 pub use context::{ExecContext, ExecContextImpl};
 pub use error::ExecutorError;
 pub use expr::BoundExpr;
-pub use node::ExecutorNode;
-pub use plan::{DmlPlan, DmlResult, QueryPlan};
+pub use plan::{DmlPlan, QueryPlan};
 pub use planner::{plan_delete, plan_insert, plan_select, plan_update};
 pub use row::Row;
+pub use runner::{DmlResult, QueryNode};
