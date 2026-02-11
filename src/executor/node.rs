@@ -67,9 +67,7 @@ impl Plan {
             }
         }
     }
-}
 
-impl Plan {
     /// Executes a DML plan (INSERT, UPDATE, DELETE) and returns the affected row count.
     ///
     /// This is the execution entry point for DML statements, in contrast to

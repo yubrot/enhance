@@ -275,36 +275,33 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::DropIndex(_) => Ok(QueryResult::command("DROP INDEX")),
             Statement::Set(_) => Ok(QueryResult::command("SET")),
             Statement::Explain(inner_stmt) => {
-                self.within_transaction(|db, txid, cid| {
-                    let inner_stmt = inner_stmt.clone();
-                    async move {
-                        let snapshot = db.tx_manager().snapshot(txid, cid);
-                        let plan = match inner_stmt.as_ref() {
-                            Statement::Select(select_stmt) => {
-                                executor::plan_select(select_stmt, db.catalog(), &snapshot).await?
-                            }
-                            Statement::Insert(insert_stmt) => {
-                                executor::plan_insert(insert_stmt, db.catalog(), &snapshot).await?
-                            }
-                            Statement::Update(update_stmt) => {
-                                executor::plan_update(update_stmt, db.catalog(), &snapshot).await?
-                            }
-                            Statement::Delete(delete_stmt) => {
-                                executor::plan_delete(delete_stmt, db.catalog(), &snapshot).await?
-                            }
-                            _ => {
-                                return Err(DatabaseError::Executor(
-                                    crate::executor::ExecutorError::Unsupported(
-                                        "EXPLAIN for this statement type".to_string(),
-                                    ),
-                                ));
-                            }
-                        };
-                        Ok(QueryResult::Rows {
-                            columns: vec![ColumnDesc::explain()],
-                            rows: plan.explain().lines().map(Row::explain_line).collect(),
-                        })
-                    }
+                self.within_transaction(|db, txid, cid| async move {
+                    let snapshot = db.tx_manager().snapshot(txid, cid);
+                    let plan = match inner_stmt.as_ref() {
+                        Statement::Select(select_stmt) => {
+                            executor::plan_select(select_stmt, db.catalog(), &snapshot).await?
+                        }
+                        Statement::Insert(insert_stmt) => {
+                            executor::plan_insert(insert_stmt, db.catalog(), &snapshot).await?
+                        }
+                        Statement::Update(update_stmt) => {
+                            executor::plan_update(update_stmt, db.catalog(), &snapshot).await?
+                        }
+                        Statement::Delete(delete_stmt) => {
+                            executor::plan_delete(delete_stmt, db.catalog(), &snapshot).await?
+                        }
+                        _ => {
+                            return Err(DatabaseError::Executor(
+                                crate::executor::ExecutorError::Unsupported(
+                                    "EXPLAIN for this statement type".to_string(),
+                                ),
+                            ));
+                        }
+                    };
+                    Ok(QueryResult::Rows {
+                        columns: vec![ColumnDesc::explain()],
+                        rows: plan.explain().lines().map(Row::explain_line).collect(),
+                    })
                 })
                 .await
             }
