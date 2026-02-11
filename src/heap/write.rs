@@ -45,8 +45,6 @@ pub async fn insert<S: Storage, R: Replacer>(
                 // Check if there's a next page to try
                 match heap_page.next_page() {
                     Some(next_id) => {
-                        // Drop the guard before fetching the next page
-                        drop(heap_page);
                         current_page_id = next_id;
                         continue;
                     }
@@ -124,34 +122,29 @@ pub async fn update<S: Storage, R: Replacer>(
     cid: CommandId,
 ) -> Result<TupleId, HeapError> {
     // Delete the old version and try same-page insert in a single fetch
-    {
-        let mut page = HeapPage::new(pool.fetch_page_mut(old_tid.page_id, true).await?);
+    let mut page = HeapPage::new(pool.fetch_page_mut(old_tid.page_id, true).await?);
 
-        // Set xmax on the old tuple
-        let mut header = page
-            .get_header(old_tid.slot_id)
-            .ok_or(HeapError::SlotNotFound(old_tid.slot_id))?;
-        header.xmax = txid;
-        header.cmax = cid;
-        page.update_header(old_tid.slot_id, header)?;
+    // Set xmax on the old tuple
+    let mut header = page
+        .get_header(old_tid.slot_id)
+        .ok_or(HeapError::SlotNotFound(old_tid.slot_id))?;
+    header.xmax = txid;
+    header.cmax = cid;
+    page.update_header(old_tid.slot_id, header)?;
 
-        // Try to insert the new version on the same page
-        match page.insert(new_record, txid, cid) {
-            Ok(slot_id) => {
-                return Ok(TupleId {
-                    page_id: old_tid.page_id,
-                    slot_id,
-                });
-            }
-            Err(HeapError::PageFull { .. }) => {
-                // Fall through — release the latch and use page-chain insert
-            }
-            Err(other) => return Err(other),
+    // Try to insert the new version on the same page
+    match page.insert(new_record, txid, cid) {
+        Ok(slot_id) => Ok(TupleId {
+            page_id: old_tid.page_id,
+            slot_id,
+        }),
+        Err(HeapError::PageFull { .. }) => {
+            // Same page is full; release the latch and insert via page chain
+            drop(page);
+            insert(pool, first_page, new_record, txid, cid).await
         }
+        Err(other) => Err(other),
     }
-
-    // Same page is full; insert via page chain
-    insert(pool, first_page, new_record, txid, cid).await
 }
 
 #[cfg(test)]
@@ -238,17 +231,44 @@ mod tests {
 
         let txid = tx_manager.begin();
 
-        // Insert and delete at CID 0 (same command can delete what it inserted)
+        // --- Case 1: Insert and delete at the same CID ---
         let record = Record::new(vec![Value::Integer(1)]);
         let tid = insert(&pool, first_page, &record, txid, CommandId::FIRST)
             .await
             .unwrap();
         delete(&pool, tid, txid, CommandId::FIRST).await.unwrap();
 
-        // After delete, CID 1 snapshot should not see the tuple
+        // CID 1 snapshot should not see the tuple (inserted and deleted at CID 0)
         let snapshot1 = tx_manager.snapshot(txid, CommandId::new(1));
         let tuples = collect_all_visible(&pool, first_page, &schema, &snapshot1, &tx_manager).await;
-        assert_eq!(tuples.len(), 0, "deleted tuple should not be visible");
+        assert_eq!(
+            tuples.len(),
+            0,
+            "same-CID insert+delete should not be visible"
+        );
+
+        // --- Case 2: Insert at CID 1, delete at CID 2 ---
+        let record2 = Record::new(vec![Value::Integer(2)]);
+        let tid2 = insert(&pool, first_page, &record2, txid, CommandId::new(1))
+            .await
+            .unwrap();
+        delete(&pool, tid2, txid, CommandId::new(2)).await.unwrap();
+
+        // CID 2 snapshot: tuple was inserted at CID 1 (visible) but deleted at CID 2
+        // (cmax 2 < current_cid 2 is false, so delete is NOT yet visible → tuple visible)
+        let snapshot2 = tx_manager.snapshot(txid, CommandId::new(2));
+        let tuples = collect_all_visible(&pool, first_page, &schema, &snapshot2, &tx_manager).await;
+        assert_eq!(
+            tuples.len(),
+            1,
+            "delete at same CID should not take effect yet"
+        );
+        assert_eq!(tuples[0].1.values[0], Value::Integer(2));
+
+        // CID 3 snapshot: delete at CID 2 is now visible (cmax 2 < 3) → tuple invisible
+        let snapshot3 = tx_manager.snapshot(txid, CommandId::new(3));
+        let tuples = collect_all_visible(&pool, first_page, &schema, &snapshot3, &tx_manager).await;
+        assert_eq!(tuples.len(), 0, "delete should be visible at next CID");
     }
 
     #[tokio::test]
@@ -281,6 +301,13 @@ mod tests {
 
         // New version should be on the same page (same-page priority)
         assert_eq!(new_tid.page_id, old_tid.page_id);
+
+        // CID 1 snapshot: only the old version should be visible (inserted at CID 0
+        // is visible, but update at CID 1 is not yet visible to CID 1)
+        let snapshot1 = tx_manager.snapshot(txid, CommandId::new(1));
+        let tuples = collect_all_visible(&pool, first_page, &schema, &snapshot1, &tx_manager).await;
+        assert_eq!(tuples.len(), 1);
+        assert_eq!(tuples[0].1.values[1], Value::Text("old".into()));
 
         // CID 2 snapshot: only the new version should be visible
         let snapshot2 = tx_manager.snapshot(txid, CommandId::new(2));
@@ -350,38 +377,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_page_chain_integrity() {
-        let pool = create_pool().await;
-        let first_page = create_heap_table(&pool).await;
-
-        let txid = TxId::FROZEN;
-        let cid = CommandId::FIRST;
-
-        // Fill enough records to span 3+ pages
-        let large_text = "y".repeat(3000);
-        for i in 0..10 {
-            let record = Record::new(vec![Value::Integer(i), Value::Text(large_text.clone())]);
-            insert(&pool, first_page, &record, txid, cid).await.unwrap();
-        }
-
-        // Walk the page chain manually and verify linkage
-        let mut page_count = 0;
-        let mut current = Some(first_page);
-        while let Some(pid) = current {
-            page_count += 1;
-            let guard = pool.fetch_page(pid).await.unwrap();
-            let page = HeapPage::new(guard);
-            current = page.next_page();
-        }
-
-        assert!(
-            page_count >= 2,
-            "expected at least 2 pages in chain, got {}",
-            page_count
-        );
-    }
-
-    #[tokio::test]
     async fn test_insert_fills_existing_pages_before_allocating() {
         let pool = create_pool().await;
         let first_page = create_heap_table(&pool).await;
@@ -389,21 +384,35 @@ mod tests {
         let txid = TxId::FROZEN;
         let cid = CommandId::FIRST;
 
-        // Fill the first page
+        // Insert large records that will span multiple pages
         let large_text = "z".repeat(2000);
-        let mut last_on_first = None;
+        let mut tids = Vec::new();
         for i in 0..20 {
             let record = Record::new(vec![Value::Integer(i), Value::Text(large_text.clone())]);
-            let tid = insert(&pool, first_page, &record, txid, cid).await.unwrap();
-            if tid.page_id == first_page {
-                last_on_first = Some(i);
+            tids.push(insert(&pool, first_page, &record, txid, cid).await.unwrap());
+        }
+
+        // Verify that once inserts move to a new page, they never return to the first page.
+        // This confirms pages are filled sequentially before allocating new ones.
+        let mut left_first_page = false;
+        for tid in &tids {
+            if tid.page_id != first_page {
+                left_first_page = true;
+            } else {
+                assert!(
+                    !left_first_page,
+                    "insert returned to first page after allocating a new page"
+                );
             }
         }
 
-        // The first few inserts should have gone to the first page
         assert!(
-            last_on_first.is_some(),
+            tids.iter().any(|t| t.page_id == first_page),
             "at least one insert should go to the first page"
+        );
+        assert!(
+            tids.iter().any(|t| t.page_id != first_page),
+            "at least one insert should overflow to a new page"
         );
     }
 
@@ -541,5 +550,188 @@ mod tests {
             .find(|(_, r)| r.values[0] == Value::Integer(1));
         assert!(updated.is_some(), "updated tuple should be visible");
         assert_eq!(updated.unwrap().1.values[1], Value::Text(large_text));
+    }
+
+    #[tokio::test]
+    async fn test_insert_empty_record() {
+        let pool = create_pool().await;
+        let tx_manager = TransactionManager::new();
+        let first_page = create_heap_table(&pool).await;
+
+        let record = Record::new(vec![]);
+        let tid = insert(&pool, first_page, &record, TxId::FROZEN, CommandId::FIRST)
+            .await
+            .unwrap();
+
+        assert_eq!(tid.page_id, first_page);
+        assert_eq!(tid.slot_id, 0);
+
+        // Verify readable via scan
+        let txid = tx_manager.begin();
+        let snapshot = tx_manager.snapshot(txid, CommandId::FIRST);
+        let schema = [];
+        let tuples = collect_all_visible(&pool, first_page, &schema, &snapshot, &tx_manager).await;
+        assert_eq!(tuples.len(), 1);
+        assert!(tuples[0].1.values.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_on_second_page() {
+        let pool = create_pool().await;
+        let tx_manager = TransactionManager::new();
+        let first_page = create_heap_table(&pool).await;
+        let schema = [Type::Integer, Type::Text];
+
+        let txid = TxId::FROZEN;
+        let cid = CommandId::FIRST;
+
+        // Fill first page and overflow to second page
+        let large_text = "x".repeat(2000);
+        let mut second_page_tid = None;
+        for i in 0..10 {
+            let record = Record::new(vec![Value::Integer(i), Value::Text(large_text.clone())]);
+            let tid = insert(&pool, first_page, &record, txid, cid).await.unwrap();
+            if tid.page_id != first_page && second_page_tid.is_none() {
+                second_page_tid = Some(tid);
+            }
+        }
+        let target_tid = second_page_tid.expect("expected at least one insert on a second page");
+
+        // Delete the tuple on the second page
+        let del_txid = tx_manager.begin();
+        delete(&pool, target_tid, del_txid, CommandId::FIRST)
+            .await
+            .unwrap();
+        tx_manager.commit(del_txid).unwrap();
+
+        // Verify the deleted tuple is no longer visible
+        let scan_txid = tx_manager.begin();
+        let snapshot = tx_manager.snapshot(scan_txid, CommandId::FIRST);
+        let tuples = collect_all_visible(&pool, first_page, &schema, &snapshot, &tx_manager).await;
+        assert!(
+            tuples.iter().all(|(tid, _)| *tid != target_tid),
+            "deleted tuple on second page should not be visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_multiple_tuples() {
+        let pool = create_pool().await;
+        let tx_manager = TransactionManager::new();
+        let first_page = create_heap_table(&pool).await;
+        let schema = [Type::Integer];
+
+        let txid = TxId::FROZEN;
+        let cid = CommandId::FIRST;
+
+        // Insert three tuples
+        let mut tids = Vec::new();
+        for i in 0..3 {
+            let record = Record::new(vec![Value::Integer(i)]);
+            tids.push(insert(&pool, first_page, &record, txid, cid).await.unwrap());
+        }
+
+        // Delete tuples 0 and 2, leaving tuple 1
+        let del_txid = tx_manager.begin();
+        delete(&pool, tids[0], del_txid, CommandId::FIRST)
+            .await
+            .unwrap();
+        delete(&pool, tids[2], del_txid, CommandId::FIRST)
+            .await
+            .unwrap();
+        tx_manager.commit(del_txid).unwrap();
+
+        // Only tuple 1 should be visible
+        let scan_txid = tx_manager.begin();
+        let snapshot = tx_manager.snapshot(scan_txid, CommandId::FIRST);
+        let tuples = collect_all_visible(&pool, first_page, &schema, &snapshot, &tx_manager).await;
+        assert_eq!(tuples.len(), 1);
+        assert_eq!(tuples[0].1.values[0], Value::Integer(1));
+    }
+
+    #[tokio::test]
+    async fn test_update_on_non_first_page() {
+        let pool = create_pool().await;
+        let tx_manager = TransactionManager::new();
+        let first_page = create_heap_table(&pool).await;
+        let schema = [Type::Integer, Type::Text];
+
+        let txid = TxId::FROZEN;
+        let cid = CommandId::FIRST;
+
+        // Fill first page and get a tuple on the second page
+        let large_text = "x".repeat(2000);
+        let mut second_page_tid = None;
+        for i in 0..10 {
+            let record = Record::new(vec![Value::Integer(i), Value::Text(large_text.clone())]);
+            let tid = insert(&pool, first_page, &record, txid, cid).await.unwrap();
+            if tid.page_id != first_page && second_page_tid.is_none() {
+                second_page_tid = Some(tid);
+            }
+        }
+        let old_tid = second_page_tid.expect("expected at least one insert on a second page");
+
+        // Update the tuple on the second page
+        let upd_txid = tx_manager.begin();
+        let new_record = Record::new(vec![Value::Integer(999), Value::Text(large_text)]);
+        let new_tid = update(
+            &pool,
+            first_page,
+            old_tid,
+            &new_record,
+            upd_txid,
+            CommandId::FIRST,
+        )
+        .await
+        .unwrap();
+
+        // New version exists (may be on same or different page)
+        assert_ne!(new_tid, old_tid, "new TupleId should differ from old");
+
+        tx_manager.commit(upd_txid).unwrap();
+
+        // The updated value should be visible, the old value should not
+        let scan_txid = tx_manager.begin();
+        let snapshot = tx_manager.snapshot(scan_txid, CommandId::FIRST);
+        let tuples = collect_all_visible(&pool, first_page, &schema, &snapshot, &tx_manager).await;
+        let updated = tuples
+            .iter()
+            .find(|(_, r)| r.values[0] == Value::Integer(999));
+        assert!(updated.is_some(), "updated tuple should be visible");
+    }
+
+    #[tokio::test]
+    async fn test_update_sequential_same_tuple() {
+        let pool = create_pool().await;
+        let tx_manager = TransactionManager::new();
+        let first_page = create_heap_table(&pool).await;
+        let schema = [Type::Integer];
+
+        let txid = tx_manager.begin();
+
+        // Insert at CID 0
+        let record = Record::new(vec![Value::Integer(1)]);
+        let tid0 = insert(&pool, first_page, &record, txid, CommandId::FIRST)
+            .await
+            .unwrap();
+
+        // Update at CID 1 (old version becomes visible at CID 1, then deleted)
+        let record1 = Record::new(vec![Value::Integer(2)]);
+        let tid1 = update(&pool, first_page, tid0, &record1, txid, CommandId::new(1))
+            .await
+            .unwrap();
+
+        // Update again at CID 2
+        let record2 = Record::new(vec![Value::Integer(3)]);
+        let tid2 = update(&pool, first_page, tid1, &record2, txid, CommandId::new(2))
+            .await
+            .unwrap();
+
+        // CID 3 snapshot should see only the final version
+        let snapshot = tx_manager.snapshot(txid, CommandId::new(3));
+        let tuples = collect_all_visible(&pool, first_page, &schema, &snapshot, &tx_manager).await;
+        assert_eq!(tuples.len(), 1);
+        assert_eq!(tuples[0].0, tid2);
+        assert_eq!(tuples[0].1.values[0], Value::Integer(3));
     }
 }
