@@ -130,15 +130,14 @@ impl<S: Storage, R: Replacer> ExecContext for ExecContextImpl<S, R> {
         first_page: PageId,
         record: &Record,
     ) -> Result<TupleId, ExecutorError> {
-        let tid = insert(
+        Ok(insert(
             &self.pool,
             first_page,
             record,
             self.snapshot.current_txid,
             self.snapshot.current_cid,
         )
-        .await?;
-        Ok(tid)
+        .await?)
     }
 
     async fn delete_tuple(&self, tid: TupleId) -> Result<(), ExecutorError> {
@@ -169,8 +168,7 @@ impl<S: Storage, R: Replacer> ExecContext for ExecContextImpl<S, R> {
     }
 
     async fn nextval(&self, seq_id: u32) -> Result<i64, ExecutorError> {
-        let val = self.catalog.nextval(seq_id).await?;
-        Ok(val)
+        Ok(self.catalog.nextval(seq_id).await?)
     }
 }
 

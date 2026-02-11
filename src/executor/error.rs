@@ -3,7 +3,6 @@
 use crate::catalog::CatalogError;
 use crate::datum::Type;
 use crate::heap::HeapError;
-use crate::storage::BufferPoolError;
 
 /// Errors that can occur during query execution.
 #[derive(Debug)]
@@ -55,9 +54,6 @@ pub enum ExecutorError {
 
     /// Catalog error during table/column lookup.
     Catalog(CatalogError),
-
-    /// Buffer pool error during page access.
-    BufferPool(BufferPoolError),
 
     /// Heap operation error (insert, delete, update).
     Heap(HeapError),
@@ -113,7 +109,6 @@ impl std::fmt::Display for ExecutorError {
             }
             ExecutorError::Unsupported(msg) => write!(f, "unsupported: {}", msg),
             ExecutorError::Catalog(e) => write!(f, "{}", e),
-            ExecutorError::BufferPool(e) => write!(f, "{}", e),
             ExecutorError::Heap(e) => write!(f, "{}", e),
         }
     }
@@ -127,7 +122,6 @@ impl std::error::Error for ExecutorError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ExecutorError::Catalog(e) => Some(e),
-            ExecutorError::BufferPool(e) => Some(e),
             ExecutorError::Heap(e) => Some(e),
             _ => None,
         }
@@ -137,12 +131,6 @@ impl std::error::Error for ExecutorError {
 impl From<CatalogError> for ExecutorError {
     fn from(e: CatalogError) -> Self {
         ExecutorError::Catalog(e)
-    }
-}
-
-impl From<BufferPoolError> for ExecutorError {
-    fn from(e: BufferPoolError) -> Self {
-        ExecutorError::BufferPool(e)
     }
 }
 
