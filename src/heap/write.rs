@@ -1,9 +1,9 @@
-//! Multi-page heap tuple insertion.
+//! Multi-page heap write operations (insert, delete, update).
 //!
-//! [`insert`] walks a heap page chain to find a page with free space,
-//! and allocates new pages when needed. Handles page chain linkage automatically.
+//! These functions operate on a heap page chain identified by its first page,
+//! handling page traversal and allocation automatically.
 //!
-//! Implemented as a free function rather than a struct because insertion is
+//! Implemented as free functions rather than a struct because each operation is
 //! stateless — no cursor position or buffered data needs to be maintained.
 
 use crate::storage::{BufferPool, PageId, Replacer, Storage};
@@ -77,6 +77,81 @@ pub async fn insert<S: Storage, R: Replacer>(
             Err(other) => return Err(other),
         }
     }
+}
+
+/// Deletes a tuple by setting its xmax/cmax (MVCC soft delete).
+///
+/// The tuple remains physically on the page but becomes invisible to
+/// subsequent snapshots once the deleting transaction commits.
+///
+/// NOTE: No xmax conflict check here. If another transaction has already set
+/// xmax, we overwrite it. Row-level locking (Step 20) will add proper
+/// write-write conflict detection via wait-for graph.
+pub async fn delete<S: Storage, R: Replacer>(
+    pool: &BufferPool<S, R>,
+    tid: TupleId,
+    txid: TxId,
+    cid: CommandId,
+) -> Result<(), HeapError> {
+    let mut page = HeapPage::new(pool.fetch_page_mut(tid.page_id, true).await?);
+    let mut header = page
+        .get_header(tid.slot_id)
+        .ok_or(HeapError::SlotNotFound(tid.slot_id))?;
+    header.xmax = txid;
+    header.cmax = cid;
+    page.update_header(tid.slot_id, header)?;
+    Ok(())
+}
+
+/// Updates a tuple (delete old version + insert new version).
+///
+/// Attempts same-page insertion first to avoid unnecessary page chain
+/// traversal. Falls back to [`insert`] on the table's first page if the
+/// same page is full.
+///
+/// Returns the [`TupleId`] of the newly inserted version.
+///
+/// NOTE: This operation is not atomic — if delete succeeds but insert fails
+/// (e.g., storage I/O error), the old version has xmax set with no new version.
+/// The transaction should be aborted in this case, which makes xmax invisible.
+/// WAL (Step 13) will provide proper rollback guarantees.
+pub async fn update<S: Storage, R: Replacer>(
+    pool: &BufferPool<S, R>,
+    first_page: PageId,
+    old_tid: TupleId,
+    new_record: &Record,
+    txid: TxId,
+    cid: CommandId,
+) -> Result<TupleId, HeapError> {
+    // Delete the old version and try same-page insert in a single fetch
+    {
+        let mut page = HeapPage::new(pool.fetch_page_mut(old_tid.page_id, true).await?);
+
+        // Set xmax on the old tuple
+        let mut header = page
+            .get_header(old_tid.slot_id)
+            .ok_or(HeapError::SlotNotFound(old_tid.slot_id))?;
+        header.xmax = txid;
+        header.cmax = cid;
+        page.update_header(old_tid.slot_id, header)?;
+
+        // Try to insert the new version on the same page
+        match page.insert(new_record, txid, cid) {
+            Ok(slot_id) => {
+                return Ok(TupleId {
+                    page_id: old_tid.page_id,
+                    slot_id,
+                });
+            }
+            Err(HeapError::PageFull { .. }) => {
+                // Fall through — release the latch and use page-chain insert
+            }
+            Err(other) => return Err(other),
+        }
+    }
+
+    // Same page is full; insert via page chain
+    insert(pool, first_page, new_record, txid, cid).await
 }
 
 #[cfg(test)]
@@ -240,5 +315,141 @@ mod tests {
             last_on_first.is_some(),
             "at least one insert should go to the first page"
         );
+    }
+
+    #[tokio::test]
+    async fn test_delete_marks_tuple_invisible() {
+        let pool = create_pool().await;
+        let tx_manager = TransactionManager::new();
+        let first_page = create_heap_table(&pool).await;
+
+        let txid = TxId::FROZEN;
+        let cid = CommandId::FIRST;
+        let schema = [Type::Integer];
+
+        // Insert two tuples
+        let record1 = Record::new(vec![Value::Integer(1)]);
+        let record2 = Record::new(vec![Value::Integer(2)]);
+        let tid1 = insert(&pool, first_page, &record1, txid, cid)
+            .await
+            .unwrap();
+        insert(&pool, first_page, &record2, txid, cid)
+            .await
+            .unwrap();
+
+        // Delete the first tuple using a real transaction
+        let del_txid = tx_manager.begin();
+        let del_cid = CommandId::FIRST;
+        delete(&pool, tid1, del_txid, del_cid).await.unwrap();
+        tx_manager.commit(del_txid).unwrap();
+
+        // A new snapshot should see only the second tuple
+        let scan_txid = tx_manager.begin();
+        let snapshot = tx_manager.snapshot(scan_txid, CommandId::FIRST);
+        let tuples = collect_all_visible(&pool, first_page, &schema, &snapshot, &tx_manager).await;
+        assert_eq!(tuples.len(), 1);
+        assert_eq!(tuples[0].1.values[0], Value::Integer(2));
+    }
+
+    #[tokio::test]
+    async fn test_delete_nonexistent_slot() {
+        let pool = create_pool().await;
+        let first_page = create_heap_table(&pool).await;
+
+        let tid = TupleId {
+            page_id: first_page,
+            slot_id: 99,
+        };
+        let result = delete(&pool, tid, TxId::FROZEN, CommandId::FIRST).await;
+        assert!(
+            matches!(result, Err(HeapError::SlotNotFound(99))),
+            "expected SlotNotFound, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_same_page() {
+        let pool = create_pool().await;
+        let tx_manager = TransactionManager::new();
+        let first_page = create_heap_table(&pool).await;
+
+        let txid = TxId::FROZEN;
+        let cid = CommandId::FIRST;
+        let schema = [Type::Integer, Type::Text];
+
+        // Insert a tuple
+        let record = Record::new(vec![Value::Integer(1), Value::Text("old".into())]);
+        let old_tid = insert(&pool, first_page, &record, txid, cid).await.unwrap();
+
+        // Update using a real transaction
+        let upd_txid = tx_manager.begin();
+        let upd_cid = CommandId::FIRST;
+        let new_record = Record::new(vec![Value::Integer(1), Value::Text("new".into())]);
+        let new_tid = update(&pool, first_page, old_tid, &new_record, upd_txid, upd_cid)
+            .await
+            .unwrap();
+
+        // New version should be on the same page
+        assert_eq!(new_tid.page_id, old_tid.page_id);
+
+        tx_manager.commit(upd_txid).unwrap();
+
+        // A new snapshot should see only the new version
+        let scan_txid = tx_manager.begin();
+        let snapshot = tx_manager.snapshot(scan_txid, CommandId::FIRST);
+        let tuples = collect_all_visible(&pool, first_page, &schema, &snapshot, &tx_manager).await;
+        assert_eq!(tuples.len(), 1);
+        assert_eq!(tuples[0].1.values[1], Value::Text("new".into()));
+    }
+
+    #[tokio::test]
+    async fn test_update_cross_page_fallback() {
+        let pool = create_pool().await;
+        let tx_manager = TransactionManager::new();
+        let first_page = create_heap_table(&pool).await;
+
+        let txid = TxId::FROZEN;
+        let cid = CommandId::FIRST;
+
+        // Insert a small tuple first
+        let record = Record::new(vec![Value::Integer(1), Value::Text("small".into())]);
+        let old_tid = insert(&pool, first_page, &record, txid, cid).await.unwrap();
+
+        // Fill the page with large tuples so there's no room for the updated version
+        let large_text = "x".repeat(2000);
+        for i in 2..20 {
+            let record = Record::new(vec![Value::Integer(i), Value::Text(large_text.clone())]);
+            insert(&pool, first_page, &record, txid, cid).await.unwrap();
+        }
+
+        // Update the first tuple with a large value — should fall back to another page
+        let upd_txid = tx_manager.begin();
+        let upd_cid = CommandId::FIRST;
+        let new_record = Record::new(vec![Value::Integer(1), Value::Text(large_text.clone())]);
+        let new_tid = update(&pool, first_page, old_tid, &new_record, upd_txid, upd_cid)
+            .await
+            .unwrap();
+
+        // New version should be on a different page (cross-page fallback)
+        assert_ne!(
+            new_tid.page_id, old_tid.page_id,
+            "expected cross-page fallback, but new tuple is on the same page"
+        );
+
+        tx_manager.commit(upd_txid).unwrap();
+
+        // Scan should see all tuples: the updated one + the filler tuples
+        let scan_txid = tx_manager.begin();
+        let snapshot = tx_manager.snapshot(scan_txid, CommandId::FIRST);
+        let schema = [Type::Integer, Type::Text];
+        let tuples = collect_all_visible(&pool, first_page, &schema, &snapshot, &tx_manager).await;
+
+        // The old version (id=1, "small") should be gone; new version (id=1, large) should be present
+        let updated = tuples
+            .iter()
+            .find(|(_, r)| r.values[0] == Value::Integer(1));
+        assert!(updated.is_some(), "updated tuple should be visible");
+        assert_eq!(updated.unwrap().1.values[1], Value::Text(large_text));
     }
 }

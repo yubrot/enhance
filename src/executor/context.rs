@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::catalog::Catalog;
 use crate::datum::Type;
-use crate::heap::{HeapPage, Record, TupleId, insert, scan_visible_page};
+use crate::heap::{Record, TupleId, delete, insert, scan_visible_page, update};
 use crate::storage::{BufferPool, PageId, Replacer, Storage};
 use crate::tx::{Snapshot, TransactionManager};
 
@@ -22,10 +22,6 @@ type ScanPageResult = Result<(Vec<(TupleId, Record)>, Option<PageId>), ExecutorE
 /// Implementations are `Clone` so each node can own its own copy.
 /// Methods take `&self` because all mutable state (scan position, buffer) is
 /// managed by the nodes themselves.
-///
-/// The `Catalog` dependency in `ExecContextImpl` exists solely for `nextval`.
-/// NOTE: A future refactor could extract sequence access into a dedicated
-/// trait, removing the `Catalog` dependency from the execution context.
 pub trait ExecContext: Send + Clone {
     /// Scans a single heap page and returns all visible tuples.
     ///
@@ -82,12 +78,13 @@ pub trait ExecContext: Send + Clone {
 pub struct ExecContextImpl<S: Storage, R: Replacer> {
     pool: Arc<BufferPool<S, R>>,
     tx_manager: Arc<TransactionManager>,
+    // NOTE: The `Catalog` dependency in `ExecContextImpl` exists solely for `nextval`.
+    // A future refactor could extract sequence access into a dedicated trait, removing
+    // the `Catalog` dependency from the execution context.
     catalog: Catalog<S, R>,
     snapshot: Snapshot,
 }
 
-// Manual Clone impl to avoid requiring S: Clone + R: Clone
-// (only Arc, Catalog, and Snapshot are cloned).
 impl<S: Storage, R: Replacer> Clone for ExecContextImpl<S, R> {
     fn clone(&self) -> Self {
         Self {
@@ -145,56 +142,30 @@ impl<S: Storage, R: Replacer> ExecContext for ExecContextImpl<S, R> {
     }
 
     async fn delete_tuple(&self, tid: TupleId) -> Result<(), ExecutorError> {
-        let mut page = HeapPage::new(self.pool.fetch_page_mut(tid.page_id, true).await?);
-        let mut header = page
-            .get_header(tid.slot_id)
-            .ok_or(crate::heap::HeapError::SlotNotFound(tid.slot_id))?;
-        // NOTE: No xmax conflict check here. If another transaction has already set
-        // xmax, we overwrite it. Row-level locking (Step 20) will add proper
-        // write-write conflict detection via wait-for graph.
-        header.xmax = self.snapshot.current_txid;
-        header.cmax = self.snapshot.current_cid;
-        page.update_header(tid.slot_id, header)?;
-        Ok(())
+        Ok(delete(
+            &self.pool,
+            tid,
+            self.snapshot.current_txid,
+            self.snapshot.current_cid,
+        )
+        .await?)
     }
 
-    // NOTE: update_tuple is not atomic — if delete succeeds but insert fails
-    // (e.g., storage I/O error), the old version has xmax set with no new version.
-    // The transaction should be aborted in this case, which makes xmax invisible.
-    // WAL (Step 13) will provide proper rollback guarantees.
     async fn update_tuple(
         &self,
         first_page: PageId,
         old_tid: TupleId,
         new_record: &Record,
     ) -> Result<TupleId, ExecutorError> {
-        // Delete the old version
-        self.delete_tuple(old_tid).await?;
-
-        // Try same-page insert first
-        {
-            let mut page = HeapPage::new(self.pool.fetch_page_mut(old_tid.page_id, true).await?);
-            match page.insert(
-                new_record,
-                self.snapshot.current_txid,
-                self.snapshot.current_cid,
-            ) {
-                Ok(slot_id) => {
-                    return Ok(TupleId {
-                        page_id: old_tid.page_id,
-                        slot_id,
-                    });
-                }
-                Err(crate::heap::HeapError::PageFull { .. }) => {
-                    // Fall through to table-wide insert
-                }
-                Err(other) => return Err(other.into()),
-            }
-        }
-
-        // Same page is full; insert via page chain
-        let tid = self.insert_tuple(first_page, new_record).await?;
-        Ok(tid)
+        Ok(update(
+            &self.pool,
+            first_page,
+            old_tid,
+            new_record,
+            self.snapshot.current_txid,
+            self.snapshot.current_cid,
+        )
+        .await?)
     }
 
     async fn nextval(&self, seq_id: u32) -> Result<i64, ExecutorError> {

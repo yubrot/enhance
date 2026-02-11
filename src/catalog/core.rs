@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 use super::error::CatalogError;
 use super::schema::{ColumnInfo, SequenceInfo, SystemCatalogTable, TableInfo};
 use super::superblock::Superblock;
-use crate::heap::{HeapPage, insert, scan_visible_page};
+use crate::heap::{HeapPage, Record, insert, scan_visible_page};
 use crate::sql::{CreateTableStmt, DataType};
 use crate::storage::{BufferPool, PageId, Replacer, Storage};
 use crate::tx::{CommandId, Snapshot, TransactionManager, TxId};
@@ -107,41 +107,27 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         let cid = CommandId::FIRST;
 
         // Insert catalog table metadata into sys_tables
-        {
-            let mut page = HeapPage::new(pool.fetch_page_mut(sys_tables_page, true).await?);
-
-            // sys_tables entry
-            let table_info = TableInfo::table_info(sys_tables_page);
-            page.insert(&table_info.to_record(), txid, cid)?;
-
-            // sys_columns entry
-            let table_info = ColumnInfo::table_info(sys_columns_page);
-            page.insert(&table_info.to_record(), txid, cid)?;
-
-            // sys_sequences entry
-            let table_info = SequenceInfo::table_info(sys_sequences_page);
-            page.insert(&table_info.to_record(), txid, cid)?;
+        let catalog_tables: [Record; 3] = [
+            TableInfo::table_info(sys_tables_page).to_record(),
+            ColumnInfo::table_info(sys_columns_page).to_record(),
+            SequenceInfo::table_info(sys_sequences_page).to_record(),
+        ];
+        for record in &catalog_tables {
+            insert(&pool, sys_tables_page, record, txid, cid).await?;
         }
 
         // Insert column metadata into sys_columns
-        {
-            let mut page = HeapPage::new(pool.fetch_page_mut(sys_columns_page, true).await?);
-
-            for (i, (name, oid)) in TableInfo::columns().into_iter().enumerate() {
-                let col = ColumnInfo::new(TableInfo::TABLE_ID, i as u32, name.to_string(), oid, 0);
-                page.insert(&col.to_record(), txid, cid)?;
-            }
-
-            for (i, (name, oid)) in ColumnInfo::columns().into_iter().enumerate() {
-                let col = ColumnInfo::new(ColumnInfo::TABLE_ID, i as u32, name.to_string(), oid, 0);
-                page.insert(&col.to_record(), txid, cid)?;
-            }
-
-            for (i, (name, oid)) in SequenceInfo::columns().into_iter().enumerate() {
-                let col =
-                    ColumnInfo::new(SequenceInfo::TABLE_ID, i as u32, name.to_string(), oid, 0);
-                page.insert(&col.to_record(), txid, cid)?;
-            }
+        for (i, (name, oid)) in TableInfo::columns().into_iter().enumerate() {
+            let col = ColumnInfo::new(TableInfo::TABLE_ID, i as u32, name.to_string(), oid, 0);
+            insert(&pool, sys_columns_page, &col.to_record(), txid, cid).await?;
+        }
+        for (i, (name, oid)) in ColumnInfo::columns().into_iter().enumerate() {
+            let col = ColumnInfo::new(ColumnInfo::TABLE_ID, i as u32, name.to_string(), oid, 0);
+            insert(&pool, sys_columns_page, &col.to_record(), txid, cid).await?;
+        }
+        for (i, (name, oid)) in SequenceInfo::columns().into_iter().enumerate() {
+            let col = ColumnInfo::new(SequenceInfo::TABLE_ID, i as u32, name.to_string(), oid, 0);
+            insert(&pool, sys_columns_page, &col.to_record(), txid, cid).await?;
         }
 
         pool.flush_all().await?;
