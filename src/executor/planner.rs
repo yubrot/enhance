@@ -5,14 +5,13 @@ use std::collections::HashSet;
 use crate::catalog::{Catalog, ColumnInfo};
 use crate::datum::Type;
 use crate::sql::{
-    BinaryOperator, DeleteStmt, Expr, FromClause, InsertStmt, SelectItem, SelectStmt, TableRef,
-    UpdateStmt,
+    DeleteStmt, Expr, FromClause, InsertStmt, SelectItem, SelectStmt, TableRef, UpdateStmt,
 };
 use crate::storage::{Replacer, Storage};
 use crate::tx::Snapshot;
 
 use super::error::ExecutorError;
-use super::expr::{BoundExpr, resolve_column_index};
+use super::expr::BoundExpr;
 use super::plan::{DmlPlan, QueryPlan};
 use super::{ColumnDesc, ColumnSource};
 
@@ -211,6 +210,7 @@ pub async fn plan_update<S: Storage, R: Replacer>(
         .map(|i| BoundExpr::Column {
             index: i,
             name: Some(column_infos[i].column_name.clone()),
+            ty: column_infos[i].ty,
         })
         .collect();
 
@@ -438,8 +438,16 @@ fn resolve_select_item(
         }
         SelectItem::Expr { expr, alias } => {
             let bound = expr.bind(input_columns)?;
-            let desc = infer_column_desc(expr, alias.as_deref(), input_columns);
-            Ok(vec![(bound, desc)])
+            let ty = bound.ty();
+            let alias_name = alias.as_deref().map(str::to_string);
+            let (name, source) = match &bound {
+                BoundExpr::Column { index, .. } => {
+                    let ColumnDesc { name, source, .. } = &input_columns[*index];
+                    (alias_name.unwrap_or_else(|| name.clone()), source.clone())
+                }
+                _ => (alias_name.unwrap_or_else(|| "?column?".to_string()), None),
+            };
+            Ok(vec![(bound, ColumnDesc { name, source, ty })])
         }
     }
 }
@@ -465,110 +473,11 @@ fn expand_columns(
             let expr = BoundExpr::Column {
                 index: i,
                 name: Some(col.name.clone()),
+                ty: col.ty,
             };
             (expr, col.clone())
         })
         .collect()
-}
-
-/// Infers the output [`ColumnDesc`] for an expression.
-///
-/// For column references, looks up the full metadata (including source table info)
-/// from the input columns. For other expressions, infers name and type heuristically
-/// with no source table info.
-fn infer_column_desc(expr: &Expr, alias: Option<&str>, input_columns: &[ColumnDesc]) -> ColumnDesc {
-    let mut desc = match expr {
-        Expr::ColumnRef { table, column } => {
-            match resolve_column_index(table.as_deref(), column, input_columns) {
-                Ok(i) => input_columns[i].clone(),
-                Err(_) => ColumnDesc {
-                    name: column.clone(),
-                    source: None,
-                    ty: Type::Text,
-                },
-            }
-        }
-        Expr::Function { name, .. } => ColumnDesc {
-            name: name.clone(),
-            source: None,
-            ty: infer_type(expr, input_columns),
-        },
-        Expr::Cast { data_type, .. } => ColumnDesc {
-            name: data_type.display_name().to_lowercase(),
-            source: None,
-            ty: infer_type(expr, input_columns),
-        },
-        _ => ColumnDesc {
-            name: "?column?".to_string(),
-            source: None,
-            ty: infer_type(expr, input_columns),
-        },
-    };
-
-    if let Some(alias) = alias {
-        desc.name = alias.to_string();
-    }
-
-    desc
-}
-
-/// Infers the output type from an expression.
-///
-/// For column references, uses the known column type. For arithmetic
-/// operations, applies [`numeric_promotion`] to both operands so that the
-/// inferred type matches the runtime evaluation result.
-fn infer_type(expr: &Expr, columns: &[ColumnDesc]) -> Type {
-    match expr {
-        Expr::ColumnRef { table, column } => {
-            match resolve_column_index(table.as_deref(), column, columns) {
-                Ok(i) => columns[i].ty,
-                Err(_) => Type::Text,
-            }
-        }
-        Expr::Integer(_) => Type::Bigint,
-        Expr::Float(_) => Type::Double,
-        Expr::Boolean(_) => Type::Bool,
-        Expr::String(_) => Type::Text,
-        Expr::Null => Type::Text,
-        Expr::BinaryOp { op, left, right } => match op {
-            BinaryOperator::Eq
-            | BinaryOperator::Neq
-            | BinaryOperator::Lt
-            | BinaryOperator::LtEq
-            | BinaryOperator::Gt
-            | BinaryOperator::GtEq
-            | BinaryOperator::And
-            | BinaryOperator::Or => Type::Bool,
-            BinaryOperator::Concat => Type::Text,
-            BinaryOperator::Add
-            | BinaryOperator::Sub
-            | BinaryOperator::Mul
-            | BinaryOperator::Div
-            | BinaryOperator::Mod => {
-                infer_arithmetic_type(infer_type(left, columns), infer_type(right, columns))
-            }
-        },
-        Expr::UnaryOp { operand, .. } => infer_type(operand, columns),
-        Expr::IsNull { .. } | Expr::InList { .. } | Expr::Between { .. } | Expr::Like { .. } => {
-            Type::Bool
-        }
-        Expr::Cast { data_type, .. } => data_type.to_type(),
-        // NOTE: Unrecognized expressions fall back to Text, similar to PostgreSQL's
-        // "unknown" type. This may cause issues in Step 11 (DML) where INSERT needs
-        // accurate type inference for literal values to match target column types.
-        _ => Type::Text,
-    }
-}
-
-fn infer_arithmetic_type(left: Type, right: Type) -> Type {
-    let (Some(left), Some(right)) = (left.to_wide_numeric(), right.to_wide_numeric()) else {
-        // Non-numeric operand: keep the inferred type and let eval report the error.
-        return left;
-    };
-    match (left, right) {
-        (Type::Bigint, Type::Bigint) => Type::Bigint,
-        _ => Type::Double,
-    }
 }
 
 #[cfg(test)]
