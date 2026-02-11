@@ -1,6 +1,6 @@
 //! Multi-page heap tuple insertion.
 //!
-//! [`heap_insert`] walks a heap page chain to find a page with free space,
+//! [`insert`] walks a heap page chain to find a page with free space,
 //! and allocates new pages when needed. Handles page chain linkage automatically.
 //!
 //! Implemented as a free function rather than a struct because insertion is
@@ -9,10 +9,10 @@
 use crate::storage::{BufferPool, PageId, Replacer, Storage};
 use crate::tx::{CommandId, TxId};
 
+use super::TupleId;
 use super::error::HeapError;
 use super::page::HeapPage;
 use super::record::Record;
-use super::TupleId;
 
 /// Inserts a tuple into a heap table, extending the page chain if needed.
 ///
@@ -20,7 +20,7 @@ use super::TupleId;
 /// If all existing pages are full, allocates a new page at the end of the chain.
 ///
 /// Returns the [`TupleId`] of the inserted tuple.
-pub async fn heap_insert<S: Storage, R: Replacer>(
+pub async fn insert<S: Storage, R: Replacer>(
     pool: &BufferPool<S, R>,
     first_page: PageId,
     record: &Record,
@@ -83,8 +83,9 @@ pub async fn heap_insert<S: Storage, R: Replacer>(
 mod tests {
     use super::*;
     use crate::datum::{Type, Value};
-    use crate::heap::HeapScanner;
+    use crate::heap::scan_visible_page;
     use crate::storage::{BufferPool, LruReplacer, MemoryStorage};
+    use crate::tx::TransactionManager;
     use std::sync::Arc;
 
     async fn create_pool() -> Arc<BufferPool<MemoryStorage, LruReplacer>> {
@@ -95,22 +96,42 @@ mod tests {
         ))
     }
 
-    async fn create_heap_table(
-        pool: &BufferPool<MemoryStorage, LruReplacer>,
-    ) -> PageId {
+    async fn create_heap_table(pool: &BufferPool<MemoryStorage, LruReplacer>) -> PageId {
         let guard = pool.new_page().await.unwrap();
         let page_id = guard.page_id();
         HeapPage::new(guard).init();
         page_id
     }
 
+    /// Collects all visible tuples from a heap page chain using scan_visible_page.
+    async fn collect_all_visible(
+        pool: &BufferPool<MemoryStorage, LruReplacer>,
+        first_page: PageId,
+        schema: &[Type],
+        snapshot: &crate::tx::Snapshot,
+        tx_manager: &TransactionManager,
+    ) -> Vec<(super::TupleId, Record)> {
+        let mut all = Vec::new();
+        let mut current_page = Some(first_page);
+        while let Some(page_id) = current_page {
+            let (tuples, next_page) =
+                scan_visible_page(pool, page_id, schema, snapshot, tx_manager)
+                    .await
+                    .unwrap();
+            all.extend(tuples);
+            current_page = next_page;
+        }
+        all
+    }
+
     #[tokio::test]
     async fn test_insert_into_empty_page() {
         let pool = create_pool().await;
+        let tx_manager = TransactionManager::new();
         let first_page = create_heap_table(&pool).await;
 
         let record = Record::new(vec![Value::Integer(42)]);
-        let tid = heap_insert(&pool, first_page, &record, TxId::FROZEN, CommandId::FIRST)
+        let tid = insert(&pool, first_page, &record, TxId::FROZEN, CommandId::FIRST)
             .await
             .unwrap();
 
@@ -118,16 +139,18 @@ mod tests {
         assert_eq!(tid.slot_id, 0);
 
         // Verify the record is readable
+        let txid = tx_manager.begin();
+        let snapshot = tx_manager.snapshot(txid, CommandId::FIRST);
         let schema = [Type::Integer];
-        let mut scanner = HeapScanner::new(&pool, &schema, first_page);
-        let tuples = scanner.collect_all().await.unwrap();
+        let tuples = collect_all_visible(&pool, first_page, &schema, &snapshot, &tx_manager).await;
         assert_eq!(tuples.len(), 1);
-        assert_eq!(tuples[0].3.values, vec![Value::Integer(42)]);
+        assert_eq!(tuples[0].1.values, vec![Value::Integer(42)]);
     }
 
     #[tokio::test]
     async fn test_insert_triggers_new_page_allocation() {
         let pool = create_pool().await;
+        let tx_manager = TransactionManager::new();
         let first_page = create_heap_table(&pool).await;
 
         let txid = TxId::FROZEN;
@@ -138,13 +161,8 @@ mod tests {
         let large_text = "x".repeat(2000);
         let mut tids = Vec::new();
         for i in 0..10 {
-            let record = Record::new(vec![
-                Value::Integer(i),
-                Value::Text(large_text.clone()),
-            ]);
-            let tid = heap_insert(&pool, first_page, &record, txid, cid)
-                .await
-                .unwrap();
+            let record = Record::new(vec![Value::Integer(i), Value::Text(large_text.clone())]);
+            let tid = insert(&pool, first_page, &record, txid, cid).await.unwrap();
             tids.push(tid);
         }
 
@@ -155,13 +173,14 @@ mod tests {
             "expected at least one insert to trigger a new page allocation"
         );
 
-        // Verify all records are readable via scanner
+        // Verify all records are readable via scan
+        let tx = tx_manager.begin();
+        let snapshot = tx_manager.snapshot(tx, CommandId::FIRST);
         let schema = [Type::Integer, Type::Text];
-        let mut scanner = HeapScanner::new(&pool, &schema, first_page);
-        let tuples = scanner.collect_all().await.unwrap();
+        let tuples = collect_all_visible(&pool, first_page, &schema, &snapshot, &tx_manager).await;
         assert_eq!(tuples.len(), 10);
         for (i, tuple) in tuples.iter().enumerate() {
-            assert_eq!(tuple.3.values[0], Value::Integer(i as i32));
+            assert_eq!(tuple.1.values[0], Value::Integer(i as i32));
         }
     }
 
@@ -176,13 +195,8 @@ mod tests {
         // Fill enough records to span 3+ pages
         let large_text = "y".repeat(3000);
         for i in 0..10 {
-            let record = Record::new(vec![
-                Value::Integer(i),
-                Value::Text(large_text.clone()),
-            ]);
-            heap_insert(&pool, first_page, &record, txid, cid)
-                .await
-                .unwrap();
+            let record = Record::new(vec![Value::Integer(i), Value::Text(large_text.clone())]);
+            insert(&pool, first_page, &record, txid, cid).await.unwrap();
         }
 
         // Walk the page chain manually and verify linkage
@@ -215,9 +229,7 @@ mod tests {
         let mut last_on_first = None;
         for i in 0..20 {
             let record = Record::new(vec![Value::Integer(i), Value::Text(large_text.clone())]);
-            let tid = heap_insert(&pool, first_page, &record, txid, cid)
-                .await
-                .unwrap();
+            let tid = insert(&pool, first_page, &record, txid, cid).await.unwrap();
             if tid.page_id == first_page {
                 last_on_first = Some(i);
             }

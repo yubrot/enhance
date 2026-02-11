@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 use super::error::CatalogError;
 use super::schema::{ColumnInfo, SequenceInfo, SystemCatalogTable, TableInfo};
 use super::superblock::Superblock;
-use crate::heap::{HeapPage, HeapScanner, heap_insert};
+use crate::heap::{HeapPage, insert, scan_visible_page};
 use crate::sql::{CreateTableStmt, DataType};
 use crate::storage::{BufferPool, PageId, Replacer, Storage};
 use crate::tx::{CommandId, Snapshot, TransactionManager, TxId};
@@ -197,14 +197,20 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         name: &str,
     ) -> Result<Option<TableInfo>, CatalogError> {
         let sys_tables_page = self.superblock.read().sys_tables_page;
-        let mut scanner = HeapScanner::new(&self.pool, TableInfo::SCHEMA, sys_tables_page);
+        let mut current_page = Some(sys_tables_page);
 
-        while let Some(page_tuples) = scanner.next_page().await? {
-            for (_page_id, _slot_id, header, record) in page_tuples {
-                if !snapshot.is_tuple_visible(&header, &self.tx_manager) {
-                    continue;
-                }
+        while let Some(page_id) = current_page {
+            let (tuples, next_page) = scan_visible_page(
+                &self.pool,
+                page_id,
+                TableInfo::SCHEMA,
+                snapshot,
+                &self.tx_manager,
+            )
+            .await?;
+            current_page = next_page;
 
+            for (_tid, record) in tuples {
                 let Some(info) = TableInfo::from_record(&record) else {
                     // NOTE: from_record() returns None when deserialization fails, indicating
                     // possible data corruption. For learning purposes, we silently skip.
@@ -233,15 +239,21 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         table_id: u32,
     ) -> Result<Vec<ColumnInfo>, CatalogError> {
         let sys_columns_page = self.superblock.read().sys_columns_page;
-        let mut scanner = HeapScanner::new(&self.pool, ColumnInfo::SCHEMA, sys_columns_page);
+        let mut current_page = Some(sys_columns_page);
 
         let mut columns = Vec::new();
-        while let Some(page_tuples) = scanner.next_page().await? {
-            for (_page_id, _slot_id, header, record) in page_tuples {
-                if !snapshot.is_tuple_visible(&header, &self.tx_manager) {
-                    continue;
-                }
+        while let Some(page_id) = current_page {
+            let (tuples, next_page) = scan_visible_page(
+                &self.pool,
+                page_id,
+                ColumnInfo::SCHEMA,
+                snapshot,
+                &self.tx_manager,
+            )
+            .await?;
+            current_page = next_page;
 
+            for (_tid, record) in tuples {
                 let Some(col) = ColumnInfo::from_record(&record) else {
                     // NOTE: Silently skipping corrupted records. See get_table() for details.
                     continue;
@@ -271,7 +283,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         first_page: PageId,
     ) -> Result<(), CatalogError> {
         let sys_tables_page = self.superblock.read().sys_tables_page;
-        heap_insert(
+        insert(
             &self.pool,
             sys_tables_page,
             &TableInfo::new(table_id, name.to_string(), first_page).to_record(),
@@ -290,7 +302,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         col: &ColumnInfo,
     ) -> Result<(), CatalogError> {
         let sys_columns_page = self.superblock.read().sys_columns_page;
-        heap_insert(&self.pool, sys_columns_page, &col.to_record(), txid, cid).await?;
+        insert(&self.pool, sys_columns_page, &col.to_record(), txid, cid).await?;
         Ok(())
     }
 
@@ -383,7 +395,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         let seq = SequenceInfo::new(seq_id, name.to_string(), 1); // Start at 1
 
         let sys_sequences_page = self.superblock.read().sys_sequences_page;
-        heap_insert(&self.pool, sys_sequences_page, &seq.to_record(), txid, cid).await?;
+        insert(&self.pool, sys_sequences_page, &seq.to_record(), txid, cid).await?;
         Ok(seq_id)
     }
 

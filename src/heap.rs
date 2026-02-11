@@ -18,14 +18,14 @@
 mod error;
 mod page;
 mod record;
-mod scanner;
-mod writer;
+mod scan;
+mod write;
 
 pub use error::HeapError;
 pub use page::{HeapPage, MAX_RECORD_SIZE, SlotId};
 pub use record::Record;
-pub use scanner::HeapScanner;
-pub use writer::heap_insert;
+pub use scan::scan_visible_page;
+pub use write::insert;
 
 /// Physical location of a tuple within the heap storage.
 ///

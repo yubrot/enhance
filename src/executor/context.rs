@@ -8,35 +8,38 @@ use std::sync::Arc;
 
 use crate::catalog::Catalog;
 use crate::datum::Type;
-use crate::heap::{HeapPage, Record, TupleId, heap_insert};
+use crate::heap::{HeapPage, Record, TupleId, insert, scan_visible_page};
 use crate::storage::{BufferPool, PageId, Replacer, Storage};
 use crate::tx::{Snapshot, TransactionManager};
 
 use super::error::ExecutorError;
-use super::row::Row;
+
+/// Result of scanning a single heap page: visible tuples and the next page link.
+type ScanPageResult = Result<(Vec<(TupleId, Record)>, Option<PageId>), ExecutorError>;
 
 /// Execution context providing storage operations to executor nodes.
 ///
 /// Implementations are `Clone` so each node can own its own copy.
 /// Methods take `&self` because all mutable state (scan position, buffer) is
 /// managed by the nodes themselves.
+///
+/// The `Catalog` dependency in `ExecContextImpl` exists solely for `nextval`.
+/// NOTE: A future refactor could extract sequence access into a dedicated
+/// trait, removing the `Catalog` dependency from the execution context.
 pub trait ExecContext: Send + Clone {
     /// Scans a single heap page and returns all visible tuples.
     ///
-    /// Also returns the next page ID in the chain (if any) so that the
-    /// caller can continue scanning multi-page tables.
+    /// Returns `(TupleId, Record)` pairs for each MVCC-visible tuple on the
+    /// page, plus the next page ID in the chain (if any) so that the caller
+    /// can continue scanning multi-page tables.
     ///
     /// Visibility is determined by the snapshot embedded in the context.
     /// The caller provides the column schema for record deserialization.
-    ///
-    /// NOTE: Page chain traversal is currently pushed to the caller (SeqScan).
-    /// A future refactor could wrap this as `scan_table` that uses HeapScanner
-    /// internally, keeping chain logic in the context layer.
     fn scan_heap_page(
         &self,
         page_id: PageId,
         schema: &[Type],
-    ) -> impl Future<Output = Result<(Vec<Row>, Option<PageId>), ExecutorError>> + Send;
+    ) -> impl Future<Output = ScanPageResult> + Send;
 
     /// Inserts a tuple into the heap table starting at `first_page`.
     ///
@@ -52,10 +55,7 @@ pub trait ExecContext: Send + Clone {
     ///
     /// The tuple remains physically on the page but becomes invisible to
     /// subsequent snapshots.
-    fn delete_tuple(
-        &self,
-        tid: TupleId,
-    ) -> impl Future<Output = Result<(), ExecutorError>> + Send;
+    fn delete_tuple(&self, tid: TupleId) -> impl Future<Output = Result<(), ExecutorError>> + Send;
 
     /// Updates a tuple (delete old version + insert new version).
     ///
@@ -117,29 +117,15 @@ impl<S: Storage, R: Replacer> ExecContextImpl<S, R> {
 }
 
 impl<S: Storage, R: Replacer> ExecContext for ExecContextImpl<S, R> {
-    // NOTE: All visible tuples from the page are loaded into a Vec<Row>
-    // so that the page latch is released before returning to the caller. This
-    // minimizes latch hold time but means memory usage is proportional to tuples
-    // per page. For production, consider streaming with explicit latch management,
-    // especially once Sort/Aggregate (Step 12) may need to scan large tables.
-    async fn scan_heap_page(
-        &self,
-        page_id: PageId,
-        schema: &[Type],
-    ) -> Result<(Vec<Row>, Option<PageId>), ExecutorError> {
-        let page = HeapPage::new(self.pool.fetch_page(page_id).await?);
-        let next_page = page.next_page();
-
-        let mut tuples = Vec::new();
-        for (slot_id, header, record) in page.scan(schema) {
-            if !self.snapshot.is_tuple_visible(&header, &self.tx_manager) {
-                continue;
-            }
-            let tid = TupleId { page_id, slot_id };
-            tuples.push(Row::from_heap(tid, record));
-        }
-
-        Ok((tuples, next_page))
+    async fn scan_heap_page(&self, page_id: PageId, schema: &[Type]) -> ScanPageResult {
+        Ok(scan_visible_page(
+            &self.pool,
+            page_id,
+            schema,
+            &self.snapshot,
+            &self.tx_manager,
+        )
+        .await?)
     }
 
     async fn insert_tuple(
@@ -147,7 +133,7 @@ impl<S: Storage, R: Replacer> ExecContext for ExecContextImpl<S, R> {
         first_page: PageId,
         record: &Record,
     ) -> Result<TupleId, ExecutorError> {
-        let tid = heap_insert(
+        let tid = insert(
             &self.pool,
             first_page,
             record,
@@ -264,10 +250,10 @@ mod tests {
         );
 
         // Verify first tuple is sys_tables itself
-        assert_eq!(tuples[0].record.values[1], Value::Text("sys_tables".into()));
-        // All tuples should have TupleId set
-        for tuple in &tuples {
-            assert!(tuple.tid.is_some());
+        assert_eq!(tuples[0].1.values[1], Value::Text("sys_tables".into()));
+        // All tuples should have valid TupleId
+        for (tid, _record) in &tuples {
+            assert_eq!(tid.page_id, table_info.first_page);
         }
     }
 
@@ -296,7 +282,12 @@ mod tests {
         // Insert a tuple (CID 0)
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-        let table = db.catalog().get_table(&snapshot, "test").await.unwrap().unwrap();
+        let table = db
+            .catalog()
+            .get_table(&snapshot, "test")
+            .await
+            .unwrap()
+            .unwrap();
         let ctx = db.exec_context(snapshot);
 
         let record = Record::new(vec![Value::Integer(42), Value::Text("hello".into())]);
@@ -313,10 +304,13 @@ mod tests {
         let snapshot2 = db.tx_manager().snapshot(txid, CommandId::new(1));
         let ctx2 = db.exec_context(snapshot2);
         let schema = [Type::Integer, Type::Text];
-        let (tuples, _) = ctx2.scan_heap_page(table.first_page, &schema).await.unwrap();
+        let (tuples, _) = ctx2
+            .scan_heap_page(table.first_page, &schema)
+            .await
+            .unwrap();
         assert_eq!(tuples.len(), 1);
-        assert_eq!(tuples[0].record.values[0], Value::Integer(42));
-        assert_eq!(tuples[0].record.values[1], Value::Text("hello".into()));
+        assert_eq!(tuples[0].1.values[0], Value::Integer(42));
+        assert_eq!(tuples[0].1.values[1], Value::Text("hello".into()));
         db.tx_manager().commit(txid).unwrap();
     }
 
@@ -345,7 +339,12 @@ mod tests {
         // Insert a tuple (CID 0)
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-        let table = db.catalog().get_table(&snapshot, "test").await.unwrap().unwrap();
+        let table = db
+            .catalog()
+            .get_table(&snapshot, "test")
+            .await
+            .unwrap()
+            .unwrap();
         let ctx = db.exec_context(snapshot);
         let record = Record::new(vec![Value::Integer(1)]);
         let tid = ctx.insert_tuple(table.first_page, &record).await.unwrap();
@@ -389,7 +388,12 @@ mod tests {
         // Insert a tuple (CID 0)
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-        let table = db.catalog().get_table(&snapshot, "test").await.unwrap().unwrap();
+        let table = db
+            .catalog()
+            .get_table(&snapshot, "test")
+            .await
+            .unwrap()
+            .unwrap();
         let ctx = db.exec_context(snapshot);
         let record = Record::new(vec![Value::Integer(1), Value::Text("old".into())]);
         let tid = ctx.insert_tuple(table.first_page, &record).await.unwrap();
@@ -415,7 +419,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tuples.len(), 1);
-        assert_eq!(tuples[0].record.values[1], Value::Text("new".into()));
+        assert_eq!(tuples[0].1.values[1], Value::Text("new".into()));
         db.tx_manager().commit(txid).unwrap();
     }
 
@@ -444,8 +448,17 @@ mod tests {
         // Find the sequence ID for the SERIAL column
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-        let table = db.catalog().get_table(&snapshot, "test").await.unwrap().unwrap();
-        let columns = db.catalog().get_columns(&snapshot, table.table_id).await.unwrap();
+        let table = db
+            .catalog()
+            .get_table(&snapshot, "test")
+            .await
+            .unwrap()
+            .unwrap();
+        let columns = db
+            .catalog()
+            .get_columns(&snapshot, table.table_id)
+            .await
+            .unwrap();
         let serial_col = columns.iter().find(|c| c.column_name == "id").unwrap();
         let seq_id = serial_col.seq_id;
         assert!(seq_id > 0, "SERIAL column should have a sequence");

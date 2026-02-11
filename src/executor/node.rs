@@ -61,7 +61,9 @@ impl Plan {
             Plan::ValuesScan => ExecutorNode::ValuesScan(ValuesScan::new()),
             // DML plans are executed via execute_dml(), not prepare_for_execute()
             Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. } => {
-                unreachable!("DML plans should not be converted to executor nodes via prepare_for_execute")
+                unreachable!(
+                    "DML plans should not be converted to executor nodes via prepare_for_execute"
+                )
             }
         }
     }
@@ -73,10 +75,7 @@ impl Plan {
     /// This is the execution entry point for DML statements, in contrast to
     /// [`prepare_for_execute`](Plan::prepare_for_execute) which is used for
     /// SELECT/scan plans that produce rows.
-    pub async fn execute_dml<C: ExecContext>(
-        self,
-        ctx: &C,
-    ) -> Result<u64, ExecutorError> {
+    pub async fn execute_dml<C: ExecContext>(self, ctx: &C) -> Result<u64, ExecutorError> {
         match self {
             Plan::Insert {
                 first_page,
@@ -84,20 +83,14 @@ impl Plan {
                 values,
                 serial_columns,
                 ..
-            } => {
-                execute_insert(ctx, first_page, &schema, values, &serial_columns).await
-            }
+            } => execute_insert(ctx, first_page, &schema, values, &serial_columns).await,
             Plan::Update {
                 input,
                 assignments,
                 first_page,
                 ..
-            } => {
-                execute_update(ctx, *input, &assignments, first_page).await
-            }
-            Plan::Delete { input, .. } => {
-                execute_delete(ctx, *input).await
-            }
+            } => execute_update(ctx, *input, &assignments, first_page).await,
+            Plan::Delete { input, .. } => execute_delete(ctx, *input).await,
             _ => unreachable!("non-DML plans should not be passed to execute_dml"),
         }
     }
@@ -172,10 +165,7 @@ async fn execute_update<C: ExecContext>(
 }
 
 /// Executes a DELETE plan: scans matching rows and calls delete_tuple for each.
-async fn execute_delete<C: ExecContext>(
-    ctx: &C,
-    input: Plan,
-) -> Result<u64, ExecutorError> {
+async fn execute_delete<C: ExecContext>(ctx: &C, input: Plan) -> Result<u64, ExecutorError> {
     let mut node = input.prepare_for_execute(ctx);
     let mut count = 0u64;
 
@@ -278,17 +268,20 @@ impl<C: ExecContext> SeqScan<C> {
     /// advances to the next page via the chain linkage.
     async fn next(&mut self) -> Result<Option<Row>, ExecutorError> {
         loop {
-            if let Some(tuple) = self.buffer.next() {
-                return Ok(Some(tuple));
+            if let Some(row) = self.buffer.next() {
+                return Ok(Some(row));
             }
             let page_id = match self.next_page_id.take() {
                 Some(id) => id,
                 None => return Ok(None),
             };
-            let (tuples, next_page) =
-                self.ctx.scan_heap_page(page_id, &self.schema).await?;
+            let (tuples, next_page) = self.ctx.scan_heap_page(page_id, &self.schema).await?;
             self.next_page_id = next_page;
-            self.buffer = tuples.into_iter();
+            self.buffer = tuples
+                .into_iter()
+                .map(|(tid, record)| Row::from_heap(tid, record))
+                .collect::<Vec<_>>()
+                .into_iter();
         }
     }
 }
@@ -755,9 +748,7 @@ mod tests {
     use crate::executor::planner;
 
     /// Helper: create a table, plan an INSERT, execute it, then verify by scanning.
-    async fn setup_table_and_ctx(
-        ddl: &str,
-    ) -> (TestDb, crate::tx::Snapshot) {
+    async fn setup_table_and_ctx(ddl: &str) -> (TestDb, crate::tx::Snapshot) {
         let db = Database::open(MemoryStorage::new(), 100).await.unwrap();
         let txid = db.tx_manager().begin();
         let stmt = crate::sql::Parser::new(ddl).parse().unwrap().unwrap();
@@ -801,10 +792,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_insert() {
-        let (db, snapshot) = setup_table_and_ctx(
-            "CREATE TABLE t (id INTEGER, name TEXT)",
-        )
-        .await;
+        let (db, snapshot) = setup_table_and_ctx("CREATE TABLE t (id INTEGER, name TEXT)").await;
 
         let insert = parse_insert_stmt("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')");
         let plan = planner::plan_insert(&insert, db.catalog(), &snapshot)
@@ -815,27 +803,32 @@ mod tests {
         assert_eq!(count, 2);
 
         // Verify by scanning with a new CID
-        let snapshot2 = db.tx_manager().snapshot(snapshot.current_txid, CommandId::new(1));
-        let table = db.catalog().get_table(&snapshot2, "t").await.unwrap().unwrap();
+        let snapshot2 = db
+            .tx_manager()
+            .snapshot(snapshot.current_txid, CommandId::new(1));
+        let table = db
+            .catalog()
+            .get_table(&snapshot2, "t")
+            .await
+            .unwrap()
+            .unwrap();
         let ctx2 = db.exec_context(snapshot2);
         let (tuples, _) = ctx2
             .scan_heap_page(table.first_page, &[Type::Integer, Type::Text])
             .await
             .unwrap();
         assert_eq!(tuples.len(), 2);
-        assert_eq!(tuples[0].record.values[1], Value::Text("Alice".into()));
-        assert_eq!(tuples[1].record.values[1], Value::Text("Bob".into()));
+        assert_eq!(tuples[0].1.values[1], Value::Text("Alice".into()));
+        assert_eq!(tuples[1].1.values[1], Value::Text("Bob".into()));
     }
 
     #[tokio::test]
     async fn test_execute_delete() {
-        let (db, snapshot) = setup_table_and_ctx(
-            "CREATE TABLE t (id INTEGER, name TEXT)",
-        )
-        .await;
+        let (db, snapshot) = setup_table_and_ctx("CREATE TABLE t (id INTEGER, name TEXT)").await;
 
         // First insert some data
-        let insert = parse_insert_stmt("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')");
+        let insert =
+            parse_insert_stmt("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')");
         let plan = planner::plan_insert(&insert, db.catalog(), &snapshot)
             .await
             .unwrap();
@@ -843,7 +836,9 @@ mod tests {
         plan.execute_dml(&ctx).await.unwrap();
 
         // Delete where id = 2
-        let snapshot2 = db.tx_manager().snapshot(snapshot.current_txid, CommandId::new(1));
+        let snapshot2 = db
+            .tx_manager()
+            .snapshot(snapshot.current_txid, CommandId::new(1));
         let delete = parse_delete_stmt("DELETE FROM t WHERE id = 2");
         let plan = planner::plan_delete(&delete, db.catalog(), &snapshot2)
             .await
@@ -853,24 +848,28 @@ mod tests {
         assert_eq!(count, 1);
 
         // Verify: should have 2 rows remaining
-        let snapshot3 = db.tx_manager().snapshot(snapshot.current_txid, CommandId::new(2));
-        let table = db.catalog().get_table(&snapshot3, "t").await.unwrap().unwrap();
+        let snapshot3 = db
+            .tx_manager()
+            .snapshot(snapshot.current_txid, CommandId::new(2));
+        let table = db
+            .catalog()
+            .get_table(&snapshot3, "t")
+            .await
+            .unwrap()
+            .unwrap();
         let ctx3 = db.exec_context(snapshot3);
         let (tuples, _) = ctx3
             .scan_heap_page(table.first_page, &[Type::Integer, Type::Text])
             .await
             .unwrap();
         assert_eq!(tuples.len(), 2);
-        assert_eq!(tuples[0].record.values[0], Value::Integer(1));
-        assert_eq!(tuples[1].record.values[0], Value::Integer(3));
+        assert_eq!(tuples[0].1.values[0], Value::Integer(1));
+        assert_eq!(tuples[1].1.values[0], Value::Integer(3));
     }
 
     #[tokio::test]
     async fn test_execute_update() {
-        let (db, snapshot) = setup_table_and_ctx(
-            "CREATE TABLE t (id INTEGER, name TEXT)",
-        )
-        .await;
+        let (db, snapshot) = setup_table_and_ctx("CREATE TABLE t (id INTEGER, name TEXT)").await;
 
         // Insert initial data
         let insert = parse_insert_stmt("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')");
@@ -881,7 +880,9 @@ mod tests {
         plan.execute_dml(&ctx).await.unwrap();
 
         // Update: SET name = 'Updated' WHERE id = 1
-        let snapshot2 = db.tx_manager().snapshot(snapshot.current_txid, CommandId::new(1));
+        let snapshot2 = db
+            .tx_manager()
+            .snapshot(snapshot.current_txid, CommandId::new(1));
         let update = parse_update_stmt("UPDATE t SET name = 'Updated' WHERE id = 1");
         let plan = planner::plan_update(&update, db.catalog(), &snapshot2)
             .await
@@ -891,8 +892,15 @@ mod tests {
         assert_eq!(count, 1);
 
         // Verify: Alice should now be Updated, Bob unchanged
-        let snapshot3 = db.tx_manager().snapshot(snapshot.current_txid, CommandId::new(2));
-        let table = db.catalog().get_table(&snapshot3, "t").await.unwrap().unwrap();
+        let snapshot3 = db
+            .tx_manager()
+            .snapshot(snapshot.current_txid, CommandId::new(2));
+        let table = db
+            .catalog()
+            .get_table(&snapshot3, "t")
+            .await
+            .unwrap()
+            .unwrap();
         let ctx3 = db.exec_context(snapshot3);
         let (tuples, _) = ctx3
             .scan_heap_page(table.first_page, &[Type::Integer, Type::Text])
@@ -901,17 +909,14 @@ mod tests {
         // Bob should remain, Alice's old version is deleted, new version is inserted
         // Due to same-page priority, we should have 3 physical tuples but only 2 visible
         assert_eq!(tuples.len(), 2);
-        let names: Vec<&Value> = tuples.iter().map(|t| &t.record.values[1]).collect();
+        let names: Vec<&Value> = tuples.iter().map(|t| &t.1.values[1]).collect();
         assert!(names.contains(&&Value::Text("Updated".into())));
         assert!(names.contains(&&Value::Text("Bob".into())));
     }
 
     #[tokio::test]
     async fn test_execute_insert_serial() {
-        let (db, snapshot) = setup_table_and_ctx(
-            "CREATE TABLE t (id SERIAL, name TEXT)",
-        )
-        .await;
+        let (db, snapshot) = setup_table_and_ctx("CREATE TABLE t (id SERIAL, name TEXT)").await;
 
         let insert = parse_insert_stmt("INSERT INTO t (name) VALUES ('Alice'), ('Bob')");
         let plan = planner::plan_insert(&insert, db.catalog(), &snapshot)
@@ -922,24 +927,28 @@ mod tests {
         assert_eq!(count, 2);
 
         // Verify SERIAL ids are auto-incremented
-        let snapshot2 = db.tx_manager().snapshot(snapshot.current_txid, CommandId::new(1));
-        let table = db.catalog().get_table(&snapshot2, "t").await.unwrap().unwrap();
+        let snapshot2 = db
+            .tx_manager()
+            .snapshot(snapshot.current_txid, CommandId::new(1));
+        let table = db
+            .catalog()
+            .get_table(&snapshot2, "t")
+            .await
+            .unwrap()
+            .unwrap();
         let ctx2 = db.exec_context(snapshot2);
         let (tuples, _) = ctx2
             .scan_heap_page(table.first_page, &[Type::Integer, Type::Text])
             .await
             .unwrap();
         assert_eq!(tuples.len(), 2);
-        assert_eq!(tuples[0].record.values[0], Value::Integer(1));
-        assert_eq!(tuples[1].record.values[0], Value::Integer(2));
+        assert_eq!(tuples[0].1.values[0], Value::Integer(1));
+        assert_eq!(tuples[1].1.values[0], Value::Integer(2));
     }
 
     #[tokio::test]
     async fn test_execute_delete_without_where() {
-        let (db, snapshot) = setup_table_and_ctx(
-            "CREATE TABLE t (id INTEGER)",
-        )
-        .await;
+        let (db, snapshot) = setup_table_and_ctx("CREATE TABLE t (id INTEGER)").await;
 
         // Insert data
         let insert = parse_insert_stmt("INSERT INTO t VALUES (1), (2), (3)");
@@ -950,7 +959,9 @@ mod tests {
         plan.execute_dml(&ctx).await.unwrap();
 
         // Delete all rows
-        let snapshot2 = db.tx_manager().snapshot(snapshot.current_txid, CommandId::new(1));
+        let snapshot2 = db
+            .tx_manager()
+            .snapshot(snapshot.current_txid, CommandId::new(1));
         let delete = parse_delete_stmt("DELETE FROM t");
         let plan = planner::plan_delete(&delete, db.catalog(), &snapshot2)
             .await
@@ -960,8 +971,15 @@ mod tests {
         assert_eq!(count, 3);
 
         // Verify: no visible rows
-        let snapshot3 = db.tx_manager().snapshot(snapshot.current_txid, CommandId::new(2));
-        let table = db.catalog().get_table(&snapshot3, "t").await.unwrap().unwrap();
+        let snapshot3 = db
+            .tx_manager()
+            .snapshot(snapshot.current_txid, CommandId::new(2));
+        let table = db
+            .catalog()
+            .get_table(&snapshot3, "t")
+            .await
+            .unwrap()
+            .unwrap();
         let ctx3 = db.exec_context(snapshot3);
         let (tuples, _) = ctx3
             .scan_heap_page(table.first_page, &[Type::Integer])
