@@ -120,38 +120,45 @@ impl QueryPlan {
     ///     SeqScan on sys_tables (cols: table_id, table_name, first_page)
     /// ```
     pub fn explain(&self) -> String {
-        self.format_explain(0)
+        std::fmt::from_fn(|f| self.fmt_explain(f, 0)).to_string()
     }
 
     /// Recursively formats a plan node with indentation.
-    fn format_explain(&self, indent: usize) -> String {
-        let prefix = "  ".repeat(indent);
+    fn fmt_explain(&self, f: &mut std::fmt::Formatter<'_>, indent: usize) -> std::fmt::Result {
+        for _ in 0..indent {
+            write!(f, "  ")?;
+        }
         match self {
             QueryPlan::SeqScan {
                 table_name,
                 columns,
                 ..
             } => {
-                let col_names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
-                format!(
-                    "{}SeqScan on {} (cols: {})",
-                    prefix,
-                    table_name,
-                    col_names.join(", ")
-                )
+                write!(f, "SeqScan on {} (cols: ", table_name)?;
+                for (i, col) in columns.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", col.name)?;
+                }
+                write!(f, ")")
             }
             QueryPlan::Filter { input, predicate } => {
-                let child_str = input.format_explain(indent + 1);
-                format!("{}Filter: {}\n{}", prefix, predicate, child_str)
+                writeln!(f, "Filter: {}", predicate)?;
+                input.fmt_explain(f, indent + 1)
             }
             QueryPlan::Projection { input, exprs, .. } => {
-                let cols: Vec<String> = exprs.iter().map(|e| e.to_string()).collect();
-                let child_str = input.format_explain(indent + 1);
-                format!("{}Projection: {}\n{}", prefix, cols.join(", "), child_str)
+                write!(f, "Projection: ")?;
+                for (i, expr) in exprs.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", expr)?;
+                }
+                writeln!(f)?;
+                input.fmt_explain(f, indent + 1)
             }
-            QueryPlan::ValuesScan => {
-                format!("{}ValuesScan (1 row)", prefix)
-            }
+            QueryPlan::ValuesScan => write!(f, "ValuesScan (1 row)"),
         }
     }
 }
@@ -159,20 +166,22 @@ impl QueryPlan {
 impl DmlPlan {
     /// Formats this plan as a human-readable EXPLAIN string.
     pub fn explain(&self) -> String {
-        self.format_explain(0)
+        std::fmt::from_fn(|f| self.fmt_explain(f, 0)).to_string()
     }
 
     /// Recursively formats a DML plan node with indentation.
-    fn format_explain(&self, indent: usize) -> String {
-        let prefix = "  ".repeat(indent);
+    fn fmt_explain(&self, f: &mut std::fmt::Formatter<'_>, indent: usize) -> std::fmt::Result {
+        for _ in 0..indent {
+            write!(f, "  ")?;
+        }
         match self {
             DmlPlan::Insert {
                 table_name, values, ..
             } => {
                 let row_count = values.len();
-                format!(
-                    "{}Insert on {} ({} row{})",
-                    prefix,
+                write!(
+                    f,
+                    "Insert on {} ({} row{})",
                     table_name,
                     row_count,
                     if row_count == 1 { "" } else { "s" }
@@ -181,14 +190,14 @@ impl DmlPlan {
             DmlPlan::Update {
                 table_name, input, ..
             } => {
-                let child_str = input.format_explain(indent + 1);
-                format!("{}Update on {}\n{}", prefix, table_name, child_str)
+                writeln!(f, "Update on {}", table_name)?;
+                input.fmt_explain(f, indent + 1)
             }
             DmlPlan::Delete {
                 table_name, input, ..
             } => {
-                let child_str = input.format_explain(indent + 1);
-                format!("{}Delete on {}\n{}", prefix, table_name, child_str)
+                writeln!(f, "Delete on {}", table_name)?;
+                input.fmt_explain(f, indent + 1)
             }
         }
     }
