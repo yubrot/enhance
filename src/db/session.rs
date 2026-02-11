@@ -164,12 +164,12 @@ impl<S: Storage, R: Replacer> Session<S, R> {
     ///
     /// Returns an error if query planning fails (e.g., table not found).
     pub async fn describe_statement(
-        &self,
+        &mut self,
         stmt: &Statement,
     ) -> Result<Option<Vec<ColumnDesc>>, DatabaseError> {
         match stmt {
             Statement::Select(select_stmt) => {
-                self.within_transaction_ro(|db, txid, cid| async move {
+                self.run_in_transaction(false, |db, txid, cid| async move {
                     let snapshot = db.tx_manager().snapshot(txid, cid);
                     let plan = executor::plan_select(select_stmt, db.catalog(), &snapshot).await?;
                     Ok(Some(plan.columns().to_vec()))
@@ -214,7 +214,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 Ok(QueryResult::command("ROLLBACK"))
             }
             Statement::CreateTable(create_stmt) => {
-                self.within_transaction(|db, txid, cid| async move {
+                self.run_in_transaction(true, |db, txid, cid| async move {
                     db.catalog()
                         .create_table(txid, cid, create_stmt)
                         .await
@@ -224,8 +224,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 .await
             }
             Statement::Select(select_stmt) => {
-                // TODO: We don't want to commit single select
-                self.within_transaction(|db, txid, cid| async move {
+                self.run_in_transaction(false, |db, txid, cid| async move {
                     let snapshot = db.tx_manager().snapshot(txid, cid);
                     let plan = executor::plan_select(select_stmt, db.catalog(), &snapshot).await?;
                     let columns = plan.columns().to_vec();
@@ -240,33 +239,24 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 })
                 .await
             }
-            Statement::Insert(insert_stmt) => {
-                self.within_transaction(|db, txid, cid| async move {
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+                self.run_in_transaction(true, |db, txid, cid| async move {
                     let snapshot = db.tx_manager().snapshot(txid, cid);
-                    let plan = executor::plan_insert(insert_stmt, db.catalog(), &snapshot).await?;
+                    let plan = match stmt {
+                        Statement::Insert(s) => {
+                            executor::plan_insert(s, db.catalog(), &snapshot).await?
+                        }
+                        Statement::Update(s) => {
+                            executor::plan_update(s, db.catalog(), &snapshot).await?
+                        }
+                        Statement::Delete(s) => {
+                            executor::plan_delete(s, db.catalog(), &snapshot).await?
+                        }
+                        _ => unreachable!(),
+                    };
                     let ctx = db.exec_context(snapshot);
-                    let count = plan.execute_dml(&ctx).await?;
-                    Ok(QueryResult::command(format!("INSERT 0 {}", count)))
-                })
-                .await
-            }
-            Statement::Update(update_stmt) => {
-                self.within_transaction(|db, txid, cid| async move {
-                    let snapshot = db.tx_manager().snapshot(txid, cid);
-                    let plan = executor::plan_update(update_stmt, db.catalog(), &snapshot).await?;
-                    let ctx = db.exec_context(snapshot);
-                    let count = plan.execute_dml(&ctx).await?;
-                    Ok(QueryResult::command(format!("UPDATE {}", count)))
-                })
-                .await
-            }
-            Statement::Delete(delete_stmt) => {
-                self.within_transaction(|db, txid, cid| async move {
-                    let snapshot = db.tx_manager().snapshot(txid, cid);
-                    let plan = executor::plan_delete(delete_stmt, db.catalog(), &snapshot).await?;
-                    let ctx = db.exec_context(snapshot);
-                    let count = plan.execute_dml(&ctx).await?;
-                    Ok(QueryResult::command(format!("DELETE {}", count)))
+                    let result = plan.execute_dml(&ctx).await?;
+                    Ok(QueryResult::command(result.command_tag()))
                 })
                 .await
             }
@@ -275,20 +265,28 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::DropIndex(_) => Ok(QueryResult::command("DROP INDEX")),
             Statement::Set(_) => Ok(QueryResult::command("SET")),
             Statement::Explain(inner_stmt) => {
-                self.within_transaction(|db, txid, cid| async move {
+                self.run_in_transaction(false, |db, txid, cid| async move {
                     let snapshot = db.tx_manager().snapshot(txid, cid);
-                    let plan = match inner_stmt.as_ref() {
+                    let explain_text = match inner_stmt.as_ref() {
                         Statement::Select(select_stmt) => {
-                            executor::plan_select(select_stmt, db.catalog(), &snapshot).await?
+                            executor::plan_select(select_stmt, db.catalog(), &snapshot)
+                                .await?
+                                .explain()
                         }
                         Statement::Insert(insert_stmt) => {
-                            executor::plan_insert(insert_stmt, db.catalog(), &snapshot).await?
+                            executor::plan_insert(insert_stmt, db.catalog(), &snapshot)
+                                .await?
+                                .explain()
                         }
                         Statement::Update(update_stmt) => {
-                            executor::plan_update(update_stmt, db.catalog(), &snapshot).await?
+                            executor::plan_update(update_stmt, db.catalog(), &snapshot)
+                                .await?
+                                .explain()
                         }
                         Statement::Delete(delete_stmt) => {
-                            executor::plan_delete(delete_stmt, db.catalog(), &snapshot).await?
+                            executor::plan_delete(delete_stmt, db.catalog(), &snapshot)
+                                .await?
+                                .explain()
                         }
                         _ => {
                             return Err(DatabaseError::Executor(
@@ -300,7 +298,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                     };
                     Ok(QueryResult::Rows {
                         columns: vec![ColumnDesc::explain()],
-                        rows: plan.explain().lines().map(Row::explain_line).collect(),
+                        rows: explain_text.lines().map(Row::explain_line).collect(),
                     })
                 })
                 .await
@@ -313,10 +311,15 @@ impl<S: Storage, R: Replacer> Session<S, R> {
     /// This helper handles the common transaction management pattern:
     /// - Increments command ID if in an active transaction
     /// - Creates an auto-commit transaction if not currently in one
-    /// - On success: commits the transaction if in auto-commit mode
+    /// - On success in auto-commit mode: commits if `commit_on_auto` is true,
+    ///   aborts otherwise (suitable for read-only operations like SELECT/EXPLAIN)
     /// - On error: aborts the transaction if in auto-commit mode, or sets
     ///   the failed flag if in an explicit transaction
-    async fn within_transaction<T, F, Fut>(&mut self, f: F) -> Result<T, DatabaseError>
+    async fn run_in_transaction<T, F, Fut>(
+        &mut self,
+        commit_on_auto: bool,
+        f: F,
+    ) -> Result<T, DatabaseError>
     where
         F: FnOnce(Arc<Database<S, R>>, TxId, CommandId) -> Fut,
         Fut: Future<Output = Result<T, DatabaseError>>,
@@ -333,7 +336,11 @@ impl<S: Storage, R: Replacer> Session<S, R> {
         match f(Arc::clone(&self.database), txid, cid).await {
             Ok(result) => {
                 if auto_commit {
-                    self.database.tx_manager().commit(txid)?;
+                    if commit_on_auto {
+                        self.database.tx_manager().commit(txid)?;
+                    } else {
+                        let _ = self.database.tx_manager().abort(txid);
+                    }
                 }
                 Ok(result)
             }
@@ -346,23 +353,6 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 Err(e)
             }
         }
-    }
-
-    /// Executes a function within a readonly transaction context.
-    async fn within_transaction_ro<T, F, Fut>(&self, f: F) -> Result<T, DatabaseError>
-    where
-        F: FnOnce(Arc<Database<S, R>>, TxId, CommandId) -> Fut,
-        Fut: Future<Output = Result<T, DatabaseError>>,
-    {
-        let (txid, cid, need_abort) = match self.transaction {
-            Some(tx) if !tx.failed => (tx.txid, tx.cid, false),
-            _ => (self.database.tx_manager().begin(), CommandId::FIRST, true),
-        };
-        let result = f(Arc::clone(&self.database), txid, cid).await;
-        if need_abort {
-            let _ = self.database.tx_manager().abort(txid);
-        }
-        result
     }
 }
 
@@ -623,7 +613,7 @@ mod tests {
     async fn test_describe_explain_select() {
         let storage = Arc::new(MemoryStorage::new());
         let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let session = Session::new(db);
+        let mut session = Session::new(db);
 
         let stmt = Parser::new("EXPLAIN SELECT * FROM sys_tables")
             .parse()
@@ -646,7 +636,7 @@ mod tests {
     async fn test_describe_select() {
         let storage = Arc::new(MemoryStorage::new());
         let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let session = Session::new(db);
+        let mut session = Session::new(db);
 
         let stmt = Parser::new("SELECT table_id, table_name FROM sys_tables")
             .parse()
@@ -668,7 +658,7 @@ mod tests {
     async fn test_describe_non_query() {
         let storage = Arc::new(MemoryStorage::new());
         let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let session = Session::new(db);
+        let mut session = Session::new(db);
 
         let stmt = Parser::new("CREATE TABLE test (id INT)")
             .parse()

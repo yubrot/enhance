@@ -1,8 +1,14 @@
 //! Logical query plan representation.
 //!
-//! A [`Plan`] describes *what* to execute without loading any data.
-//! It is produced by the planner and then converted into an
-//! [`ExecutorNode`](super::node::ExecutorNode) by [`Plan::prepare_for_execute`].
+//! Plans describe *what* to execute without loading any data:
+//!
+//! - [`QueryPlan`] — row-producing plans (SELECT, scan sub-plans) converted
+//!   into [`ExecutorNode`](super::node::ExecutorNode) via
+//!   [`QueryPlan::prepare_for_execute`].
+//! - [`DmlPlan`] — data-modifying plans (INSERT/UPDATE/DELETE) executed via
+//!   [`DmlPlan::execute_dml`].
+//! - [`DmlResult`] — result of executing a DML plan, carrying the affected
+//!   row count and formatting the command completion tag.
 
 use crate::datum::Type;
 use crate::storage::PageId;
@@ -10,12 +16,12 @@ use crate::storage::PageId;
 use super::ColumnDesc;
 use super::expr::BoundExpr;
 
-/// A logical query plan node.
+/// A row-producing logical query plan node.
 ///
-/// Unlike [`ExecutorNode`](super::node::ExecutorNode), a `Plan` contains no
-/// pre-loaded data — only the metadata needed to describe the scan, filter,
+/// Unlike [`ExecutorNode`](super::node::ExecutorNode), a `QueryPlan` contains
+/// no pre-loaded data — only the metadata needed to describe the scan, filter,
 /// and projection operations.
-pub enum Plan {
+pub enum QueryPlan {
     /// Sequential heap scan targeting a single table.
     SeqScan {
         /// Table name (for EXPLAIN output).
@@ -32,14 +38,14 @@ pub enum Plan {
     /// Tuple filter (WHERE clause).
     Filter {
         /// Child plan to pull tuples from.
-        input: Box<Plan>,
+        input: Box<QueryPlan>,
         /// Bound predicate expression.
         predicate: BoundExpr,
     },
     /// Column projection (SELECT list).
     Projection {
         /// Child plan to pull tuples from.
-        input: Box<Plan>,
+        input: Box<QueryPlan>,
         /// Bound expressions to evaluate for each output column.
         exprs: Vec<BoundExpr>,
         /// Output column descriptors.
@@ -47,6 +53,10 @@ pub enum Plan {
     },
     /// Single-row scan for queries without FROM (e.g., `SELECT 1+1`).
     ValuesScan,
+}
+
+/// A data-modifying logical plan node (INSERT, UPDATE, DELETE).
+pub enum DmlPlan {
     /// INSERT into a table.
     Insert {
         /// Table name (for EXPLAIN output and command tags).
@@ -69,7 +79,7 @@ pub enum Plan {
         /// Table name (for EXPLAIN output and command tags).
         table_name: String,
         /// Input plan that scans the rows to update (SeqScan + optional Filter).
-        input: Box<Plan>,
+        input: Box<QueryPlan>,
         /// Bound SET expressions in table-schema order (one per column).
         /// Columns not in the SET clause contain `BoundExpr::Column { index }` to
         /// preserve the original value.
@@ -84,21 +94,52 @@ pub enum Plan {
         /// Table name (for EXPLAIN output and command tags).
         table_name: String,
         /// Input plan that scans the rows to delete (SeqScan + optional Filter).
-        input: Box<Plan>,
+        input: Box<QueryPlan>,
     },
 }
 
-impl Plan {
+/// Result of executing a DML plan.
+///
+/// Each variant corresponds to its DML operation, allowing type-safe
+/// access to operation-specific results (e.g., future extensions like
+/// returning generated IDs for INSERT).
+pub enum DmlResult {
+    /// INSERT completed.
+    Insert {
+        /// Number of rows inserted.
+        count: u64,
+    },
+    /// UPDATE completed.
+    Update {
+        /// Number of rows updated.
+        count: u64,
+    },
+    /// DELETE completed.
+    Delete {
+        /// Number of rows deleted.
+        count: u64,
+    },
+}
+
+impl DmlResult {
+    /// Formats the PostgreSQL-style command completion tag.
+    pub fn command_tag(&self) -> String {
+        match self {
+            DmlResult::Insert { count } => format!("INSERT 0 {count}"),
+            DmlResult::Update { count } => format!("UPDATE {count}"),
+            DmlResult::Delete { count } => format!("DELETE {count}"),
+        }
+    }
+}
+
+impl QueryPlan {
     /// Returns the output column descriptors for this plan node.
     pub fn columns(&self) -> &[ColumnDesc] {
         match self {
-            Plan::SeqScan { columns, .. } => columns,
-            Plan::Filter { input, .. } => input.columns(),
-            Plan::Projection { columns, .. } => columns,
-            Plan::ValuesScan => &[],
-            Plan::Insert { .. } => &[],
-            Plan::Update { .. } => &[],
-            Plan::Delete { .. } => &[],
+            QueryPlan::SeqScan { columns, .. } => columns,
+            QueryPlan::Filter { input, .. } => input.columns(),
+            QueryPlan::Projection { columns, .. } => columns,
+            QueryPlan::ValuesScan => &[],
         }
     }
 
@@ -122,7 +163,7 @@ impl Plan {
     fn format_explain(&self, indent: usize) -> String {
         let prefix = "  ".repeat(indent);
         match self {
-            Plan::SeqScan {
+            QueryPlan::SeqScan {
                 table_name,
                 columns,
                 ..
@@ -135,19 +176,33 @@ impl Plan {
                     col_names.join(", ")
                 )
             }
-            Plan::Filter { input, predicate } => {
+            QueryPlan::Filter { input, predicate } => {
                 let child_str = input.format_explain(indent + 1);
                 format!("{}Filter: {}\n{}", prefix, predicate, child_str)
             }
-            Plan::Projection { input, exprs, .. } => {
+            QueryPlan::Projection { input, exprs, .. } => {
                 let cols: Vec<String> = exprs.iter().map(|e| e.to_string()).collect();
                 let child_str = input.format_explain(indent + 1);
                 format!("{}Projection: {}\n{}", prefix, cols.join(", "), child_str)
             }
-            Plan::ValuesScan => {
+            QueryPlan::ValuesScan => {
                 format!("{}ValuesScan (1 row)", prefix)
             }
-            Plan::Insert {
+        }
+    }
+}
+
+impl DmlPlan {
+    /// Formats this plan as a human-readable EXPLAIN string.
+    pub fn explain(&self) -> String {
+        self.format_explain(0)
+    }
+
+    /// Recursively formats a DML plan node with indentation.
+    fn format_explain(&self, indent: usize) -> String {
+        let prefix = "  ".repeat(indent);
+        match self {
+            DmlPlan::Insert {
                 table_name, values, ..
             } => {
                 let row_count = values.len();
@@ -159,13 +214,13 @@ impl Plan {
                     if row_count == 1 { "" } else { "s" }
                 )
             }
-            Plan::Update {
+            DmlPlan::Update {
                 table_name, input, ..
             } => {
                 let child_str = input.format_explain(indent + 1);
                 format!("{}Update on {}\n{}", prefix, table_name, child_str)
             }
-            Plan::Delete {
+            DmlPlan::Delete {
                 table_name, input, ..
             } => {
                 let child_str = input.format_explain(indent + 1);
@@ -201,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_explain_seq_scan() {
-        let plan = Plan::SeqScan {
+        let plan = QueryPlan::SeqScan {
             table_name: "users".to_string(),
             table_id: 1,
             first_page: PageId::new(10),
@@ -213,14 +268,14 @@ mod tests {
 
     #[test]
     fn test_explain_filter() {
-        let scan = Plan::SeqScan {
+        let scan = QueryPlan::SeqScan {
             table_name: "users".to_string(),
             table_id: 1,
             first_page: PageId::new(10),
             schema: vec![Type::Bigint],
             columns: vec![int_col("id")],
         };
-        let plan = Plan::Filter {
+        let plan = QueryPlan::Filter {
             input: Box::new(scan),
             predicate: bind_expr("id > 5", &[int_col("id")]),
         };
@@ -232,14 +287,14 @@ mod tests {
 
     #[test]
     fn test_explain_projection() {
-        let scan = Plan::SeqScan {
+        let scan = QueryPlan::SeqScan {
             table_name: "users".to_string(),
             table_id: 1,
             first_page: PageId::new(10),
             schema: vec![Type::Bigint, Type::Text],
             columns: vec![int_col("id"), int_col("name")],
         };
-        let plan = Plan::Projection {
+        let plan = QueryPlan::Projection {
             input: Box::new(scan),
             exprs: vec![bind_expr("name", &[int_col("id"), int_col("name")])],
             columns: vec![int_col("name")],
@@ -252,6 +307,13 @@ mod tests {
 
     #[test]
     fn test_explain_values_scan() {
-        assert_eq!(Plan::ValuesScan.explain(), "ValuesScan (1 row)");
+        assert_eq!(QueryPlan::ValuesScan.explain(), "ValuesScan (1 row)");
+    }
+
+    #[test]
+    fn test_dml_result_command_tag() {
+        assert_eq!(DmlResult::Insert { count: 3 }.command_tag(), "INSERT 0 3");
+        assert_eq!(DmlResult::Update { count: 1 }.command_tag(), "UPDATE 1");
+        assert_eq!(DmlResult::Delete { count: 5 }.command_tag(), "DELETE 5");
     }
 }

@@ -13,10 +13,10 @@ use crate::tx::Snapshot;
 
 use super::error::ExecutorError;
 use super::expr::{BoundExpr, resolve_column_index};
-use super::plan::Plan;
+use super::plan::{DmlPlan, QueryPlan};
 use super::{ColumnDesc, ColumnSource};
 
-/// Plans a SELECT statement into a logical [`Plan`] tree.
+/// Plans a SELECT statement into a logical [`QueryPlan`] tree.
 ///
 /// The planner resolves table references, binds column names to positional
 /// indices, and constructs Filter/Projection plan nodes. No data is loaded
@@ -36,7 +36,7 @@ pub async fn plan_select<S: Storage, R: Replacer>(
     select: &SelectStmt,
     catalog: &Catalog<S, R>,
     snapshot: &Snapshot,
-) -> Result<Plan, ExecutorError> {
+) -> Result<QueryPlan, ExecutorError> {
     // Check for unsupported features
     if select.distinct {
         return Err(ExecutorError::Unsupported("DISTINCT".to_string()));
@@ -63,14 +63,14 @@ pub async fn plan_select<S: Storage, R: Replacer>(
     // Step 1: FROM clause -> base plan
     let mut plan = match &select.from {
         Some(from) => build_from_plan(from, catalog, snapshot).await?,
-        None => Plan::ValuesScan,
+        None => QueryPlan::ValuesScan,
     };
 
     // Step 2: WHERE clause -> Filter (bind column names to indices)
     if let Some(where_clause) = &select.where_clause {
         let columns = plan.columns().to_vec();
         let bound_predicate = where_clause.bind(&columns)?;
-        plan = Plan::Filter {
+        plan = QueryPlan::Filter {
             input: Box::new(plan),
             predicate: bound_predicate,
         };
@@ -82,7 +82,7 @@ pub async fn plan_select<S: Storage, R: Replacer>(
     Ok(plan)
 }
 
-/// Plans an INSERT statement into a logical [`Plan::Insert`].
+/// Plans an INSERT statement into a logical [`DmlPlan::Insert`].
 ///
 /// Resolves column names to positions, handles SERIAL auto-population,
 /// binds value expressions, and applies type coercion to match target
@@ -102,7 +102,7 @@ pub async fn plan_insert<S: Storage, R: Replacer>(
     insert: &InsertStmt,
     catalog: &Catalog<S, R>,
     snapshot: &Snapshot,
-) -> Result<Plan, ExecutorError> {
+) -> Result<DmlPlan, ExecutorError> {
     // Look up the target table
     let table_info = catalog
         .get_table(snapshot, &insert.table)
@@ -168,7 +168,7 @@ pub async fn plan_insert<S: Storage, R: Replacer>(
         bound_rows.push(bound_row);
     }
 
-    Ok(Plan::Insert {
+    Ok(DmlPlan::Insert {
         table_name: insert.table.clone(),
         table_id: table_info.table_id,
         first_page: table_info.first_page,
@@ -181,7 +181,7 @@ pub async fn plan_insert<S: Storage, R: Replacer>(
     })
 }
 
-/// Plans an UPDATE statement into a logical [`Plan::Update`].
+/// Plans an UPDATE statement into a logical [`DmlPlan::Update`].
 ///
 /// Builds a SeqScan (with optional Filter for WHERE), resolves SET assignment
 /// column names, binds value expressions against the scan schema, and applies
@@ -195,7 +195,7 @@ pub async fn plan_update<S: Storage, R: Replacer>(
     update: &UpdateStmt,
     catalog: &Catalog<S, R>,
     snapshot: &Snapshot,
-) -> Result<Plan, ExecutorError> {
+) -> Result<DmlPlan, ExecutorError> {
     // Build the input scan plan
     let scan_plan = build_seq_scan_plan(&update.table, None, catalog, snapshot).await?;
 
@@ -203,7 +203,7 @@ pub async fn plan_update<S: Storage, R: Replacer>(
     let input = if let Some(where_clause) = &update.where_clause {
         let columns = scan_plan.columns().to_vec();
         let bound_predicate = where_clause.bind(&columns)?;
-        Plan::Filter {
+        QueryPlan::Filter {
             input: Box::new(scan_plan),
             predicate: bound_predicate,
         }
@@ -245,7 +245,7 @@ pub async fn plan_update<S: Storage, R: Replacer>(
         bound_assignments[col_idx] = coerce_expr(bound, target_type);
     }
 
-    Ok(Plan::Update {
+    Ok(DmlPlan::Update {
         table_name: update.table.clone(),
         input: Box::new(input),
         assignments: bound_assignments,
@@ -254,7 +254,7 @@ pub async fn plan_update<S: Storage, R: Replacer>(
     })
 }
 
-/// Plans a DELETE statement into a logical [`Plan::Delete`].
+/// Plans a DELETE statement into a logical [`DmlPlan::Delete`].
 ///
 /// Builds a SeqScan (with optional Filter for WHERE) as the input plan.
 ///
@@ -265,7 +265,7 @@ pub async fn plan_delete<S: Storage, R: Replacer>(
     delete: &DeleteStmt,
     catalog: &Catalog<S, R>,
     snapshot: &Snapshot,
-) -> Result<Plan, ExecutorError> {
+) -> Result<DmlPlan, ExecutorError> {
     // Build the input scan plan
     let scan_plan = build_seq_scan_plan(&delete.table, None, catalog, snapshot).await?;
 
@@ -273,7 +273,7 @@ pub async fn plan_delete<S: Storage, R: Replacer>(
     let input = if let Some(where_clause) = &delete.where_clause {
         let columns = scan_plan.columns().to_vec();
         let bound_predicate = where_clause.bind(&columns)?;
-        Plan::Filter {
+        QueryPlan::Filter {
             input: Box::new(scan_plan),
             predicate: bound_predicate,
         }
@@ -281,7 +281,7 @@ pub async fn plan_delete<S: Storage, R: Replacer>(
         scan_plan
     };
 
-    Ok(Plan::Delete {
+    Ok(DmlPlan::Delete {
         table_name: delete.table.clone(),
         input: Box::new(input),
     })
@@ -363,7 +363,7 @@ async fn build_from_plan<S: Storage, R: Replacer>(
     from: &FromClause,
     catalog: &Catalog<S, R>,
     snapshot: &Snapshot,
-) -> Result<Plan, ExecutorError> {
+) -> Result<QueryPlan, ExecutorError> {
     if from.tables.len() != 1 {
         return Err(ExecutorError::Unsupported(
             "multiple tables in FROM (use JOIN)".to_string(),
@@ -377,7 +377,7 @@ async fn build_table_ref_plan<S: Storage, R: Replacer>(
     table_ref: &TableRef,
     catalog: &Catalog<S, R>,
     snapshot: &Snapshot,
-) -> Result<Plan, ExecutorError> {
+) -> Result<QueryPlan, ExecutorError> {
     match table_ref {
         TableRef::Table { name, alias } => {
             build_seq_scan_plan(name, alias.as_deref(), catalog, snapshot).await
@@ -398,7 +398,7 @@ async fn build_seq_scan_plan<S: Storage, R: Replacer>(
     alias: Option<&str>,
     catalog: &Catalog<S, R>,
     snapshot: &Snapshot,
-) -> Result<Plan, ExecutorError> {
+) -> Result<QueryPlan, ExecutorError> {
     // Look up table in catalog
     let table_info = catalog
         .get_table(snapshot, table_name)
@@ -417,7 +417,7 @@ async fn build_seq_scan_plan<S: Storage, R: Replacer>(
     let resolve_name = alias.unwrap_or(table_name);
     let columns = build_column_descs(&column_infos, table_info.table_id, resolve_name);
 
-    Ok(Plan::SeqScan {
+    Ok(QueryPlan::SeqScan {
         table_name: table_name.to_string(),
         table_id: table_info.table_id,
         first_page: table_info.first_page,
@@ -448,7 +448,10 @@ fn build_column_descs(
 }
 
 /// Builds a Projection plan from the SELECT list.
-fn build_projection_plan(input: Plan, select_items: &[SelectItem]) -> Result<Plan, ExecutorError> {
+fn build_projection_plan(
+    input: QueryPlan,
+    select_items: &[SelectItem],
+) -> Result<QueryPlan, ExecutorError> {
     let input_columns = input.columns().to_vec();
     let mut exprs = Vec::new();
     let mut columns = Vec::new();
@@ -460,7 +463,7 @@ fn build_projection_plan(input: Plan, select_items: &[SelectItem]) -> Result<Pla
         }
     }
 
-    Ok(Plan::Projection {
+    Ok(QueryPlan::Projection {
         input: Box::new(input),
         exprs,
         columns,
@@ -941,7 +944,7 @@ mod tests {
 
         let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
 
-        let Plan::Insert {
+        let DmlPlan::Insert {
             table_name,
             values,
             schema,
@@ -949,7 +952,7 @@ mod tests {
             ..
         } = &plan
         else {
-            panic!("expected Plan::Insert");
+            panic!("expected DmlPlan::Insert");
         };
         assert_eq!(table_name, "users");
         assert_eq!(values.len(), 1);
@@ -966,8 +969,8 @@ mod tests {
 
         let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
 
-        let Plan::Insert { values, schema, .. } = &plan else {
-            panic!("expected Plan::Insert");
+        let DmlPlan::Insert { values, schema, .. } = &plan else {
+            panic!("expected DmlPlan::Insert");
         };
         assert_eq!(schema.len(), 2);
         assert_eq!(values.len(), 1);
@@ -990,8 +993,8 @@ mod tests {
 
         let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
 
-        let Plan::Insert { values, .. } = &plan else {
-            panic!("expected Plan::Insert");
+        let DmlPlan::Insert { values, .. } = &plan else {
+            panic!("expected DmlPlan::Insert");
         };
         assert_eq!(values[0].len(), 2);
         // name column (index 1) should be NULL
@@ -1006,13 +1009,13 @@ mod tests {
 
         let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
 
-        let Plan::Insert {
+        let DmlPlan::Insert {
             serial_columns,
             values,
             ..
         } = &plan
         else {
-            panic!("expected Plan::Insert");
+            panic!("expected DmlPlan::Insert");
         };
         // SERIAL column should be in the auto-populate list
         assert_eq!(serial_columns.len(), 1);
@@ -1030,8 +1033,8 @@ mod tests {
 
         let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
 
-        let Plan::Insert { serial_columns, .. } = &plan else {
-            panic!("expected Plan::Insert");
+        let DmlPlan::Insert { serial_columns, .. } = &plan else {
+            panic!("expected DmlPlan::Insert");
         };
         // SERIAL column explicitly provided → not in auto-populate list
         assert!(serial_columns.is_empty());
@@ -1091,8 +1094,8 @@ mod tests {
 
         let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
 
-        let Plan::Insert { values, .. } = &plan else {
-            panic!("expected Plan::Insert");
+        let DmlPlan::Insert { values, .. } = &plan else {
+            panic!("expected DmlPlan::Insert");
         };
         // Should have a Cast wrapping the integer literal
         let BoundExpr::Cast { ty, .. } = &values[0][0] else {
@@ -1113,8 +1116,8 @@ mod tests {
 
         let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
 
-        let Plan::Insert { values, .. } = &plan else {
-            panic!("expected Plan::Insert");
+        let DmlPlan::Insert { values, .. } = &plan else {
+            panic!("expected DmlPlan::Insert");
         };
         assert_eq!(values.len(), 3);
     }
@@ -1127,8 +1130,8 @@ mod tests {
 
         let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
 
-        let Plan::Insert { values, .. } = &plan else {
-            panic!("expected Plan::Insert");
+        let DmlPlan::Insert { values, .. } = &plan else {
+            panic!("expected DmlPlan::Insert");
         };
         assert!(matches!(&values[0][0], BoundExpr::Null));
     }
@@ -1161,14 +1164,14 @@ mod tests {
 
         let plan = plan_update(&update, db.catalog(), &snapshot).await.unwrap();
 
-        let Plan::Update {
+        let DmlPlan::Update {
             table_name,
             schema,
             assignments,
             ..
         } = &plan
         else {
-            panic!("expected Plan::Update");
+            panic!("expected DmlPlan::Update");
         };
         assert_eq!(table_name, "users");
         assert_eq!(schema, &[Type::Integer, Type::Text]);
@@ -1190,11 +1193,11 @@ mod tests {
 
         let plan = plan_update(&update, db.catalog(), &snapshot).await.unwrap();
 
-        let Plan::Update { input, .. } = &plan else {
-            panic!("expected Plan::Update");
+        let DmlPlan::Update { input, .. } = &plan else {
+            panic!("expected DmlPlan::Update");
         };
         // Input should be a Filter wrapping a SeqScan
-        assert!(matches!(input.as_ref(), Plan::Filter { .. }));
+        assert!(matches!(input.as_ref(), QueryPlan::Filter { .. }));
         assert_eq!(
             plan.explain(),
             "Update on users\n  Filter: ($col0 (users.id) = 1)\n    SeqScan on users (cols: id, name)"
@@ -1209,8 +1212,8 @@ mod tests {
 
         let plan = plan_update(&update, db.catalog(), &snapshot).await.unwrap();
 
-        let Plan::Update { assignments, .. } = &plan else {
-            panic!("expected Plan::Update");
+        let DmlPlan::Update { assignments, .. } = &plan else {
+            panic!("expected DmlPlan::Update");
         };
         let BoundExpr::Cast { ty, .. } = &assignments[0] else {
             panic!("expected Cast for type coercion, got {:?}", &assignments[0]);
@@ -1227,8 +1230,8 @@ mod tests {
 
         let plan = plan_update(&update, db.catalog(), &snapshot).await.unwrap();
 
-        let Plan::Update { assignments, .. } = &plan else {
-            panic!("expected Plan::Update");
+        let DmlPlan::Update { assignments, .. } = &plan else {
+            panic!("expected DmlPlan::Update");
         };
         // id should be identity
         assert!(matches!(
@@ -1277,15 +1280,15 @@ mod tests {
 
         let plan = plan_delete(&delete, db.catalog(), &snapshot).await.unwrap();
 
-        let Plan::Delete {
+        let DmlPlan::Delete {
             table_name, input, ..
         } = &plan
         else {
-            panic!("expected Plan::Delete");
+            panic!("expected DmlPlan::Delete");
         };
         assert_eq!(table_name, "users");
         // No WHERE → input is bare SeqScan
-        assert!(matches!(input.as_ref(), Plan::SeqScan { .. }));
+        assert!(matches!(input.as_ref(), QueryPlan::SeqScan { .. }));
     }
 
     #[tokio::test]
@@ -1296,10 +1299,10 @@ mod tests {
 
         let plan = plan_delete(&delete, db.catalog(), &snapshot).await.unwrap();
 
-        let Plan::Delete { input, .. } = &plan else {
-            panic!("expected Plan::Delete");
+        let DmlPlan::Delete { input, .. } = &plan else {
+            panic!("expected DmlPlan::Delete");
         };
-        assert!(matches!(input.as_ref(), Plan::Filter { .. }));
+        assert!(matches!(input.as_ref(), QueryPlan::Filter { .. }));
         assert_eq!(
             plan.explain(),
             "Delete on users\n  Filter: ($col0 (users.id) = 1)\n    SeqScan on users (cols: id, name)"

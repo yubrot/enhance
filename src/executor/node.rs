@@ -11,7 +11,7 @@ use super::ColumnDesc;
 use super::context::ExecContext;
 use super::error::ExecutorError;
 use super::expr::BoundExpr;
-use super::plan::Plan;
+use super::plan::{DmlPlan, DmlResult, QueryPlan};
 use super::row::Row;
 
 /// A query executor node.
@@ -26,14 +26,14 @@ pub enum ExecutorNode<C: ExecContext> {
     ValuesScan(ValuesScan),
 }
 
-impl Plan {
-    /// Converts a logical [`Plan`] into a physical [`ExecutorNode`] tree.
+impl QueryPlan {
+    /// Converts a logical [`QueryPlan`] into a physical [`ExecutorNode`] tree.
     ///
     /// This is a synchronous function — no I/O happens here. All storage access
     /// is deferred to [`ExecutorNode::next()`] via the [`ExecContext`].
     pub fn prepare_for_execute<C: ExecContext>(self, ctx: &C) -> ExecutorNode<C> {
         match self {
-            Plan::SeqScan {
+            QueryPlan::SeqScan {
                 table_name,
                 first_page,
                 schema,
@@ -46,10 +46,10 @@ impl Plan {
                 schema,
                 first_page,
             )),
-            Plan::Filter { input, predicate } => {
+            QueryPlan::Filter { input, predicate } => {
                 ExecutorNode::Filter(Filter::new(input.prepare_for_execute(ctx), predicate))
             }
-            Plan::Projection {
+            QueryPlan::Projection {
                 input,
                 exprs,
                 columns,
@@ -58,38 +58,43 @@ impl Plan {
                 exprs,
                 columns,
             )),
-            Plan::ValuesScan => ExecutorNode::ValuesScan(ValuesScan::new()),
-            // DML plans are executed via execute_dml(), not prepare_for_execute()
-            Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. } => {
-                unreachable!(
-                    "DML plans should not be converted to executor nodes via prepare_for_execute"
-                )
-            }
+            QueryPlan::ValuesScan => ExecutorNode::ValuesScan(ValuesScan::new()),
         }
     }
+}
 
-    /// Executes a DML plan (INSERT, UPDATE, DELETE) and returns the affected row count.
+impl DmlPlan {
+    /// Executes a DML plan (INSERT, UPDATE, DELETE) and returns the result.
     ///
     /// This is the execution entry point for DML statements, in contrast to
-    /// [`prepare_for_execute`](Plan::prepare_for_execute) which is used for
-    /// SELECT/scan plans that produce rows.
-    pub async fn execute_dml<C: ExecContext>(self, ctx: &C) -> Result<u64, ExecutorError> {
+    /// [`QueryPlan::prepare_for_execute`] which is used for SELECT/scan plans
+    /// that produce rows.
+    pub async fn execute_dml<C: ExecContext>(self, ctx: &C) -> Result<DmlResult, ExecutorError> {
         match self {
-            Plan::Insert {
+            DmlPlan::Insert {
                 first_page,
                 schema,
                 values,
                 serial_columns,
                 ..
-            } => execute_insert(ctx, first_page, &schema, values, &serial_columns).await,
-            Plan::Update {
+            } => {
+                let count =
+                    execute_insert(ctx, first_page, &schema, values, &serial_columns).await?;
+                Ok(DmlResult::Insert { count })
+            }
+            DmlPlan::Update {
                 input,
                 assignments,
                 first_page,
                 ..
-            } => execute_update(ctx, *input, &assignments, first_page).await,
-            Plan::Delete { input, .. } => execute_delete(ctx, *input).await,
-            _ => unreachable!("non-DML plans should not be passed to execute_dml"),
+            } => {
+                let count = execute_update(ctx, *input, &assignments, first_page).await?;
+                Ok(DmlResult::Update { count })
+            }
+            DmlPlan::Delete { input, .. } => {
+                let count = execute_delete(ctx, *input).await?;
+                Ok(DmlResult::Delete { count })
+            }
         }
     }
 }
@@ -135,7 +140,7 @@ async fn execute_insert<C: ExecContext>(
 /// and calls update_tuple for each.
 async fn execute_update<C: ExecContext>(
     ctx: &C,
-    input: Plan,
+    input: QueryPlan,
     assignments: &[BoundExpr],
     first_page: PageId,
 ) -> Result<u64, ExecutorError> {
@@ -163,7 +168,7 @@ async fn execute_update<C: ExecContext>(
 }
 
 /// Executes a DELETE plan: scans matching rows and calls delete_tuple for each.
-async fn execute_delete<C: ExecContext>(ctx: &C, input: Plan) -> Result<u64, ExecutorError> {
+async fn execute_delete<C: ExecContext>(ctx: &C, input: QueryPlan) -> Result<u64, ExecutorError> {
     let mut node = input.prepare_for_execute(ctx);
     let mut count = 0u64;
 
@@ -636,7 +641,7 @@ mod tests {
         let (db, first_page) = setup_int_table(vec![10, 20]).await;
         let ctx = read_ctx(&db);
 
-        let plan = Plan::SeqScan {
+        let plan = QueryPlan::SeqScan {
             table_name: "test".to_string(),
             table_id: 1,
             first_page,
@@ -662,8 +667,8 @@ mod tests {
         let (db, first_page) = setup_int_table(vec![1, 2, 3]).await;
         let ctx = read_ctx(&db);
 
-        let plan = Plan::Filter {
-            input: Box::new(Plan::SeqScan {
+        let plan = QueryPlan::Filter {
+            input: Box::new(QueryPlan::SeqScan {
                 table_name: "test".to_string(),
                 table_id: 1,
                 first_page,
@@ -687,8 +692,8 @@ mod tests {
         let (db, first_page) = setup_two_col_table(vec![(1, "alice"), (2, "bob")]).await;
         let ctx = read_ctx(&db);
 
-        let plan = Plan::Projection {
-            input: Box::new(Plan::SeqScan {
+        let plan = QueryPlan::Projection {
+            input: Box::new(QueryPlan::SeqScan {
                 table_name: "test".to_string(),
                 table_id: 1,
                 first_page,
@@ -728,8 +733,8 @@ mod tests {
         let db = Database::open(MemoryStorage::new(), 100).await.unwrap();
         let ctx = read_ctx(&db);
 
-        let plan = Plan::Projection {
-            input: Box::new(Plan::ValuesScan),
+        let plan = QueryPlan::Projection {
+            input: Box::new(QueryPlan::ValuesScan),
             exprs: vec![bind_expr("42", &[])],
             columns: vec![int_col("?column?")],
         };
@@ -797,7 +802,9 @@ mod tests {
             .await
             .unwrap();
         let ctx = db.exec_context(snapshot.clone());
-        let count = plan.execute_dml(&ctx).await.unwrap();
+        let DmlResult::Insert { count } = plan.execute_dml(&ctx).await.unwrap() else {
+            panic!("expected DmlResult::Insert");
+        };
         assert_eq!(count, 2);
 
         // Verify by scanning with a new CID
@@ -842,7 +849,9 @@ mod tests {
             .await
             .unwrap();
         let ctx2 = db.exec_context(snapshot2);
-        let count = plan.execute_dml(&ctx2).await.unwrap();
+        let DmlResult::Delete { count } = plan.execute_dml(&ctx2).await.unwrap() else {
+            panic!("expected DmlResult::Delete");
+        };
         assert_eq!(count, 1);
 
         // Verify: should have 2 rows remaining
@@ -886,7 +895,9 @@ mod tests {
             .await
             .unwrap();
         let ctx2 = db.exec_context(snapshot2);
-        let count = plan.execute_dml(&ctx2).await.unwrap();
+        let DmlResult::Update { count } = plan.execute_dml(&ctx2).await.unwrap() else {
+            panic!("expected DmlResult::Update");
+        };
         assert_eq!(count, 1);
 
         // Verify: Alice should now be Updated, Bob unchanged
@@ -921,7 +932,9 @@ mod tests {
             .await
             .unwrap();
         let ctx = db.exec_context(snapshot.clone());
-        let count = plan.execute_dml(&ctx).await.unwrap();
+        let DmlResult::Insert { count } = plan.execute_dml(&ctx).await.unwrap() else {
+            panic!("expected DmlResult::Insert");
+        };
         assert_eq!(count, 2);
 
         // Verify SERIAL ids are auto-incremented
@@ -965,7 +978,9 @@ mod tests {
             .await
             .unwrap();
         let ctx2 = db.exec_context(snapshot2);
-        let count = plan.execute_dml(&ctx2).await.unwrap();
+        let DmlResult::Delete { count } = plan.execute_dml(&ctx2).await.unwrap() else {
+            panic!("expected DmlResult::Delete");
+        };
         assert_eq!(count, 3);
 
         // Verify: no visible rows
