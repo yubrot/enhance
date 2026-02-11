@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 use super::error::CatalogError;
 use super::schema::{ColumnInfo, SequenceInfo, SystemCatalogTable, TableInfo};
 use super::superblock::Superblock;
-use crate::heap::{HeapPage, Record, insert, scan_visible_page};
+use crate::heap::{HeapPage, insert, scan_visible_page};
 use crate::sql::{CreateTableStmt, DataType};
 use crate::storage::{BufferPool, PageId, Replacer, Storage};
 use crate::tx::{CommandId, Snapshot, TransactionManager, TxId};
@@ -74,8 +74,6 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         // NOTE: Using assert_eq! here panics instead of returning an error.
         // Production code should return CatalogError::InvalidSuperblock or similar.
         assert_eq!(sb_guard.page_id(), PageId::new(0), "First page must be 0");
-        sb_guard.data_mut().fill(0);
-        drop(sb_guard);
 
         let sys_tables_guard = pool.new_page().await?;
         let sys_tables_page = sys_tables_guard.page_id();
@@ -96,7 +94,6 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         superblock.next_table_id = super::schema::LAST_RESERVED_TABLE_ID + 1;
         superblock.next_seq_id = 1;
 
-        let mut sb_guard = pool.fetch_page_mut(PageId::new(0), true).await?;
         superblock.write(sb_guard.data_mut());
         drop(sb_guard);
 
@@ -107,26 +104,20 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         let cid = CommandId::FIRST;
 
         // Insert catalog table metadata into sys_tables
-        let catalog_tables: [Record; 3] = [
-            TableInfo::table_info(sys_tables_page).to_record(),
-            ColumnInfo::table_info(sys_columns_page).to_record(),
-            SequenceInfo::table_info(sys_sequences_page).to_record(),
-        ];
-        for record in &catalog_tables {
-            insert(&pool, sys_tables_page, record, txid, cid).await?;
+        for table_info in [
+            TableInfo::table_info(sys_tables_page),
+            ColumnInfo::table_info(sys_columns_page),
+            SequenceInfo::table_info(sys_sequences_page),
+        ] {
+            insert(&pool, sys_tables_page, &table_info.to_record(), txid, cid).await?;
         }
 
         // Insert column metadata into sys_columns
-        for (i, (name, oid)) in TableInfo::columns().into_iter().enumerate() {
-            let col = ColumnInfo::new(TableInfo::TABLE_ID, i as u32, name.to_string(), oid, 0);
-            insert(&pool, sys_columns_page, &col.to_record(), txid, cid).await?;
-        }
-        for (i, (name, oid)) in ColumnInfo::columns().into_iter().enumerate() {
-            let col = ColumnInfo::new(ColumnInfo::TABLE_ID, i as u32, name.to_string(), oid, 0);
-            insert(&pool, sys_columns_page, &col.to_record(), txid, cid).await?;
-        }
-        for (i, (name, oid)) in SequenceInfo::columns().into_iter().enumerate() {
-            let col = ColumnInfo::new(SequenceInfo::TABLE_ID, i as u32, name.to_string(), oid, 0);
+        for col in TableInfo::columns()
+            .into_iter()
+            .chain(ColumnInfo::columns())
+            .chain(SequenceInfo::columns())
+        {
             insert(&pool, sys_columns_page, &col.to_record(), txid, cid).await?;
         }
 

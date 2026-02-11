@@ -39,15 +39,19 @@ pub trait SystemCatalogTable {
         TableInfo::new(Self::TABLE_ID, Self::TABLE_NAME.to_string(), page)
     }
 
-    /// Returns the column definitions for this system catalog table.
+    /// Returns the column definitions for this system catalog table as [`ColumnInfo`] items.
     ///
-    /// Each tuple is (column_name, ty), automatically paired from
-    /// COLUMN_NAMES and SCHEMA to guarantee consistency.
-    fn columns() -> impl IntoIterator<Item = (&'static str, Type)> {
+    /// Automatically pairs COLUMN_NAMES and SCHEMA with the table's TABLE_ID
+    /// and sequential column numbers.
+    fn columns() -> impl IntoIterator<Item = ColumnInfo> {
         Self::COLUMN_NAMES
             .iter()
             .copied()
             .zip(Self::SCHEMA.iter().copied())
+            .enumerate()
+            .map(|(i, (name, ty))| {
+                ColumnInfo::new(Self::TABLE_ID, i as u32, name.to_string(), ty, 0)
+            })
     }
 }
 
