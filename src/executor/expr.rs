@@ -89,6 +89,38 @@ pub struct BoundWhenClause {
     pub result: BoundExpr,
 }
 
+impl BoundExpr {
+    /// Wraps this expression in a [`BoundExpr::Cast`] if its type doesn't match
+    /// the target type.
+    ///
+    /// NULL values and expressions already matching the target type pass through
+    /// unchanged.
+    pub fn coerce(self, target_type: Type) -> BoundExpr {
+        if matches!(&self, BoundExpr::Null) {
+            return self;
+        }
+        if self.matches_type(target_type) {
+            return self;
+        }
+        BoundExpr::Cast {
+            expr: Box::new(self),
+            ty: target_type,
+        }
+    }
+
+    /// Returns true if this expression is known to already produce `target_type`.
+    fn matches_type(&self, target_type: Type) -> bool {
+        match self {
+            BoundExpr::Cast { ty, .. } => *ty == target_type,
+            BoundExpr::Integer(_) => target_type == Type::Bigint,
+            BoundExpr::Float(_) => target_type == Type::Double,
+            BoundExpr::Boolean(_) => target_type == Type::Bool,
+            BoundExpr::String(_) => target_type == Type::Text,
+            _ => false,
+        }
+    }
+}
+
 impl Expr {
     /// Converts this AST [`Expr`] into a [`BoundExpr`] by resolving column names
     /// to positional indices via the provided column descriptors.
@@ -655,5 +687,45 @@ mod tests {
 
         let err = parse_expr("count()").bind(&columns).unwrap_err();
         assert!(matches!(err, ExecutorError::Unsupported(_)));
+    }
+
+    #[test]
+    fn test_coerce_null_passthrough() {
+        assert!(matches!(
+            BoundExpr::Null.coerce(Type::Integer),
+            BoundExpr::Null
+        ));
+    }
+
+    #[test]
+    fn test_coerce_matching_type_no_cast() {
+        let expr = BoundExpr::String("hello".to_string());
+        let coerced = expr.coerce(Type::Text);
+        assert!(matches!(coerced, BoundExpr::String(s) if s == "hello"));
+    }
+
+    #[test]
+    fn test_coerce_already_cast_to_target() {
+        let expr = BoundExpr::Cast {
+            expr: Box::new(BoundExpr::Integer(1)),
+            ty: Type::Smallint,
+        };
+        let coerced = expr.coerce(Type::Smallint);
+        // Should not double-wrap
+        let BoundExpr::Cast { ty, .. } = &coerced else {
+            panic!("expected Cast");
+        };
+        assert_eq!(*ty, Type::Smallint);
+    }
+
+    #[test]
+    fn test_coerce_wraps_in_cast() {
+        let expr = BoundExpr::Integer(42);
+        let coerced = expr.coerce(Type::Smallint);
+        let BoundExpr::Cast { ty, expr } = &coerced else {
+            panic!("expected Cast, got {:?}", coerced);
+        };
+        assert_eq!(*ty, Type::Smallint);
+        assert!(matches!(expr.as_ref(), BoundExpr::Integer(42)));
     }
 }

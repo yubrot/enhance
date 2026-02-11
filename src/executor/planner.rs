@@ -67,14 +67,7 @@ pub async fn plan_select<S: Storage, R: Replacer>(
     };
 
     // Step 2: WHERE clause -> Filter (bind column names to indices)
-    if let Some(where_clause) = &select.where_clause {
-        let columns = plan.columns().to_vec();
-        let bound_predicate = where_clause.bind(&columns)?;
-        plan = QueryPlan::Filter {
-            input: Box::new(plan),
-            predicate: bound_predicate,
-        };
-    }
+    plan = apply_filter(plan, select.where_clause.as_ref())?;
 
     // Step 3: SELECT list -> Projection
     plan = build_projection_plan(plan, &select.columns)?;
@@ -158,8 +151,7 @@ pub async fn plan_insert<S: Storage, R: Replacer>(
         for (expr_idx, &col_idx) in column_mapping.iter().enumerate() {
             let bound = row_exprs[expr_idx].bind(&[])?;
             let target_type = schema[col_idx];
-            let coerced = coerce_expr(bound, target_type);
-            bound_row[col_idx] = coerced;
+            bound_row[col_idx] = bound.coerce(target_type);
         }
 
         // SERIAL columns that were not explicitly provided remain as Null —
@@ -199,21 +191,12 @@ pub async fn plan_update<S: Storage, R: Replacer>(
     // Build the input scan plan
     let scan_plan = build_seq_scan_plan(&update.table, None, catalog, snapshot).await?;
 
-    // Wrap with Filter if WHERE clause exists
-    let input = if let Some(where_clause) = &update.where_clause {
-        let columns = scan_plan.columns().to_vec();
-        let bound_predicate = where_clause.bind(&columns)?;
-        QueryPlan::Filter {
-            input: Box::new(scan_plan),
-            predicate: bound_predicate,
-        }
-    } else {
-        scan_plan
-    };
+    let input = apply_filter(scan_plan, update.where_clause.as_ref())?;
 
     let input_columns = input.columns().to_vec();
 
-    // Get column metadata for type coercion
+    // NOTE: This duplicates the table/column lookup already done inside build_seq_scan_plan.
+    // A shared ResolvedTable struct could eliminate this when Catalog access is restructured.
     let table_info = catalog
         .get_table(snapshot, &update.table)
         .await?
@@ -242,7 +225,7 @@ pub async fn plan_update<S: Storage, R: Replacer>(
 
         let bound = assignment.value.bind(&input_columns)?;
         let target_type = schema[col_idx];
-        bound_assignments[col_idx] = coerce_expr(bound, target_type);
+        bound_assignments[col_idx] = bound.coerce(target_type);
     }
 
     Ok(DmlPlan::Update {
@@ -269,17 +252,7 @@ pub async fn plan_delete<S: Storage, R: Replacer>(
     // Build the input scan plan
     let scan_plan = build_seq_scan_plan(&delete.table, None, catalog, snapshot).await?;
 
-    // Wrap with Filter if WHERE clause exists
-    let input = if let Some(where_clause) = &delete.where_clause {
-        let columns = scan_plan.columns().to_vec();
-        let bound_predicate = where_clause.bind(&columns)?;
-        QueryPlan::Filter {
-            input: Box::new(scan_plan),
-            predicate: bound_predicate,
-        }
-    } else {
-        scan_plan
-    };
+    let input = apply_filter(scan_plan, delete.where_clause.as_ref())?;
 
     Ok(DmlPlan::Delete {
         table_name: delete.table.clone(),
@@ -315,46 +288,18 @@ fn resolve_insert_columns(
     Ok(mapping)
 }
 
-/// Wraps a bound expression in a cast if the expression's type doesn't match
-/// the target column type.
-///
-/// For literal values, this inserts a `BoundExpr::Cast` node so that runtime
-/// evaluation will apply the conversion. NULL values pass through without casting.
-fn coerce_expr(expr: BoundExpr, target_type: Type) -> BoundExpr {
-    // NULL doesn't need coercion
-    if matches!(&expr, BoundExpr::Null) {
-        return expr;
-    }
-
-    // If the expression already has a cast to the right type, no additional wrapping needed
-    if let BoundExpr::Cast { ref ty, .. } = expr
-        && *ty == target_type
-    {
-        return expr;
-    }
-
-    // Infer the expression type — if it matches target, no cast needed
-    if let Some(et) = infer_bound_expr_type(&expr)
-        && et == target_type
-    {
-        return expr;
-    }
-
-    BoundExpr::Cast {
-        expr: Box::new(expr),
-        ty: target_type,
-    }
-}
-
-/// Infers the type of a bound expression.
-fn infer_bound_expr_type(expr: &BoundExpr) -> Option<Type> {
-    match expr {
-        BoundExpr::Integer(_) => Some(Type::Bigint),
-        BoundExpr::Float(_) => Some(Type::Double),
-        BoundExpr::Boolean(_) => Some(Type::Bool),
-        BoundExpr::String(_) => Some(Type::Text),
-        BoundExpr::Cast { ty, .. } => Some(*ty),
-        _ => None,
+/// Wraps a plan in a [`QueryPlan::Filter`] if a WHERE predicate is present.
+fn apply_filter(plan: QueryPlan, where_clause: Option<&Expr>) -> Result<QueryPlan, ExecutorError> {
+    match where_clause {
+        Some(expr) => {
+            let columns = plan.columns().to_vec();
+            let predicate = expr.bind(&columns)?;
+            Ok(QueryPlan::Filter {
+                input: Box::new(plan),
+                predicate,
+            })
+        }
+        None => Ok(plan),
     }
 }
 
@@ -393,6 +338,9 @@ async fn build_table_ref_plan<S: Storage, R: Replacer>(
 ///
 /// When `alias` is provided, it is used as the column source table name
 /// so that qualified references like `t.id` resolve correctly.
+///
+/// NOTE: When IndexScan is introduced, this will be subsumed by a `build_scan_plan`
+/// that takes WHERE predicates and selects between SeqScan and IndexScan.
 async fn build_seq_scan_plan<S: Storage, R: Replacer>(
     table_name: &str,
     alias: Option<&str>,
