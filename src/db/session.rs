@@ -206,8 +206,15 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 Ok(QueryResult::command("BEGIN"))
             }
             Statement::Commit => {
-                self.commit()?;
-                Ok(QueryResult::command("COMMIT"))
+                // In a failed transaction, COMMIT acts as ROLLBACK
+                // (following PostgreSQL behavior).
+                if self.transaction.as_ref().is_some_and(|tx| tx.failed) {
+                    self.rollback();
+                    Ok(QueryResult::command("ROLLBACK"))
+                } else {
+                    self.commit()?;
+                    Ok(QueryResult::command("COMMIT"))
+                }
             }
             Statement::Rollback => {
                 self.rollback();
@@ -967,7 +974,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dml_auto_commit() {
+    async fn test_commit_on_failed_transaction_acts_as_rollback() {
         let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
         let mut session = Session::new(db);
 
@@ -976,44 +983,56 @@ mod tests {
             .await
             .unwrap();
 
-        // INSERT without explicit transaction → auto-commit
+        session.execute_query("BEGIN").await.unwrap();
         session
             .execute_query("INSERT INTO t VALUES (1)")
             .await
             .unwrap();
-        assert!(session.transaction().is_none()); // Should be idle
 
-        // Data should be visible in a new auto-commit SELECT
+        // Cause an error to put transaction in failed state
+        let result = session.execute_query("SELECT * FROM nonexistent").await;
+        assert!(result.is_err());
+        assert!(matches!(
+            session.transaction(),
+            Some(tx) if tx.failed
+        ));
+
+        // COMMIT on failed transaction should act as ROLLBACK
+        let result = session.execute_query("COMMIT").await.unwrap().unwrap();
+        let QueryResult::Command { tag } = result else {
+            panic!("expected Command result");
+        };
+        assert_eq!(tag, "ROLLBACK");
+        assert!(session.transaction().is_none());
+
+        // The INSERT before the error should NOT have been committed
         let result = session
             .execute_query("SELECT * FROM t")
             .await
             .unwrap()
             .unwrap();
         let QueryResult::Rows { rows, .. } = result else {
-            panic!("expected Rows");
+            panic!("expected Rows result");
         };
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 0);
     }
 
     #[tokio::test]
-    async fn test_failed_dml_sets_failed_flag() {
+    async fn test_insert_error_aborts_auto_commit() {
         let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
         let mut session = Session::new(db);
 
-        session.execute_query("BEGIN").await.unwrap();
-
-        // INSERT into non-existent table
+        // INSERT into non-existent table without explicit transaction
         let result = session
             .execute_query("INSERT INTO nonexistent VALUES (1)")
             .await;
-        assert!(result.is_err());
+        assert!(matches!(result, Err(DatabaseError::Executor(_))));
 
-        // Transaction should be in failed state
-        assert!(matches!(
-            session.transaction(),
-            Some(tx) if tx.failed
-        ));
+        // Auto-commit transaction should be aborted; session should be idle
+        assert!(session.transaction().is_none());
 
-        session.execute_query("ROLLBACK").await.unwrap();
+        // Session should work normally after the error
+        let result = session.execute_query("SELECT 1").await;
+        assert!(result.is_ok());
     }
 }
