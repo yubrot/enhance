@@ -200,6 +200,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_insert_cid_visibility() {
+        let pool = create_pool().await;
+        let tx_manager = TransactionManager::new();
+        let first_page = create_heap_table(&pool).await;
+        let schema = [Type::Integer, Type::Text];
+
+        let txid = tx_manager.begin();
+
+        // Insert a tuple at CID 0
+        let record = Record::new(vec![Value::Integer(42), Value::Text("hello".into())]);
+        let tid = insert(&pool, first_page, &record, txid, CommandId::FIRST)
+            .await
+            .unwrap();
+        assert_eq!(tid.page_id, first_page);
+
+        // Same-CID scan: tuple inserted at CID 0 is NOT visible to CID 0
+        // (MVCC rule: cmin < current_cid required, but 0 < 0 is false)
+        let snapshot0 = tx_manager.snapshot(txid, CommandId::FIRST);
+        let tuples = collect_all_visible(&pool, first_page, &schema, &snapshot0, &tx_manager).await;
+        assert_eq!(tuples.len(), 0, "same-CID insert should not be visible");
+
+        // Next command's snapshot (CID 1): tuple IS visible (cmin 0 < current_cid 1)
+        let snapshot1 = tx_manager.snapshot(txid, CommandId::new(1));
+        let tuples = collect_all_visible(&pool, first_page, &schema, &snapshot1, &tx_manager).await;
+        assert_eq!(tuples.len(), 1);
+        assert_eq!(tuples[0].1.values[0], Value::Integer(42));
+        assert_eq!(tuples[0].1.values[1], Value::Text("hello".into()));
+    }
+
+    #[tokio::test]
+    async fn test_delete_cid_visibility() {
+        let pool = create_pool().await;
+        let tx_manager = TransactionManager::new();
+        let first_page = create_heap_table(&pool).await;
+        let schema = [Type::Integer];
+
+        let txid = tx_manager.begin();
+
+        // Insert and delete at CID 0 (same command can delete what it inserted)
+        let record = Record::new(vec![Value::Integer(1)]);
+        let tid = insert(&pool, first_page, &record, txid, CommandId::FIRST)
+            .await
+            .unwrap();
+        delete(&pool, tid, txid, CommandId::FIRST).await.unwrap();
+
+        // After delete, CID 1 snapshot should not see the tuple
+        let snapshot1 = tx_manager.snapshot(txid, CommandId::new(1));
+        let tuples = collect_all_visible(&pool, first_page, &schema, &snapshot1, &tx_manager).await;
+        assert_eq!(tuples.len(), 0, "deleted tuple should not be visible");
+    }
+
+    #[tokio::test]
+    async fn test_update_cid_visibility() {
+        let pool = create_pool().await;
+        let tx_manager = TransactionManager::new();
+        let first_page = create_heap_table(&pool).await;
+        let schema = [Type::Integer, Type::Text];
+
+        let txid = tx_manager.begin();
+
+        // Insert a tuple at CID 0
+        let record = Record::new(vec![Value::Integer(1), Value::Text("old".into())]);
+        let old_tid = insert(&pool, first_page, &record, txid, CommandId::FIRST)
+            .await
+            .unwrap();
+
+        // Update at CID 1 (CID 1 scan sees old version, so update is possible)
+        let new_record = Record::new(vec![Value::Integer(1), Value::Text("new".into())]);
+        let new_tid = update(
+            &pool,
+            first_page,
+            old_tid,
+            &new_record,
+            txid,
+            CommandId::new(1),
+        )
+        .await
+        .unwrap();
+
+        // New version should be on the same page (same-page priority)
+        assert_eq!(new_tid.page_id, old_tid.page_id);
+
+        // CID 2 snapshot: only the new version should be visible
+        let snapshot2 = tx_manager.snapshot(txid, CommandId::new(2));
+        let tuples = collect_all_visible(&pool, first_page, &schema, &snapshot2, &tx_manager).await;
+        assert_eq!(tuples.len(), 1);
+        assert_eq!(tuples[0].1.values[1], Value::Text("new".into()));
+    }
+
+    #[tokio::test]
     async fn test_insert_into_empty_page() {
         let pool = create_pool().await;
         let tx_manager = TransactionManager::new();
