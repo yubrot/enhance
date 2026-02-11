@@ -177,9 +177,10 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 .await
             }
             Statement::Explain(inner_stmt) => match inner_stmt.as_ref() {
-                Statement::Select(_) | Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
-                    Ok(Some(vec![ColumnDesc::explain()]))
-                }
+                Statement::Select(_)
+                | Statement::Insert(_)
+                | Statement::Update(_)
+                | Statement::Delete(_) => Ok(Some(vec![ColumnDesc::explain()])),
                 _ => Ok(None),
             },
             _ => Ok(None),
@@ -242,8 +243,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::Insert(insert_stmt) => {
                 self.within_transaction(|db, txid, cid| async move {
                     let snapshot = db.tx_manager().snapshot(txid, cid);
-                    let plan =
-                        executor::plan_insert(insert_stmt, db.catalog(), &snapshot).await?;
+                    let plan = executor::plan_insert(insert_stmt, db.catalog(), &snapshot).await?;
                     let ctx = db.exec_context(snapshot);
                     let count = plan.execute_dml(&ctx).await?;
                     Ok(QueryResult::command(format!("INSERT 0 {}", count)))
@@ -253,8 +253,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::Update(update_stmt) => {
                 self.within_transaction(|db, txid, cid| async move {
                     let snapshot = db.tx_manager().snapshot(txid, cid);
-                    let plan =
-                        executor::plan_update(update_stmt, db.catalog(), &snapshot).await?;
+                    let plan = executor::plan_update(update_stmt, db.catalog(), &snapshot).await?;
                     let ctx = db.exec_context(snapshot);
                     let count = plan.execute_dml(&ctx).await?;
                     Ok(QueryResult::command(format!("UPDATE {}", count)))
@@ -264,8 +263,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::Delete(delete_stmt) => {
                 self.within_transaction(|db, txid, cid| async move {
                     let snapshot = db.tx_manager().snapshot(txid, cid);
-                    let plan =
-                        executor::plan_delete(delete_stmt, db.catalog(), &snapshot).await?;
+                    let plan = executor::plan_delete(delete_stmt, db.catalog(), &snapshot).await?;
                     let ctx = db.exec_context(snapshot);
                     let count = plan.execute_dml(&ctx).await?;
                     Ok(QueryResult::command(format!("DELETE {}", count)))
@@ -949,8 +947,7 @@ mod tests {
             panic!("expected Rows");
         };
         assert_eq!(rows.len(), 2);
-        let vals: Vec<&crate::datum::Value> =
-            rows.iter().map(|r| &r.record.values[0]).collect();
+        let vals: Vec<&crate::datum::Value> = rows.iter().map(|r| &r.record.values[0]).collect();
         assert!(vals.contains(&&crate::datum::Value::Text("a".into())));
         assert!(vals.contains(&&crate::datum::Value::Text("x".into())));
 

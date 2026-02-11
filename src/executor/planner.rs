@@ -301,17 +301,13 @@ fn resolve_insert_columns(
     for name in column_names {
         let lower = name.to_lowercase();
         if !seen.insert(lower.clone()) {
-            return Err(ExecutorError::DuplicateColumn {
-                name: name.clone(),
-            });
+            return Err(ExecutorError::DuplicateColumn { name: name.clone() });
         }
 
         let col_idx = column_infos
             .iter()
             .position(|c| c.column_name.to_lowercase() == lower)
-            .ok_or_else(|| ExecutorError::ColumnNotFound {
-                name: name.clone(),
-            })?;
+            .ok_or_else(|| ExecutorError::ColumnNotFound { name: name.clone() })?;
 
         mapping.push(col_idx);
     }
@@ -1004,8 +1000,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_insert_serial_auto_populate() {
-        let (db, snapshot) =
-            setup_db_with_table("CREATE TABLE users (id SERIAL, name TEXT)").await;
+        let (db, snapshot) = setup_db_with_table("CREATE TABLE users (id SERIAL, name TEXT)").await;
         // Don't specify id — should be auto-populated
         let insert = parse_insert("INSERT INTO users (name) VALUES ('Alice')");
 
@@ -1029,17 +1024,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_insert_serial_explicit_value() {
-        let (db, snapshot) =
-            setup_db_with_table("CREATE TABLE users (id SERIAL, name TEXT)").await;
+        let (db, snapshot) = setup_db_with_table("CREATE TABLE users (id SERIAL, name TEXT)").await;
         // Explicitly provide id — should NOT auto-populate
         let insert = parse_insert("INSERT INTO users (id, name) VALUES (99, 'Bob')");
 
         let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
 
-        let Plan::Insert {
-            serial_columns, ..
-        } = &plan
-        else {
+        let Plan::Insert { serial_columns, .. } = &plan else {
             panic!("expected Plan::Insert");
         };
         // SERIAL column explicitly provided → not in auto-populate list
@@ -1070,10 +1061,7 @@ mod tests {
         let insert = parse_insert("INSERT INTO users (id, id) VALUES (1, 2)");
 
         let result = plan_insert(&insert, db.catalog(), &snapshot).await;
-        assert!(matches!(
-            result,
-            Err(ExecutorError::DuplicateColumn { .. })
-        ));
+        assert!(matches!(result, Err(ExecutorError::DuplicateColumn { .. })));
     }
 
     #[tokio::test]
@@ -1083,10 +1071,7 @@ mod tests {
         let insert = parse_insert("INSERT INTO users (id, nonexistent) VALUES (1, 'x')");
 
         let result = plan_insert(&insert, db.catalog(), &snapshot).await;
-        assert!(matches!(
-            result,
-            Err(ExecutorError::ColumnNotFound { .. })
-        ));
+        assert!(matches!(result, Err(ExecutorError::ColumnNotFound { .. })));
     }
 
     #[tokio::test]
@@ -1095,16 +1080,12 @@ mod tests {
         let insert = parse_insert("INSERT INTO nonexistent VALUES (1)");
 
         let result = plan_insert(&insert, db.catalog(), &snapshot).await;
-        assert!(matches!(
-            result,
-            Err(ExecutorError::TableNotFound { .. })
-        ));
+        assert!(matches!(result, Err(ExecutorError::TableNotFound { .. })));
     }
 
     #[tokio::test]
     async fn test_plan_insert_type_coercion() {
-        let (db, snapshot) =
-            setup_db_with_table("CREATE TABLE t (val SMALLINT)").await;
+        let (db, snapshot) = setup_db_with_table("CREATE TABLE t (val SMALLINT)").await;
         // Integer literal 42 (Bigint) → should be coerced to Smallint
         let insert = parse_insert("INSERT INTO t VALUES (42)");
 
@@ -1115,7 +1096,10 @@ mod tests {
         };
         // Should have a Cast wrapping the integer literal
         let BoundExpr::Cast { ty, .. } = &values[0][0] else {
-            panic!("expected Cast expression for type coercion, got {:?}", &values[0][0]);
+            panic!(
+                "expected Cast expression for type coercion, got {:?}",
+                &values[0][0]
+            );
         };
         assert_eq!(*ty, Type::Smallint);
     }
@@ -1137,8 +1121,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_insert_null_no_cast() {
-        let (db, snapshot) =
-            setup_db_with_table("CREATE TABLE t (val INTEGER)").await;
+        let (db, snapshot) = setup_db_with_table("CREATE TABLE t (val INTEGER)").await;
         // NULL should pass through without a Cast wrapper
         let insert = parse_insert("INSERT INTO t VALUES (NULL)");
 
@@ -1154,8 +1137,7 @@ mod tests {
     async fn test_plan_insert_explain() {
         let (db, snapshot) =
             setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
-        let insert =
-            parse_insert("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')");
+        let insert = parse_insert("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')");
 
         let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
         assert_eq!(plan.explain(), "Insert on users (2 rows)");
@@ -1192,7 +1174,10 @@ mod tests {
         assert_eq!(schema, &[Type::Integer, Type::Text]);
         assert_eq!(assignments.len(), 2);
         // id should be identity (Column { index: 0 })
-        assert!(matches!(&assignments[0], BoundExpr::Column { index: 0, .. }));
+        assert!(matches!(
+            &assignments[0],
+            BoundExpr::Column { index: 0, .. }
+        ));
         // name should be the string literal 'Bob'
         assert!(matches!(&assignments[1], BoundExpr::String(s) if s == "Bob"));
     }
@@ -1218,8 +1203,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_update_type_coercion() {
-        let (db, snapshot) =
-            setup_db_with_table("CREATE TABLE t (val SMALLINT)").await;
+        let (db, snapshot) = setup_db_with_table("CREATE TABLE t (val SMALLINT)").await;
         // Integer literal 42 (Bigint) → should be coerced to Smallint
         let update = parse_update("UPDATE t SET val = 42");
 
@@ -1247,7 +1231,10 @@ mod tests {
             panic!("expected Plan::Update");
         };
         // id should be identity
-        assert!(matches!(&assignments[0], BoundExpr::Column { index: 0, .. }));
+        assert!(matches!(
+            &assignments[0],
+            BoundExpr::Column { index: 0, .. }
+        ));
         // count should be a Cast(BinaryOp(Column + Integer)) since count+1 infers as Bigint
         // and target is Integer
         assert!(matches!(&assignments[1], BoundExpr::Cast { .. }));
