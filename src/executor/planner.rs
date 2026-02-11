@@ -438,7 +438,7 @@ fn resolve_select_item(
         }
         SelectItem::Expr { expr, alias } => {
             let bound = expr.bind(input_columns)?;
-            let ty = bound.ty();
+            let ty = bound.ty().unwrap_or(Type::Text);
             let alias_name = alias.as_deref().map(str::to_string);
             let (name, source) = match &bound {
                 BoundExpr::Column { index, .. } => {
