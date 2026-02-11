@@ -9,8 +9,6 @@
 //! raw 8KB page buffers. Header interpretation is the responsibility of higher-level
 //! modules (e.g., heap pages, B+tree nodes) that manage specific page formats.
 
-use super::PAGE_SIZE;
-
 /// Size of the page header in bytes.
 pub const PAGE_HEADER_SIZE: usize = 24;
 
@@ -82,7 +80,10 @@ pub struct PageHeader {
 
 impl PageHeader {
     /// Creates a new header for an empty heap page.
-    pub fn new_heap_page() -> Self {
+    ///
+    /// `free_end` is the byte offset where the usable data area ends (i.e., the
+    /// boundary before any page-type-specific footer such as `HeapFooter`).
+    pub fn new_heap_page(free_end: u16) -> Self {
         Self {
             page_lsn: 0,
             checksum: 0,
@@ -91,7 +92,7 @@ impl PageHeader {
             flags: 0,
             slot_count: 0,
             first_free_slot: u16::MAX,
-            free_end: PAGE_SIZE as u16,
+            free_end,
         }
     }
 
@@ -141,6 +142,7 @@ impl PageHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::PAGE_SIZE;
 
     #[test]
     fn test_page_type_try_from() {
@@ -152,7 +154,7 @@ mod tests {
 
     #[test]
     fn test_header_free_space() {
-        let header = PageHeader::new_heap_page();
+        let header = PageHeader::new_heap_page(PAGE_SIZE as u16);
         const SLOT_SIZE: usize = 4;
         assert_eq!(
             header.free_space(SLOT_SIZE),

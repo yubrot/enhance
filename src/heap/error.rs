@@ -3,6 +3,7 @@
 use std::fmt;
 
 use crate::datum::SerializationError;
+use crate::storage::BufferPoolError;
 
 /// Errors from heap operations.
 #[derive(Debug)]
@@ -25,6 +26,8 @@ pub enum HeapError {
     },
     /// Serialization error.
     Serialization(SerializationError),
+    /// Buffer pool / storage layer error.
+    BufferPool(BufferPoolError),
 }
 
 impl fmt::Display for HeapError {
@@ -53,6 +56,9 @@ impl fmt::Display for HeapError {
             HeapError::Serialization(err) => {
                 write!(f, "serialization error: {}", err)
             }
+            HeapError::BufferPool(err) => {
+                write!(f, "buffer pool error: {}", err)
+            }
         }
     }
 }
@@ -62,5 +68,11 @@ impl std::error::Error for HeapError {}
 impl From<SerializationError> for HeapError {
     fn from(err: SerializationError) -> Self {
         HeapError::Serialization(err)
+    }
+}
+
+impl From<BufferPoolError> for HeapError {
+    fn from(err: BufferPoolError) -> Self {
+        HeapError::BufferPool(err)
     }
 }

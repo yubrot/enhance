@@ -9,19 +9,31 @@
 //!   This is a conceptual term for the on-disk format, not a struct.
 //! - **Record**: Data values only (Vec<Value>), without MVCC information
 //!
-//! ## Components
+//! ## Interface Layers
 //!
-//! - [`HeapPage`]: Page-level tuple storage using slotted page structure
+//! - **[`HeapPage`]** — Low-level, single-page operations. Callers manage page
+//!   fetching and chain traversal themselves. Used for page initialization,
+//!   catalog bootstrap, and MVCC-bypassing in-place updates (e.g., sequences).
+//! - **[`insert`], [`delete`], [`update`], [`scan_visible_page`]** — High-level
+//!   functions that operate on a heap page chain, handling page traversal,
+//!   allocation, and MVCC visibility automatically.
+//!
+//! ## Other Components
+//!
 //! - [`Record`]: Data values for a row (combined with TupleHeader to form a tuple)
 //! - [`TupleId`]: Physical location of a tuple (page + slot)
 
 mod error;
 mod page;
 mod record;
+mod scan;
+mod write;
 
 pub use error::HeapError;
 pub use page::{HeapPage, MAX_RECORD_SIZE, SlotId};
 pub use record::Record;
+pub use scan::scan_visible_page;
+pub use write::{delete, insert, update};
 
 /// Physical location of a tuple within the heap storage.
 ///

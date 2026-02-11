@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 use super::error::CatalogError;
 use super::schema::{ColumnInfo, SequenceInfo, SystemCatalogTable, TableInfo};
 use super::superblock::Superblock;
-use crate::heap::HeapPage;
+use crate::heap::{HeapPage, insert, scan_visible_page};
 use crate::sql::{CreateTableStmt, DataType};
 use crate::storage::{BufferPool, PageId, Replacer, Storage};
 use crate::tx::{CommandId, Snapshot, TransactionManager, TxId};
@@ -22,16 +22,24 @@ use crate::tx::{CommandId, Snapshot, TransactionManager, TxId};
 ///
 /// This is a low-level store without caching. Use `catalog::cached::Catalog`
 /// wrapper for efficient access.
-///
-/// Each catalog table uses a single page for simplicity. Multi-page
-/// support will be added in Step 15 with FSM.
 pub struct Catalog<S: Storage, R: Replacer> {
     /// Buffer pool for page access.
     pool: Arc<BufferPool<S, R>>,
     /// Transaction manager for MVCC.
     tx_manager: Arc<TransactionManager>,
     /// Superblock with catalog metadata (protected for updates).
-    superblock: RwLock<Superblock>,
+    superblock: Arc<RwLock<Superblock>>,
+}
+
+// Manual Clone impl: all fields are Arc-based, so cloning is lightweight.
+impl<S: Storage, R: Replacer> Clone for Catalog<S, R> {
+    fn clone(&self) -> Self {
+        Self {
+            pool: Arc::clone(&self.pool),
+            tx_manager: Arc::clone(&self.tx_manager),
+            superblock: Arc::clone(&self.superblock),
+        }
+    }
 }
 
 impl<S: Storage, R: Replacer> Catalog<S, R> {
@@ -47,7 +55,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         Self {
             pool,
             tx_manager,
-            superblock: RwLock::new(superblock),
+            superblock: Arc::new(RwLock::new(superblock)),
         }
     }
 
@@ -66,8 +74,6 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         // NOTE: Using assert_eq! here panics instead of returning an error.
         // Production code should return CatalogError::InvalidSuperblock or similar.
         assert_eq!(sb_guard.page_id(), PageId::new(0), "First page must be 0");
-        sb_guard.data_mut().fill(0);
-        drop(sb_guard);
 
         let sys_tables_guard = pool.new_page().await?;
         let sys_tables_page = sys_tables_guard.page_id();
@@ -88,7 +94,6 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         superblock.next_table_id = super::schema::LAST_RESERVED_TABLE_ID + 1;
         superblock.next_seq_id = 1;
 
-        let mut sb_guard = pool.fetch_page_mut(PageId::new(0), true).await?;
         superblock.write(sb_guard.data_mut());
         drop(sb_guard);
 
@@ -99,41 +104,21 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         let cid = CommandId::FIRST;
 
         // Insert catalog table metadata into sys_tables
-        {
-            let mut page = HeapPage::new(pool.fetch_page_mut(sys_tables_page, true).await?);
-
-            // sys_tables entry
-            let table_info = TableInfo::table_info(sys_tables_page);
-            page.insert(&table_info.to_record(), txid, cid)?;
-
-            // sys_columns entry
-            let table_info = ColumnInfo::table_info(sys_columns_page);
-            page.insert(&table_info.to_record(), txid, cid)?;
-
-            // sys_sequences entry
-            let table_info = SequenceInfo::table_info(sys_sequences_page);
-            page.insert(&table_info.to_record(), txid, cid)?;
+        for table_info in [
+            TableInfo::table_info(sys_tables_page),
+            ColumnInfo::table_info(sys_columns_page),
+            SequenceInfo::table_info(sys_sequences_page),
+        ] {
+            insert(&pool, sys_tables_page, &table_info.to_record(), txid, cid).await?;
         }
 
         // Insert column metadata into sys_columns
+        for col in TableInfo::columns()
+            .into_iter()
+            .chain(ColumnInfo::columns())
+            .chain(SequenceInfo::columns())
         {
-            let mut page = HeapPage::new(pool.fetch_page_mut(sys_columns_page, true).await?);
-
-            for (i, (name, oid)) in TableInfo::columns().into_iter().enumerate() {
-                let col = ColumnInfo::new(TableInfo::TABLE_ID, i as u32, name.to_string(), oid, 0);
-                page.insert(&col.to_record(), txid, cid)?;
-            }
-
-            for (i, (name, oid)) in ColumnInfo::columns().into_iter().enumerate() {
-                let col = ColumnInfo::new(ColumnInfo::TABLE_ID, i as u32, name.to_string(), oid, 0);
-                page.insert(&col.to_record(), txid, cid)?;
-            }
-
-            for (i, (name, oid)) in SequenceInfo::columns().into_iter().enumerate() {
-                let col =
-                    ColumnInfo::new(SequenceInfo::TABLE_ID, i as u32, name.to_string(), oid, 0);
-                page.insert(&col.to_record(), txid, cid)?;
-            }
+            insert(&pool, sys_columns_page, &col.to_record(), txid, cid).await?;
         }
 
         pool.flush_all().await?;
@@ -182,32 +167,40 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
 
     /// Looks up a table by name.
     ///
-    /// Scans sys_tables to find the table metadata.
+    /// Scans the full sys_tables page chain to find the table metadata.
     pub async fn get_table(
         &self,
         snapshot: &Snapshot,
         name: &str,
     ) -> Result<Option<TableInfo>, CatalogError> {
         let sys_tables_page = self.superblock.read().sys_tables_page;
-        let page = HeapPage::new(self.pool.fetch_page(sys_tables_page).await?);
+        let mut current_page = Some(sys_tables_page);
 
-        for (_slot_id, header, record) in page.scan(TableInfo::SCHEMA) {
-            if !snapshot.is_tuple_visible(&header, &self.tx_manager) {
-                continue;
-            }
+        while let Some(page_id) = current_page {
+            let (tuples, next_page) = scan_visible_page(
+                &self.pool,
+                page_id,
+                TableInfo::SCHEMA,
+                snapshot,
+                &self.tx_manager,
+            )
+            .await?;
+            current_page = next_page;
 
-            let Some(info) = TableInfo::from_record(&record) else {
-                // NOTE: from_record() returns None when deserialization fails, indicating
-                // possible data corruption. For learning purposes, we silently skip.
-                // Production systems should either:
-                // - Log corruption warnings and attempt recovery
-                // - Return CatalogError::CorruptedMetadata to fail fast
-                // - Use checksums (Step 13) to detect corruption earlier
-                continue;
-            };
+            for (_tid, record) in tuples {
+                let Some(info) = TableInfo::from_record(&record) else {
+                    // NOTE: from_record() returns None when deserialization fails, indicating
+                    // possible data corruption. For learning purposes, we silently skip.
+                    // Production systems should either:
+                    // - Log corruption warnings and attempt recovery
+                    // - Return CatalogError::CorruptedMetadata to fail fast
+                    // - Use checksums (Step 13) to detect corruption earlier
+                    continue;
+                };
 
-            if info.table_name == name {
-                return Ok(Some(info));
+                if info.table_name == name {
+                    return Ok(Some(info));
+                }
             }
         }
 
@@ -216,31 +209,39 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
 
     /// Gets columns for a table.
     ///
-    /// Scans sys_columns to find the column metadata.
+    /// Scans the full sys_columns page chain to find the column metadata.
     pub async fn get_columns(
         &self,
         snapshot: &Snapshot,
         table_id: u32,
     ) -> Result<Vec<ColumnInfo>, CatalogError> {
         let sys_columns_page = self.superblock.read().sys_columns_page;
-        let page = HeapPage::new(self.pool.fetch_page(sys_columns_page).await?);
+        let mut current_page = Some(sys_columns_page);
 
         let mut columns = Vec::new();
-        for (_slot_id, header, record) in page.scan(ColumnInfo::SCHEMA) {
-            if !snapshot.is_tuple_visible(&header, &self.tx_manager) {
-                continue;
+        while let Some(page_id) = current_page {
+            let (tuples, next_page) = scan_visible_page(
+                &self.pool,
+                page_id,
+                ColumnInfo::SCHEMA,
+                snapshot,
+                &self.tx_manager,
+            )
+            .await?;
+            current_page = next_page;
+
+            for (_tid, record) in tuples {
+                let Some(col) = ColumnInfo::from_record(&record) else {
+                    // NOTE: Silently skipping corrupted records. See get_table() for details.
+                    continue;
+                };
+
+                if col.table_id != table_id {
+                    continue;
+                }
+
+                columns.push(col);
             }
-
-            let Some(col) = ColumnInfo::from_record(&record) else {
-                // NOTE: Silently skipping corrupted records. See get_table() for details.
-                continue;
-            };
-
-            if col.table_id != table_id {
-                continue;
-            }
-
-            columns.push(col);
         }
 
         // Sort by column_num
@@ -259,11 +260,14 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         first_page: PageId,
     ) -> Result<(), CatalogError> {
         let sys_tables_page = self.superblock.read().sys_tables_page;
-        HeapPage::new(self.pool.fetch_page_mut(sys_tables_page, true).await?).insert(
+        insert(
+            &self.pool,
+            sys_tables_page,
             &TableInfo::new(table_id, name.to_string(), first_page).to_record(),
             txid,
             cid,
-        )?;
+        )
+        .await?;
         Ok(())
     }
 
@@ -275,11 +279,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         col: &ColumnInfo,
     ) -> Result<(), CatalogError> {
         let sys_columns_page = self.superblock.read().sys_columns_page;
-        HeapPage::new(self.pool.fetch_page_mut(sys_columns_page, true).await?).insert(
-            &col.to_record(),
-            txid,
-            cid,
-        )?;
+        insert(&self.pool, sys_columns_page, &col.to_record(), txid, cid).await?;
         Ok(())
     }
 
@@ -372,11 +372,7 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         let seq = SequenceInfo::new(seq_id, name.to_string(), 1); // Start at 1
 
         let sys_sequences_page = self.superblock.read().sys_sequences_page;
-        HeapPage::new(self.pool.fetch_page_mut(sys_sequences_page, true).await?).insert(
-            &seq.to_record(),
-            txid,
-            cid,
-        )?;
+        insert(&self.pool, sys_sequences_page, &seq.to_record(), txid, cid).await?;
         Ok(seq_id)
     }
 

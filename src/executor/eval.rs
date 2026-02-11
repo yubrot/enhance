@@ -484,11 +484,13 @@ mod tests {
 
     #[test]
     fn test_evaluate_column() {
+        use crate::datum::Type;
         let record = Record::new(vec![Value::Bigint(1), Value::Text("alice".into())]);
         assert_eq!(
             BoundExpr::Column {
                 index: 0,
-                name: None
+                name: None,
+                ty: Type::Bigint,
             }
             .evaluate(&record)
             .unwrap(),
@@ -497,7 +499,8 @@ mod tests {
         assert_eq!(
             BoundExpr::Column {
                 index: 1,
-                name: Some("name".into())
+                name: Some("name".into()),
+                ty: Type::Text,
             }
             .evaluate(&record)
             .unwrap(),
@@ -507,11 +510,13 @@ mod tests {
 
     #[test]
     fn test_evaluate_column_out_of_bounds() {
+        use crate::datum::Type;
         let record = Record::new(vec![Value::Bigint(1)]);
         assert!(matches!(
             BoundExpr::Column {
                 index: 5,
-                name: None
+                name: None,
+                ty: Type::Bigint,
             }
             .evaluate(&record),
             Err(ExecutorError::ColumnIndexOutOfBounds { index: 5, len: 1 })

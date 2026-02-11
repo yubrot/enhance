@@ -164,12 +164,12 @@ impl<S: Storage, R: Replacer> Session<S, R> {
     ///
     /// Returns an error if query planning fails (e.g., table not found).
     pub async fn describe_statement(
-        &self,
+        &mut self,
         stmt: &Statement,
     ) -> Result<Option<Vec<ColumnDesc>>, DatabaseError> {
         match stmt {
             Statement::Select(select_stmt) => {
-                self.within_transaction_ro(|db, txid, cid| async move {
+                self.run_in_transaction(false, |db, txid, cid| async move {
                     let snapshot = db.tx_manager().snapshot(txid, cid);
                     let plan = executor::plan_select(select_stmt, db.catalog(), &snapshot).await?;
                     Ok(Some(plan.columns().to_vec()))
@@ -177,7 +177,10 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 .await
             }
             Statement::Explain(inner_stmt) => match inner_stmt.as_ref() {
-                Statement::Select(_) => Ok(Some(vec![ColumnDesc::explain()])),
+                Statement::Select(_)
+                | Statement::Insert(_)
+                | Statement::Update(_)
+                | Statement::Delete(_) => Ok(Some(vec![ColumnDesc::explain()])),
                 _ => Ok(None),
             },
             _ => Ok(None),
@@ -203,15 +206,22 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 Ok(QueryResult::command("BEGIN"))
             }
             Statement::Commit => {
-                self.commit()?;
-                Ok(QueryResult::command("COMMIT"))
+                // In a failed transaction, COMMIT acts as ROLLBACK
+                // (following PostgreSQL behavior).
+                if self.transaction.as_ref().is_some_and(|tx| tx.failed) {
+                    self.rollback();
+                    Ok(QueryResult::command("ROLLBACK"))
+                } else {
+                    self.commit()?;
+                    Ok(QueryResult::command("COMMIT"))
+                }
             }
             Statement::Rollback => {
                 self.rollback();
                 Ok(QueryResult::command("ROLLBACK"))
             }
             Statement::CreateTable(create_stmt) => {
-                self.within_transaction(|db, txid, cid| async move {
+                self.run_in_transaction(true, |db, txid, cid| async move {
                     db.catalog()
                         .create_table(txid, cid, create_stmt)
                         .await
@@ -221,8 +231,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 .await
             }
             Statement::Select(select_stmt) => {
-                // TODO: We don't want to commit single select
-                self.within_transaction(|db, txid, cid| async move {
+                self.run_in_transaction(false, |db, txid, cid| async move {
                     let snapshot = db.tx_manager().snapshot(txid, cid);
                     let plan = executor::plan_select(select_stmt, db.catalog(), &snapshot).await?;
                     let columns = plan.columns().to_vec();
@@ -237,32 +246,70 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 })
                 .await
             }
-            Statement::Insert(_) => Ok(QueryResult::command("INSERT 0 0")),
-            Statement::Update(_) => Ok(QueryResult::command("UPDATE 0")),
-            Statement::Delete(_) => Ok(QueryResult::command("DELETE 0")),
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+                self.run_in_transaction(true, |db, txid, cid| async move {
+                    let snapshot = db.tx_manager().snapshot(txid, cid);
+                    let plan = match stmt {
+                        Statement::Insert(s) => {
+                            executor::plan_insert(s, db.catalog(), &snapshot).await?
+                        }
+                        Statement::Update(s) => {
+                            executor::plan_update(s, db.catalog(), &snapshot).await?
+                        }
+                        Statement::Delete(s) => {
+                            executor::plan_delete(s, db.catalog(), &snapshot).await?
+                        }
+                        _ => unreachable!(),
+                    };
+                    let ctx = db.exec_context(snapshot);
+                    let result = plan.execute_dml(&ctx).await?;
+                    Ok(QueryResult::command(result.command_tag()))
+                })
+                .await
+            }
             Statement::DropTable(_) => Ok(QueryResult::command("DROP TABLE")),
             Statement::CreateIndex(_) => Ok(QueryResult::command("CREATE INDEX")),
             Statement::DropIndex(_) => Ok(QueryResult::command("DROP INDEX")),
             Statement::Set(_) => Ok(QueryResult::command("SET")),
-            Statement::Explain(inner_stmt) => match inner_stmt.as_ref() {
-                Statement::Select(select_stmt) => {
-                    self.within_transaction(|db, txid, cid| async move {
-                        let snapshot = db.tx_manager().snapshot(txid, cid);
-                        let plan =
-                            executor::plan_select(select_stmt, db.catalog(), &snapshot).await?;
-                        Ok(QueryResult::Rows {
-                            columns: vec![ColumnDesc::explain()],
-                            rows: plan.explain().lines().map(Row::explain_line).collect(),
-                        })
+            Statement::Explain(inner_stmt) => {
+                self.run_in_transaction(false, |db, txid, cid| async move {
+                    let snapshot = db.tx_manager().snapshot(txid, cid);
+                    let explain_text = match inner_stmt.as_ref() {
+                        Statement::Select(select_stmt) => {
+                            executor::plan_select(select_stmt, db.catalog(), &snapshot)
+                                .await?
+                                .explain()
+                        }
+                        Statement::Insert(insert_stmt) => {
+                            executor::plan_insert(insert_stmt, db.catalog(), &snapshot)
+                                .await?
+                                .explain()
+                        }
+                        Statement::Update(update_stmt) => {
+                            executor::plan_update(update_stmt, db.catalog(), &snapshot)
+                                .await?
+                                .explain()
+                        }
+                        Statement::Delete(delete_stmt) => {
+                            executor::plan_delete(delete_stmt, db.catalog(), &snapshot)
+                                .await?
+                                .explain()
+                        }
+                        _ => {
+                            return Err(DatabaseError::Executor(
+                                crate::executor::ExecutorError::Unsupported(
+                                    "EXPLAIN for this statement type".to_string(),
+                                ),
+                            ));
+                        }
+                    };
+                    Ok(QueryResult::Rows {
+                        columns: vec![ColumnDesc::explain()],
+                        rows: explain_text.lines().map(Row::explain_line).collect(),
                     })
-                    .await
-                }
-                _ => Err(DatabaseError::Executor(
-                    crate::executor::ExecutorError::Unsupported(
-                        "EXPLAIN for non-SELECT statements".to_string(),
-                    ),
-                )),
-            },
+                })
+                .await
+            }
         }
     }
 
@@ -271,10 +318,15 @@ impl<S: Storage, R: Replacer> Session<S, R> {
     /// This helper handles the common transaction management pattern:
     /// - Increments command ID if in an active transaction
     /// - Creates an auto-commit transaction if not currently in one
-    /// - On success: commits the transaction if in auto-commit mode
+    /// - On success in auto-commit mode: commits if `commit_on_auto` is true,
+    ///   aborts otherwise (suitable for read-only operations like SELECT/EXPLAIN)
     /// - On error: aborts the transaction if in auto-commit mode, or sets
     ///   the failed flag if in an explicit transaction
-    async fn within_transaction<T, F, Fut>(&mut self, f: F) -> Result<T, DatabaseError>
+    async fn run_in_transaction<T, F, Fut>(
+        &mut self,
+        commit_on_auto: bool,
+        f: F,
+    ) -> Result<T, DatabaseError>
     where
         F: FnOnce(Arc<Database<S, R>>, TxId, CommandId) -> Fut,
         Fut: Future<Output = Result<T, DatabaseError>>,
@@ -291,7 +343,11 @@ impl<S: Storage, R: Replacer> Session<S, R> {
         match f(Arc::clone(&self.database), txid, cid).await {
             Ok(result) => {
                 if auto_commit {
-                    self.database.tx_manager().commit(txid)?;
+                    if commit_on_auto {
+                        self.database.tx_manager().commit(txid)?;
+                    } else {
+                        let _ = self.database.tx_manager().abort(txid);
+                    }
                 }
                 Ok(result)
             }
@@ -304,23 +360,6 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 Err(e)
             }
         }
-    }
-
-    /// Executes a function within a readonly transaction context.
-    async fn within_transaction_ro<T, F, Fut>(&self, f: F) -> Result<T, DatabaseError>
-    where
-        F: FnOnce(Arc<Database<S, R>>, TxId, CommandId) -> Fut,
-        Fut: Future<Output = Result<T, DatabaseError>>,
-    {
-        let (txid, cid, need_abort) = match self.transaction {
-            Some(tx) if !tx.failed => (tx.txid, tx.cid, false),
-            _ => (self.database.tx_manager().begin(), CommandId::FIRST, true),
-        };
-        let result = f(Arc::clone(&self.database), txid, cid).await;
-        if need_abort {
-            let _ = self.database.tx_manager().abort(txid);
-        }
-        result
     }
 }
 
@@ -581,7 +620,7 @@ mod tests {
     async fn test_describe_explain_select() {
         let storage = Arc::new(MemoryStorage::new());
         let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let session = Session::new(db);
+        let mut session = Session::new(db);
 
         let stmt = Parser::new("EXPLAIN SELECT * FROM sys_tables")
             .parse()
@@ -604,7 +643,7 @@ mod tests {
     async fn test_describe_select() {
         let storage = Arc::new(MemoryStorage::new());
         let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let session = Session::new(db);
+        let mut session = Session::new(db);
 
         let stmt = Parser::new("SELECT table_id, table_name FROM sys_tables")
             .parse()
@@ -626,7 +665,7 @@ mod tests {
     async fn test_describe_non_query() {
         let storage = Arc::new(MemoryStorage::new());
         let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let session = Session::new(db);
+        let mut session = Session::new(db);
 
         let stmt = Parser::new("CREATE TABLE test (id INT)")
             .parse()
@@ -728,5 +767,272 @@ mod tests {
         // Session with no transaction — drop should not panic
         let session = Session::new(db);
         drop(session);
+    }
+
+    // --- DML integration tests ---
+
+    #[tokio::test]
+    async fn test_insert_and_select() {
+        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
+        let mut session = Session::new(db);
+
+        session
+            .execute_query("CREATE TABLE t (id INTEGER, name TEXT)")
+            .await
+            .unwrap();
+
+        let result = session
+            .execute_query("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')")
+            .await
+            .unwrap()
+            .unwrap();
+        let QueryResult::Command { tag } = result else {
+            panic!("expected Command");
+        };
+        assert_eq!(tag, "INSERT 0 2");
+
+        let result = session
+            .execute_query("SELECT name FROM t WHERE id = 1")
+            .await
+            .unwrap()
+            .unwrap();
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].record.values[0],
+            crate::datum::Value::Text("Alice".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_and_select() {
+        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
+        let mut session = Session::new(db);
+
+        session
+            .execute_query("CREATE TABLE t (id INTEGER, name TEXT)")
+            .await
+            .unwrap();
+        session
+            .execute_query("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')")
+            .await
+            .unwrap();
+
+        let result = session
+            .execute_query("UPDATE t SET name = 'Updated' WHERE id = 1")
+            .await
+            .unwrap()
+            .unwrap();
+        let QueryResult::Command { tag } = result else {
+            panic!("expected Command");
+        };
+        assert_eq!(tag, "UPDATE 1");
+
+        let result = session
+            .execute_query("SELECT name FROM t WHERE id = 1")
+            .await
+            .unwrap()
+            .unwrap();
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].record.values[0],
+            crate::datum::Value::Text("Updated".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_and_select() {
+        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
+        let mut session = Session::new(db);
+
+        session
+            .execute_query("CREATE TABLE t (id INTEGER, name TEXT)")
+            .await
+            .unwrap();
+        session
+            .execute_query("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')")
+            .await
+            .unwrap();
+
+        let result = session
+            .execute_query("DELETE FROM t WHERE id = 2")
+            .await
+            .unwrap()
+            .unwrap();
+        let QueryResult::Command { tag } = result else {
+            panic!("expected Command");
+        };
+        assert_eq!(tag, "DELETE 1");
+
+        let result = session
+            .execute_query("SELECT * FROM t")
+            .await
+            .unwrap()
+            .unwrap();
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_serial_auto_increment() {
+        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
+        let mut session = Session::new(db);
+
+        session
+            .execute_query("CREATE TABLE t (id SERIAL, name TEXT)")
+            .await
+            .unwrap();
+        session
+            .execute_query("INSERT INTO t (name) VALUES ('Alice'), ('Bob')")
+            .await
+            .unwrap();
+
+        let result = session
+            .execute_query("SELECT id, name FROM t")
+            .await
+            .unwrap()
+            .unwrap();
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].record.values[0], crate::datum::Value::Integer(1));
+        assert_eq!(rows[1].record.values[0], crate::datum::Value::Integer(2));
+    }
+
+    #[tokio::test]
+    async fn test_transaction_dml_sequence() {
+        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
+        let mut session = Session::new(db);
+
+        session
+            .execute_query("CREATE TABLE t (id INTEGER, val TEXT)")
+            .await
+            .unwrap();
+
+        // Multi-statement transaction
+        session.execute_query("BEGIN").await.unwrap();
+        session
+            .execute_query("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+            .await
+            .unwrap();
+        session
+            .execute_query("UPDATE t SET val = 'x' WHERE id = 2")
+            .await
+            .unwrap();
+        session
+            .execute_query("DELETE FROM t WHERE id = 3")
+            .await
+            .unwrap();
+
+        let result = session
+            .execute_query("SELECT val FROM t")
+            .await
+            .unwrap()
+            .unwrap();
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 2);
+        let vals: Vec<&crate::datum::Value> = rows.iter().map(|r| &r.record.values[0]).collect();
+        assert!(vals.contains(&&crate::datum::Value::Text("a".into())));
+        assert!(vals.contains(&&crate::datum::Value::Text("x".into())));
+
+        session.execute_query("COMMIT").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_explain_insert() {
+        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
+        let mut session = Session::new(db);
+
+        session
+            .execute_query("CREATE TABLE t (id INTEGER, name TEXT)")
+            .await
+            .unwrap();
+
+        let result = session
+            .execute_query("EXPLAIN INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')")
+            .await
+            .unwrap()
+            .unwrap();
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        let plan_text = match &rows[0].record.values[0] {
+            crate::datum::Value::Text(s) => s.clone(),
+            v => panic!("expected Text, got {:?}", v),
+        };
+        assert!(plan_text.contains("Insert on t"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_on_failed_transaction_acts_as_rollback() {
+        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
+        let mut session = Session::new(db);
+
+        session
+            .execute_query("CREATE TABLE t (id INTEGER)")
+            .await
+            .unwrap();
+
+        session.execute_query("BEGIN").await.unwrap();
+        session
+            .execute_query("INSERT INTO t VALUES (1)")
+            .await
+            .unwrap();
+
+        // Cause an error to put transaction in failed state
+        let result = session.execute_query("SELECT * FROM nonexistent").await;
+        assert!(result.is_err());
+        assert!(matches!(
+            session.transaction(),
+            Some(tx) if tx.failed
+        ));
+
+        // COMMIT on failed transaction should act as ROLLBACK
+        let result = session.execute_query("COMMIT").await.unwrap().unwrap();
+        let QueryResult::Command { tag } = result else {
+            panic!("expected Command result");
+        };
+        assert_eq!(tag, "ROLLBACK");
+        assert!(session.transaction().is_none());
+
+        // The INSERT before the error should NOT have been committed
+        let result = session
+            .execute_query("SELECT * FROM t")
+            .await
+            .unwrap()
+            .unwrap();
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_insert_error_aborts_auto_commit() {
+        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
+        let mut session = Session::new(db);
+
+        // INSERT into non-existent table without explicit transaction
+        let result = session
+            .execute_query("INSERT INTO nonexistent VALUES (1)")
+            .await;
+        assert!(matches!(result, Err(DatabaseError::Executor(_))));
+
+        // Auto-commit transaction should be aborted; session should be idle
+        assert!(session.transaction().is_none());
+
+        // Session should work normally after the error
+        let result = session.execute_query("SELECT 1").await;
+        assert!(result.is_ok());
     }
 }

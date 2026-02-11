@@ -6,15 +6,18 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use crate::catalog::Catalog;
 use crate::datum::Type;
-use crate::heap::{HeapPage, TupleId};
+use crate::heap::{Record, TupleId, delete, insert, scan_visible_page, update};
 use crate::storage::{BufferPool, PageId, Replacer, Storage};
 use crate::tx::{Snapshot, TransactionManager};
 
 use super::error::ExecutorError;
-use super::row::Row;
 
-/// Execution context providing stateless storage operations to executor nodes.
+/// Result of scanning a single heap page: visible tuples and the next page link.
+type ScanPageResult = Result<(Vec<(TupleId, Record)>, Option<PageId>), ExecutorError>;
+
+/// Execution context providing storage operations to executor nodes.
 ///
 /// Implementations are `Clone` so each node can own its own copy.
 /// Methods take `&self` because all mutable state (scan position, buffer) is
@@ -22,32 +25,72 @@ use super::row::Row;
 pub trait ExecContext: Send + Clone {
     /// Scans a single heap page and returns all visible tuples.
     ///
+    /// Returns `(TupleId, Record)` pairs for each MVCC-visible tuple on the
+    /// page, plus the next page ID in the chain (if any) so that the caller
+    /// can continue scanning multi-page tables.
+    ///
     /// Visibility is determined by the snapshot embedded in the context.
     /// The caller provides the column schema for record deserialization.
     fn scan_heap_page(
         &self,
         page_id: PageId,
         schema: &[Type],
-    ) -> impl Future<Output = Result<Vec<Row>, ExecutorError>> + Send;
+    ) -> impl Future<Output = ScanPageResult> + Send;
+
+    /// Inserts a tuple into the heap table starting at `first_page`.
+    ///
+    /// Walks the page chain to find free space; allocates new pages when full.
+    /// Sets xmin to the current transaction, cid to the current command.
+    fn insert_tuple(
+        &self,
+        first_page: PageId,
+        record: &Record,
+    ) -> impl Future<Output = Result<TupleId, ExecutorError>> + Send;
+
+    /// Deletes a tuple by setting its xmax to the current transaction.
+    ///
+    /// The tuple remains physically on the page but becomes invisible to
+    /// subsequent snapshots.
+    fn delete_tuple(&self, tid: TupleId) -> impl Future<Output = Result<(), ExecutorError>> + Send;
+
+    /// Updates a tuple (delete old version + insert new version).
+    ///
+    /// Attempts same-page insertion first to avoid unnecessary page chain
+    /// traversal. Falls back to `insert_tuple` on the table's first page
+    /// if the same page is full.
+    fn update_tuple(
+        &self,
+        first_page: PageId,
+        old_tid: TupleId,
+        new_record: &Record,
+    ) -> impl Future<Output = Result<TupleId, ExecutorError>> + Send;
+
+    /// Gets the next value from a sequence.
+    ///
+    /// Sequences are NOT rolled back on transaction abort (following PostgreSQL behavior).
+    fn nextval(&self, seq_id: u32) -> impl Future<Output = Result<i64, ExecutorError>> + Send;
 }
 
-/// Concrete [`ExecContext`] backed by a [`BufferPool`] and [`TransactionManager`].
+/// Concrete [`ExecContext`] backed by a [`BufferPool`], [`TransactionManager`], and [`Catalog`].
 ///
-/// Owns `Arc` references to the buffer pool and transaction manager, plus a
-/// cloned [`Snapshot`] for visibility checks. Cloning is lightweight.
+/// Owns `Arc` references to shared components plus a cloned [`Snapshot`]
+/// for visibility checks. Cloning is lightweight.
 pub struct ExecContextImpl<S: Storage, R: Replacer> {
     pool: Arc<BufferPool<S, R>>,
     tx_manager: Arc<TransactionManager>,
+    // NOTE: The `Catalog` dependency in `ExecContextImpl` exists solely for `nextval`.
+    // A future refactor could extract sequence access into a dedicated trait, removing
+    // the `Catalog` dependency from the execution context.
+    catalog: Catalog<S, R>,
     snapshot: Snapshot,
 }
 
-// Manual Clone impl to avoid requiring S: Clone + R: Clone
-// (only Arc and Snapshot are cloned).
 impl<S: Storage, R: Replacer> Clone for ExecContextImpl<S, R> {
     fn clone(&self) -> Self {
         Self {
             pool: Arc::clone(&self.pool),
             tx_manager: Arc::clone(&self.tx_manager),
+            catalog: self.catalog.clone(),
             snapshot: self.snapshot.clone(),
         }
     }
@@ -58,90 +101,73 @@ impl<S: Storage, R: Replacer> ExecContextImpl<S, R> {
     pub fn new(
         pool: Arc<BufferPool<S, R>>,
         tx_manager: Arc<TransactionManager>,
+        catalog: Catalog<S, R>,
         snapshot: Snapshot,
     ) -> Self {
         Self {
             pool,
             tx_manager,
+            catalog,
             snapshot,
         }
     }
 }
 
 impl<S: Storage, R: Replacer> ExecContext for ExecContextImpl<S, R> {
-    // NOTE: All visible tuples from the page are loaded into a Vec<Row>
-    // so that the page latch is released before returning to the caller. This
-    // minimizes latch hold time but means memory usage is proportional to tuples
-    // per page. For production, consider streaming with explicit latch management,
-    // especially once Sort/Aggregate (Step 12) may need to scan large tables.
-    async fn scan_heap_page(
-        &self,
-        page_id: PageId,
-        schema: &[Type],
-    ) -> Result<Vec<Row>, ExecutorError> {
-        let page = HeapPage::new(self.pool.fetch_page(page_id).await?);
-
-        let mut tuples = Vec::new();
-        for (slot_id, header, record) in page.scan(schema) {
-            if !self.snapshot.is_tuple_visible(&header, &self.tx_manager) {
-                continue;
-            }
-            let tid = TupleId { page_id, slot_id };
-            tuples.push(Row::from_heap(tid, record));
-        }
-
-        Ok(tuples)
+    async fn scan_heap_page(&self, page_id: PageId, schema: &[Type]) -> ScanPageResult {
+        Ok(scan_visible_page(
+            &self.pool,
+            page_id,
+            schema,
+            &self.snapshot,
+            &self.tx_manager,
+        )
+        .await?)
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::catalog::{SystemCatalogTable, TableInfo};
-    use crate::datum::Value;
-    use crate::db::Database;
-    use crate::storage::MemoryStorage;
-    use crate::tx::CommandId;
+    async fn insert_tuple(
+        &self,
+        first_page: PageId,
+        record: &Record,
+    ) -> Result<TupleId, ExecutorError> {
+        Ok(insert(
+            &self.pool,
+            first_page,
+            record,
+            self.snapshot.current_txid,
+            self.snapshot.current_cid,
+        )
+        .await?)
+    }
 
-    #[tokio::test]
-    async fn test_exec_context_impl_scan_catalog() {
-        // Bootstrap a database to get catalog tables with data
-        let storage = MemoryStorage::new();
-        let db = Database::open(storage, 100).await.unwrap();
+    async fn delete_tuple(&self, tid: TupleId) -> Result<(), ExecutorError> {
+        Ok(delete(
+            &self.pool,
+            tid,
+            self.snapshot.current_txid,
+            self.snapshot.current_cid,
+        )
+        .await?)
+    }
 
-        let txid = db.tx_manager().begin();
-        let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
+    async fn update_tuple(
+        &self,
+        first_page: PageId,
+        old_tid: TupleId,
+        new_record: &Record,
+    ) -> Result<TupleId, ExecutorError> {
+        Ok(update(
+            &self.pool,
+            first_page,
+            old_tid,
+            new_record,
+            self.snapshot.current_txid,
+            self.snapshot.current_cid,
+        )
+        .await?)
+    }
 
-        // Scan the first page of sys_tables (page 2 after superblock and catalog pages)
-        // We don't know the exact page ID, so we rely on the catalog to tell us.
-        // For this test, we just verify the context is functional by scanning page 2
-        // (which is the sys_tables heap page in a freshly bootstrapped database).
-        let table_info = db
-            .catalog()
-            .get_table(&snapshot, "sys_tables")
-            .await
-            .unwrap()
-            .unwrap();
-
-        let ctx = db.exec_context(snapshot);
-
-        let tuples = ctx
-            .scan_heap_page(table_info.first_page, &TableInfo::SCHEMA)
-            .await
-            .unwrap();
-
-        // Should find at least 3 catalog tables (sys_tables, sys_columns, sys_sequences)
-        assert!(
-            tuples.len() >= 3,
-            "expected at least 3 catalog tables, got {}",
-            tuples.len()
-        );
-
-        // Verify first tuple is sys_tables itself
-        assert_eq!(tuples[0].record.values[1], Value::Text("sys_tables".into()));
-        // All tuples should have TupleId set
-        for tuple in &tuples {
-            assert!(tuple.tid.is_some());
-        }
+    async fn nextval(&self, seq_id: u32) -> Result<i64, ExecutorError> {
+        Ok(self.catalog.nextval(seq_id).await?)
     }
 }

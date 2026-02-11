@@ -2,7 +2,7 @@
 
 use crate::catalog::CatalogError;
 use crate::datum::Type;
-use crate::storage::BufferPoolError;
+use crate::heap::HeapError;
 
 /// Errors that can occur during query execution.
 #[derive(Debug)]
@@ -43,14 +43,20 @@ pub enum ExecutorError {
     /// Column index exceeds the number of columns in the record.
     ColumnIndexOutOfBounds { index: usize, len: usize },
 
+    /// Number of values does not match the number of target columns.
+    ColumnCountMismatch { expected: usize, found: usize },
+
+    /// Duplicate column name in column list.
+    DuplicateColumn { name: String },
+
     /// Unsupported operation or feature.
     Unsupported(String),
 
     /// Catalog error during table/column lookup.
     Catalog(CatalogError),
 
-    /// Buffer pool error during page access.
-    BufferPool(BufferPoolError),
+    /// Heap operation error (insert, delete, update).
+    Heap(HeapError),
 }
 
 impl std::fmt::Display for ExecutorError {
@@ -91,9 +97,19 @@ impl std::fmt::Display for ExecutorError {
             ExecutorError::NumericOutOfRange { type_name } => {
                 write!(f, "{} out of range", type_name)
             }
+            ExecutorError::ColumnCountMismatch { expected, found } => {
+                write!(
+                    f,
+                    "INSERT has {} expressions but {} target columns",
+                    found, expected
+                )
+            }
+            ExecutorError::DuplicateColumn { name } => {
+                write!(f, "column \"{}\" specified more than once", name)
+            }
             ExecutorError::Unsupported(msg) => write!(f, "unsupported: {}", msg),
             ExecutorError::Catalog(e) => write!(f, "{}", e),
-            ExecutorError::BufferPool(e) => write!(f, "{}", e),
+            ExecutorError::Heap(e) => write!(f, "{}", e),
         }
     }
 }
@@ -106,7 +122,7 @@ impl std::error::Error for ExecutorError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ExecutorError::Catalog(e) => Some(e),
-            ExecutorError::BufferPool(e) => Some(e),
+            ExecutorError::Heap(e) => Some(e),
             _ => None,
         }
     }
@@ -118,8 +134,8 @@ impl From<CatalogError> for ExecutorError {
     }
 }
 
-impl From<BufferPoolError> for ExecutorError {
-    fn from(e: BufferPoolError) -> Self {
-        ExecutorError::BufferPool(e)
+impl From<HeapError> for ExecutorError {
+    fn from(e: HeapError) -> Self {
+        ExecutorError::Heap(e)
     }
 }
