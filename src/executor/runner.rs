@@ -59,7 +59,7 @@ impl DmlResult {
 pub enum QueryNode<C: ExecContext> {
     /// Sequential heap scan with lazy page loading.
     SeqScan(SeqScan<C>),
-    /// Tuple filter (WHERE clause).
+    /// Row filter (WHERE clause).
     Filter(Filter<C>),
     /// Column projection (SELECT list).
     Projection(Projection<C>),
@@ -225,7 +225,7 @@ async fn execute_delete<C: ExecContext>(ctx: &C, input: QueryPlan) -> Result<u64
 }
 
 impl<C: ExecContext> QueryNode<C> {
-    /// Returns the next tuple, or `None` if exhausted.
+    /// Returns the next row, or `None` if exhausted.
     ///
     /// This method follows the Volcano iterator model naming convention,
     /// not `std::iter::Iterator`, because it returns `Result<Option<_>>`.
@@ -264,7 +264,7 @@ impl<C: ExecContext> QueryNode<C> {
     }
 }
 
-/// Sequential scan node that lazily loads visible tuples page-by-page.
+/// Sequential scan node that lazily loads visible rows page-by-page.
 ///
 /// Tuples are loaded one page at a time via [`ExecContext::scan_heap_page`],
 /// avoiding holding page latches across `next()` calls and keeping memory
@@ -283,7 +283,7 @@ pub struct SeqScan<C: ExecContext> {
     schema: Vec<Type>,
     /// Next page to scan, or `None` if exhausted.
     next_page_id: Option<PageId>,
-    /// Buffer of tuples from the current page (ownership-based, no clone).
+    /// Buffer of rows from the current page (ownership-based, no clone).
     buffer: std::vec::IntoIter<Row>,
 }
 
@@ -306,7 +306,7 @@ impl<C: ExecContext> SeqScan<C> {
         }
     }
 
-    /// Returns the next visible tuple, loading pages lazily as needed.
+    /// Returns the next visible row, loading pages lazily as needed.
     ///
     /// Follows the heap page chain automatically: when a page is exhausted,
     /// advances to the next page via the chain linkage.
@@ -330,9 +330,9 @@ impl<C: ExecContext> SeqScan<C> {
     }
 }
 
-/// Filter node that applies a predicate to each tuple from its child.
+/// Filter node that applies a predicate to each row from its child.
 pub struct Filter<C: ExecContext> {
-    /// Child node to pull tuples from.
+    /// Child node to pull rows from.
     child: Box<QueryNode<C>>,
     /// Bound predicate expression (must evaluate to boolean).
     predicate: BoundExpr,
@@ -347,16 +347,16 @@ impl<C: ExecContext> Filter<C> {
         }
     }
 
-    /// Returns the next tuple that satisfies the predicate.
+    /// Returns the next row that satisfies the predicate.
     async fn next(&mut self) -> Result<Option<Row>, ExecutorError> {
         loop {
             match self.child.next().await? {
-                Some(tuple) => {
-                    let result = self.predicate.evaluate(&tuple.record)?;
+                Some(row) => {
+                    let result = self.predicate.evaluate(&row.record)?;
                     if matches!(result, Value::Boolean(true)) {
-                        return Ok(Some(tuple));
+                        return Ok(Some(row));
                     }
-                    // NULL and false both skip the tuple
+                    // NULL and false both skip the row
                 }
                 None => return Ok(None),
             }
@@ -366,7 +366,7 @@ impl<C: ExecContext> Filter<C> {
 
 /// Projection node that evaluates bound expressions to produce output columns.
 pub struct Projection<C: ExecContext> {
-    /// Child node to pull tuples from.
+    /// Child node to pull rows from.
     child: Box<QueryNode<C>>,
     /// Bound expressions to evaluate for each output column.
     exprs: Vec<BoundExpr>,
@@ -384,17 +384,17 @@ impl<C: ExecContext> Projection<C> {
         }
     }
 
-    /// Returns the next projected tuple.
+    /// Returns the next projected row.
     ///
     /// NOTE: Allocates a new Vec and Record per row. For production, consider
     /// arena allocation or a reusable row buffer to reduce GC pressure on
     /// large result sets.
     async fn next(&mut self) -> Result<Option<Row>, ExecutorError> {
         match self.child.next().await? {
-            Some(tuple) => {
+            Some(row) => {
                 let mut values = Vec::with_capacity(self.exprs.len());
                 for expr in &self.exprs {
-                    values.push(expr.evaluate(&tuple.record)?);
+                    values.push(expr.evaluate(&row.record)?);
                 }
                 Ok(Some(Row::computed(Record::new(values))))
             }
@@ -423,7 +423,7 @@ impl ValuesScan {
         }
     }
 
-    /// Returns the single empty tuple, then `None`.
+    /// Returns the single empty row, then `None`.
     async fn next(&mut self) -> Result<Option<Row>, ExecutorError> {
         if self.done {
             Ok(None)

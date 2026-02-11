@@ -33,16 +33,16 @@ pub enum QueryPlan {
         /// Output column descriptors.
         columns: Vec<ColumnDesc>,
     },
-    /// Tuple filter (WHERE clause).
+    /// Row filter (WHERE clause).
     Filter {
-        /// Child plan to pull tuples from.
+        /// Child plan to pull rows from.
         input: Box<QueryPlan>,
         /// Bound predicate expression.
         predicate: BoundExpr,
     },
     /// Column projection (SELECT list).
     Projection {
-        /// Child plan to pull tuples from.
+        /// Child plan to pull rows from.
         input: Box<QueryPlan>,
         /// Bound expressions to evaluate for each output column.
         exprs: Vec<BoundExpr>,

@@ -1,13 +1,15 @@
-//! Query executor implementing the Volcano iterator model.
+//! Query planning and execution engine.
 //!
-//! This module provides the execution engine that evaluates SQL queries
-//! against heap-stored data with MVCC visibility checks.
+//! This module translates AST nodes into logical plans ([`QueryPlan`] / [`DmlPlan`]),
+//! then executes them against heap-stored data with MVCC visibility checks.
+//! Row-producing queries use the Volcano iterator model ([`QueryNode`]);
+//! DML operations drive the iterator internally and return a scalar result ([`DmlResult`]).
 //!
 //! # Architecture
 //!
 //! ```text
 //! +------------------------+
-//! |    AST (SelectStmt)    |  <- Expr: column names as strings
+//! |    AST (Statement)     |  <- Expr: column names as strings
 //! +-----------+------------+
 //!             | plan_select / plan_insert / plan_update / plan_delete
 //!             v
