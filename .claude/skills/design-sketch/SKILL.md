@@ -50,22 +50,60 @@ Document any naming ambiguities and the chosen resolution:
 - "tuple" vs "row": "tuple" = on-disk (TupleHeader + Record), "row" = in-executor logical unit
 - ...
 
+## Prerequisite Refactoring
+
+List changes to existing code that must happen **before** the feature implementation. These become the first items in the Commit Plan. If none are needed, write "None identified."
+
+Examples of prerequisites:
+- Rename `Type::DoublePrecision` → `Type::Double` to align with terms this step introduces
+- Split `Plan` enum into `QueryPlan` and `DmlPlan` because the new feature needs a non-query plan variant
+- Add `Value::cast()` method to consolidate scattered conversion logic that the new feature would duplicate
+
+For each prerequisite, explain **why** it must happen first (not just what to change).
+
 ## Module Structure
 
 ### New Modules
 
-List each new file with its responsibility and key public items.
+List each new file with its responsibility and **concrete public signatures**.
 
-- `src/executor/expr.rs` — Bound expression types and evaluation
-  - `pub enum BoundExpr`
-  - `pub fn evaluate(&self, record: &Record) -> Result<Value>`
+For each public function/method, specify the full signature including parameter types and return type. For enums/structs, list variants/fields. This precision prevents structural rework during REFINE.
+
+When choosing between a struct with methods vs free functions, document the rationale:
+- Struct: when there is state to maintain across calls, or the API has a natural "open/use/close" lifecycle
+- Free functions: when operations are stateless and composable (e.g., `heap::insert`, `heap::scan_visible_page`)
+
+Example:
+
+```rust
+// src/executor/expr.rs — Bound expression types and evaluation
+
+pub enum BoundExpr {
+    ColumnRef { index: usize, ty: Type },
+    Literal(Value),
+    // ...
+}
+
+impl BoundExpr {
+    pub fn evaluate(&self, record: &Record) -> Result<Value> { .. }
+    pub fn ty(&self) -> Option<Type> { .. }
+}
+```
 
 ### Modified Modules
 
-List each existing file that will be changed, and what changes.
+List each existing file that will be changed, with concrete new/changed signatures.
 
-- `src/db/session.rs` — Add SELECT/EXPLAIN execution path
-  - New method: `execute_select(&mut self, stmt: &SelectStmt) -> Result<QueryResult>`
+Example:
+
+```rust
+// src/db/session.rs — Add DML execution path
+
+// New:
+async fn execute_dml(&mut self, plan: DmlPlan) -> Result<DmlResult> { .. }
+
+// Changed: execute_statement — add Statement::Insert/Update/Delete arms
+```
 
 ### Dependency Graph
 
@@ -124,6 +162,8 @@ Before presenting the document, verify:
 3. **Dependency direction**: Draw the dependency arrows and confirm no cycles
 4. **Edge case coverage**: Each checklist item maps to at least one test in the commit plan
 5. **Commit independence**: Each commit in the plan can compile and pass tests on its own
+6. **Prerequisite completeness**: Every naming inconsistency or structural debt that would cause REFINE-phase rework is captured in the Prerequisite Refactoring section
+7. **Signature concreteness**: Every new public function/method has a full signature (parameter types and return type), not just a name. Every new enum/struct has variants/fields listed
 
 ### Phase 4: Present for Review
 

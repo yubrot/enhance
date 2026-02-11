@@ -23,16 +23,34 @@ Launch a **new** `Task` tool (`subagent_type=general-purpose`) to perform the re
 
 Using a subagent ensures the review is not influenced by implementation context.
 
-### Step 2: Fix Issues (if any)
+### Step 2: Triage Issues
 
-If the review reports High or Medium severity issues:
+Classify each High/Medium issue from the review into one of two categories:
+
+- **Quality fix**: Naming tweaks, missing docs, unused imports, test gaps, minor API cleanup — changes that do NOT alter the design sketch's Type Glossary, Module Structure, or Dependency Graph
+- **Design correction**: Module moves, type splits/renames, new public types, API signature changes, dependency direction changes — changes that **would require updating the design sketch** to remain accurate
+
+#### Quality Fixes
 
 1. Fix the issues in code
 2. Run `cargo test` and `cargo clippy`
 3. Launch a **fresh** review subagent (do NOT resume the previous one) to re-review the full diff
-4. Repeat until no High/Medium issues remain
+4. Repeat until no High/Medium quality issues remain
 
 **Important**: Every review iteration MUST use a new `Task` invocation — never resume a previous review agent. A fresh agent re-reads the diff from scratch without prior assumptions, which means it can catch issues that the previous iteration overlooked or that were introduced by the fixes themselves.
+
+#### Design Corrections
+
+If any issues are classified as design corrections, **pause autonomous execution** and present them to the user with `AskUserQuestion`:
+
+- Describe each design correction concisely (what the review found, what structural change it implies)
+- Offer two choices per issue:
+  1. **Update design sketch**: Modify `docs/design-sketch-{N}.md` (Type Glossary, Module Structure, signatures, etc.) to reflect the correction, then apply the code fix. This ensures subsequent Commit Plan items build on the corrected design.
+  2. **Proceed as-is**: Treat it as a quality fix (no design sketch update). Use this when the review finding is debatable or the impact on future items is negligible.
+
+After the user decides, apply the chosen action for each issue. If any design sketch updates were made, re-read the updated design sketch before continuing.
+
+#### Low Severity
 
 Low severity issues: present to the user and let them decide whether to fix now or defer.
 

@@ -5,7 +5,7 @@ Write code for the **next unchecked commit plan item** from the approved design 
 ## Procedure
 
 1. Run `/compact` before proceeding. This keeps context lean across cycles
-2. Read `docs/design-sketch-{N}.md` and identify the next `- [ ]` item in the Commit Plan
+2. Read `docs/design-sketch-{N}.md` **in full** (the design sketch may have been updated by REFINE design corrections) and identify the next `- [ ]` item in the Commit Plan
 3. Implement **only that item**:
    - Write the code as specified in the design sketch
    - Run `cargo test` and `cargo clippy`

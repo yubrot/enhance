@@ -21,6 +21,8 @@ The ARCHITECT phase is **interactive** — it gathers context and decisions from
 
 Once ARCHITECT completes and the design sketch is approved, the workflow proceeds **autonomously** through all remaining phases (IMPLEMENT → REFINE → ... → COMPLETE) without waiting for user confirmation. Report progress at each phase transition but do not pause for approval.
 
+**Exception**: REFINE may pause for user input when the review identifies design corrections (structural changes that affect the design sketch). See [refine.md](refine.md) for details.
+
 ## Phase Detection
 
 Check artifacts **in this order** to determine the current phase:
