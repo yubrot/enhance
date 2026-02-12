@@ -86,7 +86,7 @@ Goal: Execute queries with MVCC awareness.
 
 Goal: Crash recovery and storage maintenance.
 
-13. Write-Ahead Log: Log record types (INSERT/UPDATE/DELETE/COMMIT), WAL buffer management, write-ahead principle enforcement, fsync discipline.
+13. Write-Ahead Log: CLOG (persistent transaction state replacing volatile tx_states), log record types (INSERT/UPDATE/DELETE/COMMIT), WAL buffer management, write-ahead principle enforcement, fsync discipline.
 14. Checkpoint & Recovery: Dirty page tracking in buffer pool, checkpoint record writing, flush policy, REDO replay sequence on startup.
 15. VACUUM & FSM: Dead tuple identification via visibility rules, space reclamation within pages. Implement Free Space Map (FSM) as a separate structure tracking available space per heap page, enabling efficient page selection for INSERT operations.
 

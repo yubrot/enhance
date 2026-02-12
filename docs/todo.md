@@ -9,7 +9,7 @@ This document evaluates remaining roadmap items from the perspective of Agentic 
 | # | Item | Difficulty | Rationale |
 |---|------|:----------:|-----------|
 | 12 | **Sort & Aggregation** | 2 | Standard algorithms. In-memory sort is simple. Aggregate functions are well-defined |
-| 13 | **Write-Ahead Log** | 4 | Strict write-ahead principle. Coordination with Buffer Pool. fsync timing |
+| 13 | **Write-Ahead Log** | 4 | CLOG (persistent TxState) as prerequisite sub-step, then WAL log records + write-ahead principle. Coordination with Buffer Pool. fsync timing |
 | 14 | **Checkpoint & Recovery** | **5** | Dirty page concurrency during checkpoint. Correct REDO replay ordering. Crash recovery testing is difficult |
 | 15 | **VACUUM & FSM** | 3 | Depends on visibility rules but extends existing compaction. FSM is an independent structure |
 | 16 | **B+Tree Index** | **5** | Correct latch coupling (crabbing) implementation. Concurrency during node splits. Integration with Buffer Pool latch hierarchy |
@@ -17,6 +17,19 @@ This document evaluates remaining roadmap items from the perspective of Agentic 
 | 18 | **HOT** | 3 | Same-page chain management. Logic for skipping index updates |
 | 19 | **Nested Loop Join** | 2 | Simple algorithm. Fits naturally into Volcano model |
 | 20 | **Row-Level Lock** | **5** | Wait queue management. Deadlock detection (wait-for graph). Interaction between xmax-based locking and MVCC visibility |
+
+## Step 13 Sub-steps
+
+Step 13 (WAL) involves two distinct subsystems that should be implemented in order:
+
+1. **CLOG (Commit Log)**: Persistent `TxId → TxState` map replacing the volatile `tx_states` HashMap in `TransactionManager`. This is a prerequisite for WAL because:
+   - WAL REDO replay updates CLOG entries during recovery
+   - Without CLOG, restarted servers lose all transaction state, making aborted transactions appear committed
+   - Consumers: `Snapshot::is_inserted()` and `Snapshot::is_deleted()` call `TransactionManager::state()` when hint bits are unset
+2. **WAL log records + buffer**: Define log record types (INSERT/UPDATE/DELETE/COMMIT), implement WAL buffer, enforce write-ahead principle (log before data page flush), fsync discipline
+3. **Heap integration**: Modify heap write operations (`heap::insert`, `heap::delete`, `heap::update`) to emit WAL records before modifying data pages
+
+CLOG alone does NOT provide crash consistency (data pages may be unflushed), so all three sub-steps must be completed before the system is durable. However, implementing CLOG first isolates the simpler persistence concern from the more complex WAL machinery.
 
 ## Pattern Analysis
 
