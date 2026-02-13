@@ -171,7 +171,8 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::Select(select_stmt) => {
                 self.run_in_transaction(false, |db, txid, cid| async move {
                     let snapshot = db.tx_manager().snapshot(txid, cid);
-                    let plan = executor::plan_select(select_stmt, db.catalog(), &snapshot).await?;
+                    let catalog = db.catalog_snapshot(&snapshot).await?;
+                    let plan = executor::plan_select(select_stmt, &catalog)?;
                     Ok(Some(plan.columns().to_vec()))
                 })
                 .await
@@ -222,10 +223,11 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             }
             Statement::CreateTable(create_stmt) => {
                 self.run_in_transaction(true, |db, txid, cid| async move {
-                    db.catalog()
+                    db.catalog_store()
                         .create_table(txid, cid, create_stmt)
                         .await
                         .map_err(DatabaseError::Catalog)?;
+                    db.catalog_cache().register_ddl(txid, db.tx_manager());
                     Ok(QueryResult::command("CREATE TABLE"))
                 })
                 .await
@@ -233,7 +235,8 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::Select(select_stmt) => {
                 self.run_in_transaction(false, |db, txid, cid| async move {
                     let snapshot = db.tx_manager().snapshot(txid, cid);
-                    let plan = executor::plan_select(select_stmt, db.catalog(), &snapshot).await?;
+                    let catalog = db.catalog_snapshot(&snapshot).await?;
+                    let plan = executor::plan_select(select_stmt, &catalog)?;
                     let columns = plan.columns().to_vec();
 
                     let ctx = db.exec_context(snapshot);
@@ -249,16 +252,11 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
                 self.run_in_transaction(true, |db, txid, cid| async move {
                     let snapshot = db.tx_manager().snapshot(txid, cid);
+                    let catalog = db.catalog_snapshot(&snapshot).await?;
                     let plan = match stmt {
-                        Statement::Insert(s) => {
-                            executor::plan_insert(s, db.catalog(), &snapshot).await?
-                        }
-                        Statement::Update(s) => {
-                            executor::plan_update(s, db.catalog(), &snapshot).await?
-                        }
-                        Statement::Delete(s) => {
-                            executor::plan_delete(s, db.catalog(), &snapshot).await?
-                        }
+                        Statement::Insert(s) => executor::plan_insert(s, &catalog)?,
+                        Statement::Update(s) => executor::plan_update(s, &catalog)?,
+                        Statement::Delete(s) => executor::plan_delete(s, &catalog)?,
                         _ => unreachable!(),
                     };
                     let ctx = db.exec_context(snapshot);
@@ -274,27 +272,12 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::Explain(inner_stmt) => {
                 self.run_in_transaction(false, |db, txid, cid| async move {
                     let snapshot = db.tx_manager().snapshot(txid, cid);
+                    let catalog = db.catalog_snapshot(&snapshot).await?;
                     let explain_text = match inner_stmt.as_ref() {
-                        Statement::Select(select_stmt) => {
-                            executor::plan_select(select_stmt, db.catalog(), &snapshot)
-                                .await?
-                                .explain()
-                        }
-                        Statement::Insert(insert_stmt) => {
-                            executor::plan_insert(insert_stmt, db.catalog(), &snapshot)
-                                .await?
-                                .explain()
-                        }
-                        Statement::Update(update_stmt) => {
-                            executor::plan_update(update_stmt, db.catalog(), &snapshot)
-                                .await?
-                                .explain()
-                        }
-                        Statement::Delete(delete_stmt) => {
-                            executor::plan_delete(delete_stmt, db.catalog(), &snapshot)
-                                .await?
-                                .explain()
-                        }
+                        Statement::Select(s) => executor::plan_select(s, &catalog)?.explain(),
+                        Statement::Insert(s) => executor::plan_insert(s, &catalog)?.explain(),
+                        Statement::Update(s) => executor::plan_update(s, &catalog)?.explain(),
+                        Statement::Delete(s) => executor::plan_delete(s, &catalog)?.explain(),
                         _ => {
                             return Err(DatabaseError::Executor(
                                 crate::executor::ExecutorError::Unsupported(
@@ -1034,5 +1017,77 @@ mod tests {
         // Session should work normally after the error
         let result = session.execute_query("SELECT 1").await;
         assert!(result.is_ok());
+    }
+
+    // --- CatalogCache integration tests ---
+
+    #[tokio::test]
+    async fn test_catalog_cache_reflects_auto_commit_ddl() {
+        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
+        let mut session = Session::new(Arc::clone(&db));
+
+        // Before DDL: table should not exist in cached snapshot.
+        let txid = db.tx_manager().begin();
+        let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
+        let snap = db.catalog_snapshot(&snapshot).await.unwrap();
+        assert!(snap.resolve_table("t").is_none());
+        let _ = db.tx_manager().abort(txid);
+
+        session
+            .execute_query("CREATE TABLE t (id INTEGER)")
+            .await
+            .unwrap();
+
+        // After auto-commit DDL: table should be visible.
+        let txid2 = db.tx_manager().begin();
+        let snapshot2 = db.tx_manager().snapshot(txid2, CommandId::FIRST);
+        let snap2 = db.catalog_snapshot(&snapshot2).await.unwrap();
+        assert!(snap2.resolve_table("t").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_catalog_cache_reflects_explicit_commit_ddl() {
+        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
+        let mut session = Session::new(Arc::clone(&db));
+
+        session.execute_query("BEGIN").await.unwrap();
+        session
+            .execute_query("CREATE TABLE t (id INTEGER)")
+            .await
+            .unwrap();
+
+        // Not yet committed — other sessions should not see the table.
+        let txid = db.tx_manager().begin();
+        let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
+        let snap = db.catalog_snapshot(&snapshot).await.unwrap();
+        assert!(snap.resolve_table("t").is_none());
+        let _ = db.tx_manager().abort(txid);
+
+        session.execute_query("COMMIT").await.unwrap();
+
+        // After commit, the table should be visible.
+        let txid2 = db.tx_manager().begin();
+        let snapshot2 = db.tx_manager().snapshot(txid2, CommandId::FIRST);
+        let snap2 = db.catalog_snapshot(&snapshot2).await.unwrap();
+        assert!(snap2.resolve_table("t").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_catalog_cache_not_updated_on_rollback() {
+        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
+        let mut session = Session::new(Arc::clone(&db));
+
+        session.execute_query("BEGIN").await.unwrap();
+        session
+            .execute_query("CREATE TABLE t (id INTEGER)")
+            .await
+            .unwrap();
+        session.execute_query("ROLLBACK").await.unwrap();
+
+        // DDL was rolled back — table should not exist.
+        let txid = db.tx_manager().begin();
+        let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
+        let snap = db.catalog_snapshot(&snapshot).await.unwrap();
+        assert!(snap.resolve_table("t").is_none());
     }
 }

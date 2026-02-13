@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use super::error::DatabaseError;
-use crate::catalog::CatalogStore;
+use crate::catalog::{CatalogCache, CatalogError, CatalogSnapshot, CatalogStore};
 use crate::executor::ExecContextImpl;
 use crate::storage::{BufferPool, LruReplacer, Replacer, Storage};
 use crate::tx::{Snapshot, TransactionManager};
@@ -15,7 +15,8 @@ use crate::tx::{Snapshot, TransactionManager};
 pub struct Database<S: Storage, R: Replacer> {
     pool: Arc<BufferPool<S, R>>,
     tx_manager: Arc<TransactionManager>,
-    catalog: CatalogStore<S, R>,
+    catalog_store: CatalogStore<S, R>,
+    catalog_cache: CatalogCache,
 }
 
 impl<S: Storage> Database<S, LruReplacer> {
@@ -60,7 +61,7 @@ impl<S: Storage, R: Replacer> Database<S, R> {
         let tx_manager = Arc::new(TransactionManager::new());
 
         // Check if this is a fresh database
-        let catalog = match pool.page_count().await {
+        let catalog_store = match pool.page_count().await {
             0 => CatalogStore::bootstrap(pool.clone(), tx_manager.clone()).await?,
             _ => CatalogStore::open(pool.clone(), tx_manager.clone()).await?,
         };
@@ -68,7 +69,8 @@ impl<S: Storage, R: Replacer> Database<S, R> {
         Ok(Self {
             pool,
             tx_manager,
-            catalog,
+            catalog_store,
+            catalog_cache: CatalogCache::new(),
         })
     }
 
@@ -82,9 +84,27 @@ impl<S: Storage, R: Replacer> Database<S, R> {
         &self.tx_manager
     }
 
-    /// Returns a reference to the catalog.
-    pub fn catalog(&self) -> &CatalogStore<S, R> {
-        &self.catalog
+    /// Returns a reference to the catalog store.
+    pub fn catalog_store(&self) -> &CatalogStore<S, R> {
+        &self.catalog_store
+    }
+
+    /// Returns a reference to the catalog cache.
+    pub fn catalog_cache(&self) -> &CatalogCache {
+        &self.catalog_cache
+    }
+
+    /// Returns a cached [`CatalogSnapshot`] for the given MVCC snapshot.
+    ///
+    /// Delegates to [`CatalogCache::get_or_load`], which avoids redundant
+    /// heap scans when no DDL has been committed since the last load.
+    pub async fn catalog_snapshot(
+        &self,
+        snapshot: &Snapshot,
+    ) -> Result<Arc<CatalogSnapshot>, CatalogError> {
+        self.catalog_cache
+            .get_or_load(&self.catalog_store, snapshot, &self.tx_manager)
+            .await
     }
 
     /// Creates an [`ExecContextImpl`] for query execution with the given snapshot.
@@ -92,7 +112,7 @@ impl<S: Storage, R: Replacer> Database<S, R> {
         ExecContextImpl::new(
             Arc::clone(&self.pool),
             Arc::clone(&self.tx_manager),
-            self.catalog.clone(),
+            self.catalog_store.clone(),
             snapshot,
         )
     }
@@ -120,7 +140,7 @@ mod tests {
             let db = Database::open(Arc::clone(&storage), 100).await.unwrap();
 
             // Verify catalog is initialized
-            let sb = db.catalog().superblock();
+            let sb = db.catalog_store().superblock();
             assert_eq!(sb.next_table_id, LAST_RESERVED_TABLE_ID + 1);
             assert!(db.pool().page_count().await > 0);
         };
@@ -130,7 +150,7 @@ mod tests {
             let db = Database::open(storage, 100).await.unwrap();
 
             // Verify catalog was opened (not re-bootstrapped)
-            let sb = db.catalog().superblock();
+            let sb = db.catalog_store().superblock();
             assert_eq!(sb.next_table_id, LAST_RESERVED_TABLE_ID + 1);
         }
     }

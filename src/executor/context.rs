@@ -81,7 +81,7 @@ pub struct ExecContextImpl<S: Storage, R: Replacer> {
     // NOTE: The `CatalogStore` dependency in `ExecContextImpl` exists solely for `nextval`.
     // A future refactor could extract sequence access into a dedicated trait, removing
     // the `CatalogStore` dependency from the execution context.
-    catalog: CatalogStore<S, R>,
+    catalog_store: CatalogStore<S, R>,
     snapshot: Snapshot,
 }
 
@@ -90,7 +90,7 @@ impl<S: Storage, R: Replacer> Clone for ExecContextImpl<S, R> {
         Self {
             pool: Arc::clone(&self.pool),
             tx_manager: Arc::clone(&self.tx_manager),
-            catalog: self.catalog.clone(),
+            catalog_store: self.catalog_store.clone(),
             snapshot: self.snapshot.clone(),
         }
     }
@@ -101,13 +101,13 @@ impl<S: Storage, R: Replacer> ExecContextImpl<S, R> {
     pub fn new(
         pool: Arc<BufferPool<S, R>>,
         tx_manager: Arc<TransactionManager>,
-        catalog: CatalogStore<S, R>,
+        catalog_store: CatalogStore<S, R>,
         snapshot: Snapshot,
     ) -> Self {
         Self {
             pool,
             tx_manager,
-            catalog,
+            catalog_store,
             snapshot,
         }
     }
@@ -168,6 +168,6 @@ impl<S: Storage, R: Replacer> ExecContext for ExecContextImpl<S, R> {
     }
 
     async fn nextval(&self, seq_id: u32) -> Result<i64, ExecutorError> {
-        Ok(self.catalog.nextval(seq_id).await?)
+        Ok(self.catalog_store.nextval(seq_id).await?)
     }
 }

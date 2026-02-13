@@ -2,13 +2,11 @@
 
 use std::collections::HashSet;
 
-use crate::catalog::{CatalogStore, ColumnInfo};
+use crate::catalog::{CatalogSnapshot, ColumnInfo};
 use crate::datum::Type;
 use crate::sql::{
     DeleteStmt, Expr, FromClause, InsertStmt, SelectItem, SelectStmt, TableRef, UpdateStmt,
 };
-use crate::storage::{Replacer, Storage};
-use crate::tx::Snapshot;
 
 use super::error::ExecutorError;
 use super::expr::BoundExpr;
@@ -24,17 +22,15 @@ use super::{ColumnDesc, ColumnSource};
 /// # Arguments
 ///
 /// * `select` - The parsed SELECT statement
-/// * `catalog` - Catalog store for table/column metadata access
-/// * `snapshot` - MVCC snapshot for catalog visibility checks
+/// * `catalog` - Catalog snapshot for table/column metadata lookups
 ///
 /// # Errors
 ///
 /// Returns [`ExecutorError`] for unresolvable tables/columns, unsupported
-/// features (JOINs, subqueries), or catalog I/O errors.
-pub async fn plan_select<S: Storage, R: Replacer>(
+/// features (JOINs, subqueries), or catalog lookup errors.
+pub fn plan_select(
     select: &SelectStmt,
-    catalog: &CatalogStore<S, R>,
-    snapshot: &Snapshot,
+    catalog: &CatalogSnapshot,
 ) -> Result<QueryPlan, ExecutorError> {
     // Check for unsupported features
     if select.distinct {
@@ -61,7 +57,7 @@ pub async fn plan_select<S: Storage, R: Replacer>(
 
     // Step 1: FROM clause -> base plan
     let mut plan = match &select.from {
-        Some(from) => build_from_plan(from, catalog, snapshot).await?,
+        Some(from) => build_from_plan(from, catalog)?,
         None => QueryPlan::ValuesScan,
     };
 
@@ -83,27 +79,24 @@ pub async fn plan_select<S: Storage, R: Replacer>(
 /// # Arguments
 ///
 /// * `insert` - The parsed INSERT statement
-/// * `catalog` - Catalog store for table/column metadata access
-/// * `snapshot` - MVCC snapshot for catalog visibility checks
+/// * `catalog` - Catalog snapshot for table/column metadata lookups
 ///
 /// # Errors
 ///
 /// Returns [`ExecutorError`] for unknown tables/columns, column count
 /// mismatches, duplicate columns, or type coercion failures.
-pub async fn plan_insert<S: Storage, R: Replacer>(
+pub fn plan_insert(
     insert: &InsertStmt,
-    catalog: &CatalogStore<S, R>,
-    snapshot: &Snapshot,
+    catalog: &CatalogSnapshot,
 ) -> Result<DmlPlan, ExecutorError> {
-    // Look up the target table
-    let table_info = catalog
-        .get_table(snapshot, &insert.table)
-        .await?
-        .ok_or_else(|| ExecutorError::TableNotFound {
-            name: insert.table.clone(),
-        })?;
-
-    let column_infos = catalog.get_columns(snapshot, table_info.table_id).await?;
+    // Look up the target table and columns
+    let entry =
+        catalog
+            .resolve_table(&insert.table)
+            .ok_or_else(|| ExecutorError::TableNotFound {
+                name: insert.table.clone(),
+            })?;
+    let (table_info, column_infos) = (&entry.info, entry.columns.as_slice());
     let column_count = column_infos.len();
 
     // Determine the column mapping: which table column each value expression maps to.
@@ -112,7 +105,7 @@ pub async fn plan_insert<S: Storage, R: Replacer>(
         // No column list: values must match table column count
         (0..column_count).collect::<Vec<_>>()
     } else {
-        resolve_insert_columns(&insert.columns, &column_infos)?
+        resolve_insert_columns(&insert.columns, column_infos)?
     };
 
     // Identify SERIAL columns for auto-population
@@ -182,27 +175,26 @@ pub async fn plan_insert<S: Storage, R: Replacer>(
 ///
 /// Returns [`ExecutorError`] for unknown tables/columns, or expression binding
 /// errors.
-pub async fn plan_update<S: Storage, R: Replacer>(
+pub fn plan_update(
     update: &UpdateStmt,
-    catalog: &CatalogStore<S, R>,
-    snapshot: &Snapshot,
+    catalog: &CatalogSnapshot,
 ) -> Result<DmlPlan, ExecutorError> {
     // Build the input scan plan
-    let scan_plan = build_seq_scan_plan(&update.table, None, catalog, snapshot).await?;
+    let scan_plan = build_seq_scan_plan(&update.table, None, catalog)?;
 
     let input = apply_filter(scan_plan, update.where_clause.as_ref())?;
 
     let input_columns = input.columns().to_vec();
 
     // NOTE: This duplicates the table/column lookup already done inside build_seq_scan_plan.
-    // A shared ResolvedTable struct could eliminate this when Catalog access is restructured.
-    let table_info = catalog
-        .get_table(snapshot, &update.table)
-        .await?
-        .ok_or_else(|| ExecutorError::TableNotFound {
-            name: update.table.clone(),
-        })?;
-    let column_infos = catalog.get_columns(snapshot, table_info.table_id).await?;
+    // With CatalogSnapshot this is a cheap HashMap lookup, so no performance concern.
+    let entry =
+        catalog
+            .resolve_table(&update.table)
+            .ok_or_else(|| ExecutorError::TableNotFound {
+                name: update.table.clone(),
+            })?;
+    let (table_info, column_infos) = (&entry.info, entry.columns.as_slice());
     let schema: Vec<Type> = column_infos.iter().map(|c| c.ty).collect();
 
     // Build assignments: start with identity (preserve original values)
@@ -244,13 +236,12 @@ pub async fn plan_update<S: Storage, R: Replacer>(
 /// # Errors
 ///
 /// Returns [`ExecutorError`] for unknown tables or expression binding errors.
-pub async fn plan_delete<S: Storage, R: Replacer>(
+pub fn plan_delete(
     delete: &DeleteStmt,
-    catalog: &CatalogStore<S, R>,
-    snapshot: &Snapshot,
+    catalog: &CatalogSnapshot,
 ) -> Result<DmlPlan, ExecutorError> {
     // Build the input scan plan
-    let scan_plan = build_seq_scan_plan(&delete.table, None, catalog, snapshot).await?;
+    let scan_plan = build_seq_scan_plan(&delete.table, None, catalog)?;
 
     let input = apply_filter(scan_plan, delete.where_clause.as_ref())?;
 
@@ -304,29 +295,25 @@ fn apply_filter(plan: QueryPlan, where_clause: Option<&Expr>) -> Result<QueryPla
 }
 
 /// Builds a plan from a FROM clause.
-async fn build_from_plan<S: Storage, R: Replacer>(
+fn build_from_plan(
     from: &FromClause,
-    catalog: &CatalogStore<S, R>,
-    snapshot: &Snapshot,
+    catalog: &CatalogSnapshot,
 ) -> Result<QueryPlan, ExecutorError> {
     if from.tables.len() != 1 {
         return Err(ExecutorError::Unsupported(
             "multiple tables in FROM (use JOIN)".to_string(),
         ));
     }
-    build_table_ref_plan(&from.tables[0], catalog, snapshot).await
+    build_table_ref_plan(&from.tables[0], catalog)
 }
 
 /// Builds a plan from a table reference.
-async fn build_table_ref_plan<S: Storage, R: Replacer>(
+fn build_table_ref_plan(
     table_ref: &TableRef,
-    catalog: &CatalogStore<S, R>,
-    snapshot: &Snapshot,
+    catalog: &CatalogSnapshot,
 ) -> Result<QueryPlan, ExecutorError> {
     match table_ref {
-        TableRef::Table { name, alias } => {
-            build_seq_scan_plan(name, alias.as_deref(), catalog, snapshot).await
-        }
+        TableRef::Table { name, alias } => build_seq_scan_plan(name, alias.as_deref(), catalog),
         TableRef::Join { .. } => Err(ExecutorError::Unsupported("JOIN".to_string())),
         TableRef::Subquery { .. } => {
             Err(ExecutorError::Unsupported("subquery in FROM".to_string()))
@@ -341,29 +328,25 @@ async fn build_table_ref_plan<S: Storage, R: Replacer>(
 ///
 /// NOTE: When IndexScan is introduced, this will be subsumed by a `build_scan_plan`
 /// that takes WHERE predicates and selects between SeqScan and IndexScan.
-async fn build_seq_scan_plan<S: Storage, R: Replacer>(
+fn build_seq_scan_plan(
     table_name: &str,
     alias: Option<&str>,
-    catalog: &CatalogStore<S, R>,
-    snapshot: &Snapshot,
+    catalog: &CatalogSnapshot,
 ) -> Result<QueryPlan, ExecutorError> {
-    // Look up table in catalog
-    let table_info = catalog
-        .get_table(snapshot, table_name)
-        .await?
+    // Look up table and columns in catalog
+    let entry = catalog
+        .resolve_table(table_name)
         .ok_or_else(|| ExecutorError::TableNotFound {
             name: table_name.to_string(),
         })?;
-
-    // Get column metadata
-    let column_infos = catalog.get_columns(snapshot, table_info.table_id).await?;
+    let (table_info, column_infos) = (&entry.info, entry.columns.as_slice());
 
     // Build schema (column types) for record deserialization
     let schema: Vec<Type> = column_infos.iter().map(|c| c.ty).collect();
 
     // Build column descriptors — use alias for column resolution if provided
     let resolve_name = alias.unwrap_or(table_name);
-    let columns = build_column_descs(&column_infos, table_info.table_id, resolve_name);
+    let columns = build_column_descs(column_infos, table_info.table_id, resolve_name);
 
     Ok(QueryPlan::SeqScan {
         table_name: table_name.to_string(),
@@ -483,22 +466,20 @@ fn expand_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-
+    use crate::catalog::CatalogSnapshot;
     use crate::db::Database;
     use crate::sql::{Parser, Statement};
     use crate::storage::MemoryStorage;
     use crate::tx::CommandId;
 
-    async fn setup_test_db() -> (
-        Arc<Database<MemoryStorage, crate::storage::LruReplacer>>,
-        Snapshot,
-    ) {
+    async fn setup_catalog() -> CatalogSnapshot {
         let storage = MemoryStorage::new();
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
+        let db = Database::open(storage, 100).await.unwrap();
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-        (db, snapshot)
+        CatalogSnapshot::load(db.catalog_store(), &snapshot)
+            .await
+            .unwrap()
     }
 
     fn parse_select(sql: &str) -> SelectStmt {
@@ -511,10 +492,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_select_from_sys_tables() {
-        let (db, snapshot) = setup_test_db().await;
+        let catalog = setup_catalog().await;
         let select = parse_select("SELECT * FROM sys_tables");
 
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
 
         assert_eq!(plan.columns().len(), 3);
         assert_eq!(plan.columns()[0].name, "table_id");
@@ -524,10 +505,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_select_no_from() {
-        let (db, snapshot) = setup_test_db().await;
+        let catalog = setup_catalog().await;
         let select = parse_select("SELECT 42");
 
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
 
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "?column?");
@@ -535,19 +516,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_select_table_not_found() {
-        let (db, snapshot) = setup_test_db().await;
+        let catalog = setup_catalog().await;
         let select = parse_select("SELECT * FROM nonexistent");
 
-        let result = plan_select(&select, db.catalog(), &snapshot).await;
+        let result = plan_select(&select, &catalog);
         assert!(matches!(result, Err(ExecutorError::TableNotFound { .. })));
     }
 
     #[tokio::test]
     async fn test_plan_select_with_where() {
-        let (db, snapshot) = setup_test_db().await;
+        let catalog = setup_catalog().await;
         let select = parse_select("SELECT table_name FROM sys_tables WHERE table_id = 1");
 
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
 
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "table_name");
@@ -562,10 +543,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_select_expr_has_no_table_metadata() {
-        let (db, snapshot) = setup_test_db().await;
+        let catalog = setup_catalog().await;
         let select = parse_select("SELECT 1 + table_id FROM sys_tables");
 
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
 
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "?column?");
@@ -574,10 +555,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_select_qualified_column_ref() {
-        let (db, snapshot) = setup_test_db().await;
+        let catalog = setup_catalog().await;
         let select = parse_select("SELECT sys_tables.table_name FROM sys_tables");
 
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
 
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "table_name");
@@ -592,10 +573,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_select_qualified_wildcard() {
-        let (db, snapshot) = setup_test_db().await;
+        let catalog = setup_catalog().await;
         let select = parse_select("SELECT sys_tables.* FROM sys_tables");
 
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
 
         assert_eq!(plan.columns().len(), 3);
         assert_eq!(plan.columns()[0].name, "table_id");
@@ -605,19 +586,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_select_qualified_wildcard_wrong_table() {
-        let (db, snapshot) = setup_test_db().await;
+        let catalog = setup_catalog().await;
         let select = parse_select("SELECT nonexistent.* FROM sys_tables");
 
-        let result = plan_select(&select, db.catalog(), &snapshot).await;
+        let result = plan_select(&select, &catalog);
         assert!(matches!(result, Err(ExecutorError::TableNotFound { .. })));
     }
 
     #[tokio::test]
     async fn test_plan_select_with_table_alias() {
-        let (db, snapshot) = setup_test_db().await;
+        let catalog = setup_catalog().await;
         let select = parse_select("SELECT t.table_name FROM sys_tables AS t");
 
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
 
         assert_eq!(plan.columns().len(), 1);
         assert_eq!(plan.columns()[0].name, "table_name");
@@ -630,128 +611,128 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_select_alias_hides_original_name() {
-        let (db, snapshot) = setup_test_db().await;
+        let catalog = setup_catalog().await;
         let select = parse_select("SELECT sys_tables.table_name FROM sys_tables AS t");
 
-        let result = plan_select(&select, db.catalog(), &snapshot).await;
+        let result = plan_select(&select, &catalog);
         assert!(matches!(result, Err(ExecutorError::ColumnNotFound { .. })));
     }
 
     #[tokio::test]
     async fn test_infer_data_type_literals() {
-        let (db, snapshot) = setup_test_db().await;
+        let catalog = setup_catalog().await;
 
         // Integer literal → bigint
         let select = parse_select("SELECT 42");
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Bigint);
 
         // Float literal → Double
         let select = parse_select("SELECT 3.14");
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Double);
 
         // Boolean literal → Bool
         let select = parse_select("SELECT TRUE");
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Bool);
 
         // String literal → Text
         let select = parse_select("SELECT 'hello'");
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Text);
 
         // NULL → Text (fallback)
         let select = parse_select("SELECT NULL");
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Text);
     }
 
     #[tokio::test]
     async fn test_infer_data_type_operators() {
-        let (db, snapshot) = setup_test_db().await;
+        let catalog = setup_catalog().await;
 
         // Comparison → Bool
         let select = parse_select("SELECT 1 = 1");
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Bool);
 
         // Arithmetic (int + int) → Bigint
         let select = parse_select("SELECT 1 + 2");
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Bigint);
 
         // Arithmetic (int + float) → Double via numeric promotion
         let select = parse_select("SELECT 1 + 2.5");
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Double);
 
         // Arithmetic (float + int) → Double via numeric promotion
         let select = parse_select("SELECT 2.5 + 1");
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Double);
 
         // Arithmetic (float + float) → Double
         let select = parse_select("SELECT 1.0 * 2.5");
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Double);
 
         // Concatenation → Text
         let select = parse_select("SELECT 'a' || 'b'");
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Text);
 
         // IS NULL → Bool
         let select = parse_select("SELECT 1 IS NULL");
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Bool);
 
         // IN list → Bool
         let select = parse_select("SELECT 1 IN (1, 2)");
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Bool);
 
         // BETWEEN → Bool
         let select = parse_select("SELECT 1 BETWEEN 0 AND 2");
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Bool);
 
         // LIKE → Bool
         let select = parse_select("SELECT 'a' LIKE '%'");
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Bool);
 
         // CAST → target type
         let select = parse_select("SELECT CAST(1 AS TEXT)");
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Text);
 
         // Unary minus → inherits operand type
         let select = parse_select("SELECT -42");
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Bigint);
     }
 
     #[tokio::test]
     async fn test_infer_data_type_column_ref() {
-        let (db, snapshot) = setup_test_db().await;
+        let catalog = setup_catalog().await;
 
         // Column reference preserves source type
         let select = parse_select("SELECT table_id FROM sys_tables");
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Integer);
 
         let select = parse_select("SELECT table_name FROM sys_tables");
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
         assert_eq!(plan.columns()[0].ty, Type::Text);
     }
 
     #[tokio::test]
     async fn test_plan_select_alias_qualified_wildcard() {
-        let (db, snapshot) = setup_test_db().await;
+        let catalog = setup_catalog().await;
         let select = parse_select("SELECT t.* FROM sys_tables AS t");
 
-        let plan = plan_select(&select, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_select(&select, &catalog).unwrap();
 
         assert_eq!(plan.columns().len(), 3);
         assert_eq!(plan.columns()[0].name, "table_id");
@@ -759,22 +740,17 @@ mod tests {
 
     // --- INSERT planner tests ---
 
-    /// Sets up a database with a user-defined table for INSERT tests.
-    async fn setup_db_with_table(
-        ddl: &str,
-    ) -> (
-        Arc<Database<MemoryStorage, crate::storage::LruReplacer>>,
-        Snapshot,
-    ) {
+    /// Sets up a catalog snapshot with a user-defined table.
+    async fn setup_catalog_with_table(ddl: &str) -> CatalogSnapshot {
         let storage = MemoryStorage::new();
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
+        let db = Database::open(storage, 100).await.unwrap();
 
         let txid = db.tx_manager().begin();
         let stmt = Parser::new(ddl).parse().unwrap().unwrap();
         let Statement::CreateTable(create_stmt) = stmt else {
             panic!("expected CREATE TABLE");
         };
-        db.catalog()
+        db.catalog_store()
             .create_table(txid, CommandId::FIRST, &create_stmt)
             .await
             .unwrap();
@@ -782,7 +758,9 @@ mod tests {
 
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-        (db, snapshot)
+        CatalogSnapshot::load(db.catalog_store(), &snapshot)
+            .await
+            .unwrap()
     }
 
     fn parse_insert(sql: &str) -> InsertStmt {
@@ -795,11 +773,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_insert_basic() {
-        let (db, snapshot) =
-            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let catalog = setup_catalog_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
         let insert = parse_insert("INSERT INTO users VALUES (1, 'Alice')");
 
-        let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_insert(&insert, &catalog).unwrap();
 
         let DmlPlan::Insert {
             table_name,
@@ -820,11 +797,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_insert_with_column_list() {
-        let (db, snapshot) =
-            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let catalog = setup_catalog_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
         let insert = parse_insert("INSERT INTO users (name, id) VALUES ('Bob', 2)");
 
-        let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_insert(&insert, &catalog).unwrap();
 
         let DmlPlan::Insert { values, schema, .. } = &plan else {
             panic!("expected DmlPlan::Insert");
@@ -843,12 +819,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_insert_fewer_columns() {
-        let (db, snapshot) =
-            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let catalog = setup_catalog_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
         // Only specify id, name should default to NULL
         let insert = parse_insert("INSERT INTO users (id) VALUES (1)");
 
-        let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_insert(&insert, &catalog).unwrap();
 
         let DmlPlan::Insert { values, .. } = &plan else {
             panic!("expected DmlPlan::Insert");
@@ -860,11 +835,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_insert_serial_auto_populate() {
-        let (db, snapshot) = setup_db_with_table("CREATE TABLE users (id SERIAL, name TEXT)").await;
+        let catalog = setup_catalog_with_table("CREATE TABLE users (id SERIAL, name TEXT)").await;
         // Don't specify id — should be auto-populated
         let insert = parse_insert("INSERT INTO users (name) VALUES ('Alice')");
 
-        let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_insert(&insert, &catalog).unwrap();
 
         let DmlPlan::Insert {
             serial_columns,
@@ -884,11 +859,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_insert_serial_explicit_value() {
-        let (db, snapshot) = setup_db_with_table("CREATE TABLE users (id SERIAL, name TEXT)").await;
+        let catalog = setup_catalog_with_table("CREATE TABLE users (id SERIAL, name TEXT)").await;
         // Explicitly provide id — should NOT auto-populate
         let insert = parse_insert("INSERT INTO users (id, name) VALUES (99, 'Bob')");
 
-        let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_insert(&insert, &catalog).unwrap();
 
         let DmlPlan::Insert { serial_columns, .. } = &plan else {
             panic!("expected DmlPlan::Insert");
@@ -899,12 +874,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_insert_column_count_mismatch() {
-        let (db, snapshot) =
-            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let catalog = setup_catalog_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
         // 3 values but only 2 columns
         let insert = parse_insert("INSERT INTO users VALUES (1, 'Alice', 'extra')");
 
-        let result = plan_insert(&insert, db.catalog(), &snapshot).await;
+        let result = plan_insert(&insert, &catalog);
         assert!(matches!(
             result,
             Err(ExecutorError::ColumnCountMismatch {
@@ -916,40 +890,38 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_insert_duplicate_column() {
-        let (db, snapshot) =
-            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let catalog = setup_catalog_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
         let insert = parse_insert("INSERT INTO users (id, id) VALUES (1, 2)");
 
-        let result = plan_insert(&insert, db.catalog(), &snapshot).await;
+        let result = plan_insert(&insert, &catalog);
         assert!(matches!(result, Err(ExecutorError::DuplicateColumn { .. })));
     }
 
     #[tokio::test]
     async fn test_plan_insert_column_not_found() {
-        let (db, snapshot) =
-            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let catalog = setup_catalog_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
         let insert = parse_insert("INSERT INTO users (id, nonexistent) VALUES (1, 'x')");
 
-        let result = plan_insert(&insert, db.catalog(), &snapshot).await;
+        let result = plan_insert(&insert, &catalog);
         assert!(matches!(result, Err(ExecutorError::ColumnNotFound { .. })));
     }
 
     #[tokio::test]
     async fn test_plan_insert_table_not_found() {
-        let (db, snapshot) = setup_test_db().await;
+        let catalog = setup_catalog().await;
         let insert = parse_insert("INSERT INTO nonexistent VALUES (1)");
 
-        let result = plan_insert(&insert, db.catalog(), &snapshot).await;
+        let result = plan_insert(&insert, &catalog);
         assert!(matches!(result, Err(ExecutorError::TableNotFound { .. })));
     }
 
     #[tokio::test]
     async fn test_plan_insert_type_coercion() {
-        let (db, snapshot) = setup_db_with_table("CREATE TABLE t (val SMALLINT)").await;
+        let catalog = setup_catalog_with_table("CREATE TABLE t (val SMALLINT)").await;
         // Integer literal 42 (Bigint) → should be coerced to Smallint
         let insert = parse_insert("INSERT INTO t VALUES (42)");
 
-        let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_insert(&insert, &catalog).unwrap();
 
         let DmlPlan::Insert { values, .. } = &plan else {
             panic!("expected DmlPlan::Insert");
@@ -966,12 +938,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_insert_multi_row() {
-        let (db, snapshot) =
-            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let catalog = setup_catalog_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
         let insert =
             parse_insert("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')");
 
-        let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_insert(&insert, &catalog).unwrap();
 
         let DmlPlan::Insert { values, .. } = &plan else {
             panic!("expected DmlPlan::Insert");
@@ -981,11 +952,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_insert_null_no_cast() {
-        let (db, snapshot) = setup_db_with_table("CREATE TABLE t (val INTEGER)").await;
+        let catalog = setup_catalog_with_table("CREATE TABLE t (val INTEGER)").await;
         // NULL should pass through without a Cast wrapper
         let insert = parse_insert("INSERT INTO t VALUES (NULL)");
 
-        let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_insert(&insert, &catalog).unwrap();
 
         let DmlPlan::Insert { values, .. } = &plan else {
             panic!("expected DmlPlan::Insert");
@@ -995,11 +966,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_insert_explain() {
-        let (db, snapshot) =
-            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let catalog = setup_catalog_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
         let insert = parse_insert("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')");
 
-        let plan = plan_insert(&insert, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_insert(&insert, &catalog).unwrap();
         assert_eq!(plan.explain(), "Insert on users (2 rows)");
     }
 
@@ -1015,11 +985,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_update_basic() {
-        let (db, snapshot) =
-            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let catalog = setup_catalog_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
         let update = parse_update("UPDATE users SET name = 'Bob'");
 
-        let plan = plan_update(&update, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_update(&update, &catalog).unwrap();
 
         let DmlPlan::Update {
             table_name,
@@ -1044,11 +1013,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_update_with_where() {
-        let (db, snapshot) =
-            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let catalog = setup_catalog_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
         let update = parse_update("UPDATE users SET name = 'Bob' WHERE id = 1");
 
-        let plan = plan_update(&update, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_update(&update, &catalog).unwrap();
 
         let DmlPlan::Update { input, .. } = &plan else {
             panic!("expected DmlPlan::Update");
@@ -1063,11 +1031,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_update_type_coercion() {
-        let (db, snapshot) = setup_db_with_table("CREATE TABLE t (val SMALLINT)").await;
+        let catalog = setup_catalog_with_table("CREATE TABLE t (val SMALLINT)").await;
         // Integer literal 42 (Bigint) → should be coerced to Smallint
         let update = parse_update("UPDATE t SET val = 42");
 
-        let plan = plan_update(&update, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_update(&update, &catalog).unwrap();
 
         let DmlPlan::Update { assignments, .. } = &plan else {
             panic!("expected DmlPlan::Update");
@@ -1080,12 +1048,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_update_referencing_column() {
-        let (db, snapshot) =
-            setup_db_with_table("CREATE TABLE counters (id INTEGER, count INTEGER)").await;
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE counters (id INTEGER, count INTEGER)").await;
         // SET count = count + 1 — references existing column
         let update = parse_update("UPDATE counters SET count = count + 1");
 
-        let plan = plan_update(&update, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_update(&update, &catalog).unwrap();
 
         let DmlPlan::Update { assignments, .. } = &plan else {
             panic!("expected DmlPlan::Update");
@@ -1102,20 +1070,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_update_column_not_found() {
-        let (db, snapshot) =
-            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let catalog = setup_catalog_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
         let update = parse_update("UPDATE users SET nonexistent = 1");
 
-        let result = plan_update(&update, db.catalog(), &snapshot).await;
+        let result = plan_update(&update, &catalog);
         assert!(matches!(result, Err(ExecutorError::ColumnNotFound { .. })));
     }
 
     #[tokio::test]
     async fn test_plan_update_table_not_found() {
-        let (db, snapshot) = setup_test_db().await;
+        let catalog = setup_catalog().await;
         let update = parse_update("UPDATE nonexistent SET x = 1");
 
-        let result = plan_update(&update, db.catalog(), &snapshot).await;
+        let result = plan_update(&update, &catalog);
         assert!(matches!(result, Err(ExecutorError::TableNotFound { .. })));
     }
 
@@ -1131,11 +1098,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_delete_basic() {
-        let (db, snapshot) =
-            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let catalog = setup_catalog_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
         let delete = parse_delete("DELETE FROM users");
 
-        let plan = plan_delete(&delete, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_delete(&delete, &catalog).unwrap();
 
         let DmlPlan::Delete {
             table_name, input, ..
@@ -1150,11 +1116,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_delete_with_where() {
-        let (db, snapshot) =
-            setup_db_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
+        let catalog = setup_catalog_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
         let delete = parse_delete("DELETE FROM users WHERE id = 1");
 
-        let plan = plan_delete(&delete, db.catalog(), &snapshot).await.unwrap();
+        let plan = plan_delete(&delete, &catalog).unwrap();
 
         let DmlPlan::Delete { input, .. } = &plan else {
             panic!("expected DmlPlan::Delete");
@@ -1168,10 +1133,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_delete_table_not_found() {
-        let (db, snapshot) = setup_test_db().await;
+        let catalog = setup_catalog().await;
         let delete = parse_delete("DELETE FROM nonexistent");
 
-        let result = plan_delete(&delete, db.catalog(), &snapshot).await;
+        let result = plan_delete(&delete, &catalog);
         assert!(matches!(result, Err(ExecutorError::TableNotFound { .. })));
     }
 }
