@@ -37,12 +37,19 @@ pub struct TransactionManager {
 impl TransactionManager {
     /// Create a new transaction manager.
     pub fn new() -> Self {
+        let mut tx_states = HashMap::new();
+        // FROZEN is a synthetic "always committed" transaction used as a
+        // universal visibility baseline (e.g., bootstrap tuples, catalog cache
+        // fallback). Register it so that `state(TxId::FROZEN)` returns
+        // `Committed` without special-casing.
+        tx_states.insert(TxId::FROZEN, TxState::Committed);
+
         Self {
             state: Mutex::new(TxManagerState {
                 next_txid: 2, // Start from 2 (0=INVALID, 1=FROZEN are reserved)
                 active_txids: Vec::new(),
             }),
-            tx_states: Mutex::new(HashMap::new()),
+            tx_states: Mutex::new(tx_states),
         }
     }
 
@@ -284,5 +291,11 @@ mod tests {
         assert_eq!(snapshot.xmin, tx1);
         // xmax = next_txid = 5 (unaffected by commit)
         assert_eq!(snapshot.xmax, TxId::new(5));
+    }
+
+    #[test]
+    fn test_frozen_is_committed() {
+        let manager = TransactionManager::new();
+        assert_eq!(manager.state(TxId::FROZEN), TxState::Committed);
     }
 }
