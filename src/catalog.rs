@@ -27,7 +27,7 @@
 //!
 //! ## Components
 //!
-//! - [`Catalog`]: Main entry point for catalog operations (create table, lookups)
+//! - [`CatalogStore`]: Low-level catalog operations (create table, heap lookups)
 //! - [`Superblock`]: Database metadata stored in page 0 (page IDs, ID generators)
 //! - [`TableInfo`], [`ColumnInfo`], [`SequenceInfo`]: Typed wrappers for catalog rows
 //!
@@ -43,12 +43,12 @@
 //! The catalog is accessed through the [`Database`](crate::db::Database) type,
 //! which orchestrates the buffer pool, transaction manager, and catalog.
 
-mod core;
 mod error;
 mod schema;
+mod store;
 mod superblock;
 
-pub use core::Catalog;
 pub use error::CatalogError;
 pub use schema::{ColumnInfo, LAST_RESERVED_TABLE_ID, SequenceInfo, SystemCatalogTable, TableInfo};
+pub use store::CatalogStore;
 pub use superblock::Superblock;

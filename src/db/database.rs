@@ -3,19 +3,19 @@
 use std::sync::Arc;
 
 use super::error::DatabaseError;
-use crate::catalog::Catalog;
+use crate::catalog::CatalogStore;
 use crate::executor::ExecContextImpl;
 use crate::storage::{BufferPool, LruReplacer, Replacer, Storage};
 use crate::tx::{Snapshot, TransactionManager};
 
-/// Database orchestrates the core components: BufferPool, TransactionManager, and Catalog.
+/// Database orchestrates the core components: BufferPool, TransactionManager, and CatalogStore.
 ///
 /// This is the main entry point for database operations. It initializes or opens
 /// an existing database and provides access to its components.
 pub struct Database<S: Storage, R: Replacer> {
     pool: Arc<BufferPool<S, R>>,
     tx_manager: Arc<TransactionManager>,
-    catalog: Catalog<S, R>,
+    catalog: CatalogStore<S, R>,
 }
 
 impl<S: Storage> Database<S, LruReplacer> {
@@ -61,8 +61,8 @@ impl<S: Storage, R: Replacer> Database<S, R> {
 
         // Check if this is a fresh database
         let catalog = match pool.page_count().await {
-            0 => Catalog::bootstrap(pool.clone(), tx_manager.clone()).await?,
-            _ => Catalog::open(pool.clone(), tx_manager.clone()).await?,
+            0 => CatalogStore::bootstrap(pool.clone(), tx_manager.clone()).await?,
+            _ => CatalogStore::open(pool.clone(), tx_manager.clone()).await?,
         };
 
         Ok(Self {
@@ -83,7 +83,7 @@ impl<S: Storage, R: Replacer> Database<S, R> {
     }
 
     /// Returns a reference to the catalog.
-    pub fn catalog(&self) -> &Catalog<S, R> {
+    pub fn catalog(&self) -> &CatalogStore<S, R> {
         &self.catalog
     }
 

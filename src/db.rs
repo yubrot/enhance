@@ -27,7 +27,7 @@
 //! |  (Orchestrates core infrastructure components)                   |
 //! |                                                                  |
 //! |  +-----------------+  +--------------------+  +---------------+  |
-//! |  | Arc<BufferPool> |  | Arc<TxManager>     |  |    Catalog    |  |
+//! |  | Arc<BufferPool> |  | Arc<TxManager>     |  | CatalogStore |  |
 //! |  | (Page I/O,      |  | (TxId allocation,  |  | (Table/column |  |
 //! |  |  LRU eviction)  |  |  commit/abort)     |  |  metadata)    |  |
 //! |  +--------+--------+  +--------------------+  +-------+-------+  |

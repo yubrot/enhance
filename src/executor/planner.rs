@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use crate::catalog::{Catalog, ColumnInfo};
+use crate::catalog::{CatalogStore, ColumnInfo};
 use crate::datum::Type;
 use crate::sql::{
     DeleteStmt, Expr, FromClause, InsertStmt, SelectItem, SelectStmt, TableRef, UpdateStmt,
@@ -24,7 +24,7 @@ use super::{ColumnDesc, ColumnSource};
 /// # Arguments
 ///
 /// * `select` - The parsed SELECT statement
-/// * `catalog` - Catalog for table/column metadata access
+/// * `catalog` - Catalog store for table/column metadata access
 /// * `snapshot` - MVCC snapshot for catalog visibility checks
 ///
 /// # Errors
@@ -33,7 +33,7 @@ use super::{ColumnDesc, ColumnSource};
 /// features (JOINs, subqueries), or catalog I/O errors.
 pub async fn plan_select<S: Storage, R: Replacer>(
     select: &SelectStmt,
-    catalog: &Catalog<S, R>,
+    catalog: &CatalogStore<S, R>,
     snapshot: &Snapshot,
 ) -> Result<QueryPlan, ExecutorError> {
     // Check for unsupported features
@@ -83,7 +83,7 @@ pub async fn plan_select<S: Storage, R: Replacer>(
 /// # Arguments
 ///
 /// * `insert` - The parsed INSERT statement
-/// * `catalog` - Catalog for table/column metadata access
+/// * `catalog` - Catalog store for table/column metadata access
 /// * `snapshot` - MVCC snapshot for catalog visibility checks
 ///
 /// # Errors
@@ -92,7 +92,7 @@ pub async fn plan_select<S: Storage, R: Replacer>(
 /// mismatches, duplicate columns, or type coercion failures.
 pub async fn plan_insert<S: Storage, R: Replacer>(
     insert: &InsertStmt,
-    catalog: &Catalog<S, R>,
+    catalog: &CatalogStore<S, R>,
     snapshot: &Snapshot,
 ) -> Result<DmlPlan, ExecutorError> {
     // Look up the target table
@@ -184,7 +184,7 @@ pub async fn plan_insert<S: Storage, R: Replacer>(
 /// errors.
 pub async fn plan_update<S: Storage, R: Replacer>(
     update: &UpdateStmt,
-    catalog: &Catalog<S, R>,
+    catalog: &CatalogStore<S, R>,
     snapshot: &Snapshot,
 ) -> Result<DmlPlan, ExecutorError> {
     // Build the input scan plan
@@ -246,7 +246,7 @@ pub async fn plan_update<S: Storage, R: Replacer>(
 /// Returns [`ExecutorError`] for unknown tables or expression binding errors.
 pub async fn plan_delete<S: Storage, R: Replacer>(
     delete: &DeleteStmt,
-    catalog: &Catalog<S, R>,
+    catalog: &CatalogStore<S, R>,
     snapshot: &Snapshot,
 ) -> Result<DmlPlan, ExecutorError> {
     // Build the input scan plan
@@ -306,7 +306,7 @@ fn apply_filter(plan: QueryPlan, where_clause: Option<&Expr>) -> Result<QueryPla
 /// Builds a plan from a FROM clause.
 async fn build_from_plan<S: Storage, R: Replacer>(
     from: &FromClause,
-    catalog: &Catalog<S, R>,
+    catalog: &CatalogStore<S, R>,
     snapshot: &Snapshot,
 ) -> Result<QueryPlan, ExecutorError> {
     if from.tables.len() != 1 {
@@ -320,7 +320,7 @@ async fn build_from_plan<S: Storage, R: Replacer>(
 /// Builds a plan from a table reference.
 async fn build_table_ref_plan<S: Storage, R: Replacer>(
     table_ref: &TableRef,
-    catalog: &Catalog<S, R>,
+    catalog: &CatalogStore<S, R>,
     snapshot: &Snapshot,
 ) -> Result<QueryPlan, ExecutorError> {
     match table_ref {
@@ -344,7 +344,7 @@ async fn build_table_ref_plan<S: Storage, R: Replacer>(
 async fn build_seq_scan_plan<S: Storage, R: Replacer>(
     table_name: &str,
     alias: Option<&str>,
-    catalog: &Catalog<S, R>,
+    catalog: &CatalogStore<S, R>,
     snapshot: &Snapshot,
 ) -> Result<QueryPlan, ExecutorError> {
     // Look up table in catalog

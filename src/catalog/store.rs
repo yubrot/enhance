@@ -1,7 +1,6 @@
-//! Catalog for table and column metadata management.
+//! Low-level catalog store for table and column metadata management.
 //!
-//! This module provides pure metadata accessor without caching.
-//! For cached access, use the `Catalog` wrapper in `cached.rs`.
+//! This module provides direct heap access to system catalog tables.
 
 use std::sync::Arc;
 
@@ -15,14 +14,12 @@ use crate::sql::{CreateTableStmt, DataType};
 use crate::storage::{BufferPool, PageId, Replacer, Storage};
 use crate::tx::{CommandId, Snapshot, TransactionManager, TxId};
 
-/// Catalog for managing table and column metadata.
+/// Low-level catalog store for managing table and column metadata.
 ///
-/// The catalog provides direct access to metadata stored in self-hosted
-/// heap tables (sys_tables, sys_columns, sys_sequences).
-///
-/// This is a low-level store without caching. Use `catalog::cached::Catalog`
-/// wrapper for efficient access.
-pub struct Catalog<S: Storage, R: Replacer> {
+/// Provides direct access to metadata stored in self-hosted heap tables
+/// (sys_tables, sys_columns, sys_sequences). All methods are async because
+/// they perform heap page I/O through the buffer pool.
+pub struct CatalogStore<S: Storage, R: Replacer> {
     /// Buffer pool for page access.
     pool: Arc<BufferPool<S, R>>,
     /// Transaction manager for MVCC.
@@ -32,7 +29,7 @@ pub struct Catalog<S: Storage, R: Replacer> {
 }
 
 // Manual Clone impl: all fields are Arc-based, so cloning is lightweight.
-impl<S: Storage, R: Replacer> Clone for Catalog<S, R> {
+impl<S: Storage, R: Replacer> Clone for CatalogStore<S, R> {
     fn clone(&self) -> Self {
         Self {
             pool: Arc::clone(&self.pool),
@@ -42,11 +39,11 @@ impl<S: Storage, R: Replacer> Clone for Catalog<S, R> {
     }
 }
 
-impl<S: Storage, R: Replacer> Catalog<S, R> {
-    /// Creates a new catalog with the given components.
+impl<S: Storage, R: Replacer> CatalogStore<S, R> {
+    /// Creates a new catalog store with the given components.
     ///
-    /// This is an internal constructor; use `Catalog::bootstrap()` or
-    /// `Catalog::open()` to initialize the catalog properly.
+    /// This is an internal constructor; use `CatalogStore::bootstrap()` or
+    /// `CatalogStore::open()` to initialize the catalog store properly.
     fn new(
         pool: Arc<BufferPool<S, R>>,
         tx_manager: Arc<TransactionManager>,
@@ -414,7 +411,7 @@ mod tests {
     use crate::storage::{LruReplacer, MemoryStorage, PageId};
 
     struct TestCatalog {
-        catalog: Catalog<MemoryStorage, LruReplacer>,
+        catalog: CatalogStore<MemoryStorage, LruReplacer>,
         tx_manager: Arc<TransactionManager>,
     }
 
@@ -423,7 +420,9 @@ mod tests {
         let replacer = LruReplacer::new(100);
         let pool = Arc::new(BufferPool::new(storage, replacer, 100));
         let tx_manager = Arc::new(TransactionManager::new());
-        let catalog = Catalog::bootstrap(pool, tx_manager.clone()).await.unwrap();
+        let catalog = CatalogStore::bootstrap(pool, tx_manager.clone())
+            .await
+            .unwrap();
 
         TestCatalog {
             catalog,

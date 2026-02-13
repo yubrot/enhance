@@ -6,7 +6,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use crate::catalog::Catalog;
+use crate::catalog::CatalogStore;
 use crate::datum::Type;
 use crate::heap::{Record, TupleId, delete, insert, scan_visible_page, update};
 use crate::storage::{BufferPool, PageId, Replacer, Storage};
@@ -71,17 +71,17 @@ pub trait ExecContext: Send + Clone {
     fn nextval(&self, seq_id: u32) -> impl Future<Output = Result<i64, ExecutorError>> + Send;
 }
 
-/// Concrete [`ExecContext`] backed by a [`BufferPool`], [`TransactionManager`], and [`Catalog`].
+/// Concrete [`ExecContext`] backed by a [`BufferPool`], [`TransactionManager`], and [`CatalogStore`].
 ///
 /// Owns `Arc` references to shared components plus a cloned [`Snapshot`]
 /// for visibility checks. Cloning is lightweight.
 pub struct ExecContextImpl<S: Storage, R: Replacer> {
     pool: Arc<BufferPool<S, R>>,
     tx_manager: Arc<TransactionManager>,
-    // NOTE: The `Catalog` dependency in `ExecContextImpl` exists solely for `nextval`.
+    // NOTE: The `CatalogStore` dependency in `ExecContextImpl` exists solely for `nextval`.
     // A future refactor could extract sequence access into a dedicated trait, removing
-    // the `Catalog` dependency from the execution context.
-    catalog: Catalog<S, R>,
+    // the `CatalogStore` dependency from the execution context.
+    catalog: CatalogStore<S, R>,
     snapshot: Snapshot,
 }
 
@@ -101,7 +101,7 @@ impl<S: Storage, R: Replacer> ExecContextImpl<S, R> {
     pub fn new(
         pool: Arc<BufferPool<S, R>>,
         tx_manager: Arc<TransactionManager>,
-        catalog: Catalog<S, R>,
+        catalog: CatalogStore<S, R>,
         snapshot: Snapshot,
     ) -> Self {
         Self {
