@@ -1,7 +1,8 @@
-//! Catalog for table and column metadata management.
+//! Low-level catalog store for table and column metadata management.
 //!
-//! This module provides pure metadata accessor without caching.
-//! For cached access, use the `Catalog` wrapper in `cached.rs`.
+//! This module provides direct heap access to system catalog tables.
+//! For efficient in-memory lookups, use [`CatalogSnapshot`](super::CatalogSnapshot)
+//! built via [`CatalogSnapshot::load`](CatalogSnapshot::load).
 
 use std::sync::Arc;
 
@@ -15,14 +16,14 @@ use crate::sql::{CreateTableStmt, DataType};
 use crate::storage::{BufferPool, PageId, Replacer, Storage};
 use crate::tx::{CommandId, Snapshot, TransactionManager, TxId};
 
-/// Catalog for managing table and column metadata.
+/// Low-level catalog store for managing table and column metadata.
 ///
-/// The catalog provides direct access to metadata stored in self-hosted
-/// heap tables (sys_tables, sys_columns, sys_sequences).
+/// Provides direct access to metadata stored in self-hosted heap tables
+/// (sys_tables, sys_columns, sys_sequences). All methods are async because
+/// they perform heap page I/O through the buffer pool.
 ///
-/// This is a low-level store without caching. Use `catalog::cached::Catalog`
-/// wrapper for efficient access.
-pub struct Catalog<S: Storage, R: Replacer> {
+/// For synchronous, cached access during query planning, use [`CatalogSnapshot`](super::CatalogSnapshot).
+pub struct CatalogStore<S: Storage, R: Replacer> {
     /// Buffer pool for page access.
     pool: Arc<BufferPool<S, R>>,
     /// Transaction manager for MVCC.
@@ -32,7 +33,7 @@ pub struct Catalog<S: Storage, R: Replacer> {
 }
 
 // Manual Clone impl: all fields are Arc-based, so cloning is lightweight.
-impl<S: Storage, R: Replacer> Clone for Catalog<S, R> {
+impl<S: Storage, R: Replacer> Clone for CatalogStore<S, R> {
     fn clone(&self) -> Self {
         Self {
             pool: Arc::clone(&self.pool),
@@ -42,11 +43,11 @@ impl<S: Storage, R: Replacer> Clone for Catalog<S, R> {
     }
 }
 
-impl<S: Storage, R: Replacer> Catalog<S, R> {
+impl<S: Storage, R: Replacer> CatalogStore<S, R> {
     /// Creates a new catalog with the given components.
     ///
-    /// This is an internal constructor; use `Catalog::bootstrap()` or
-    /// `Catalog::open()` to initialize the catalog properly.
+    /// This is an internal constructor; use `CatalogStore::bootstrap()` or
+    /// `CatalogStore::open()` to initialize the catalog properly.
     fn new(
         pool: Arc<BufferPool<S, R>>,
         tx_manager: Arc<TransactionManager>,
@@ -165,89 +166,92 @@ impl<S: Storage, R: Replacer> Catalog<S, R> {
         Ok(())
     }
 
+    /// Scans a single sys_tables page for visible table entries.
+    ///
+    /// Pass `None` as `page_id` to start from the first sys_tables page.
+    /// Returns the visible entries on that page and the next page link
+    /// (`None` if there are no more pages).
+    ///
+    /// # Note
+    ///
+    /// Corrupted records (where `TableInfo::from_record` returns `None`) are
+    /// silently skipped. Production systems should log warnings or fail fast.
+    pub(crate) async fn scan_tables(
+        &self,
+        snapshot: &Snapshot,
+        page_id: Option<PageId>,
+    ) -> Result<(Vec<TableInfo>, Option<PageId>), CatalogError> {
+        let page_id = page_id.unwrap_or_else(|| self.superblock.read().sys_tables_page);
+        let (tuples, next_page) = scan_visible_page(
+            &self.pool,
+            page_id,
+            TableInfo::SCHEMA,
+            snapshot,
+            &self.tx_manager,
+        )
+        .await?;
+
+        let tables = tuples
+            .into_iter()
+            .filter_map(|(_tid, record)| TableInfo::from_record(&record))
+            .collect();
+
+        Ok((tables, next_page))
+    }
+
+    /// Scans a single sys_columns page for visible column entries.
+    ///
+    /// Pass `None` as `page_id` to start from the first sys_columns page.
+    /// Returns the visible entries on that page and the next page link
+    /// (`None` if there are no more pages).
+    ///
+    /// # Note
+    ///
+    /// Corrupted records (where `ColumnInfo::from_record` returns `None`) are
+    /// silently skipped. Production systems should log warnings or fail fast.
+    pub(crate) async fn scan_columns(
+        &self,
+        snapshot: &Snapshot,
+        page_id: Option<PageId>,
+    ) -> Result<(Vec<ColumnInfo>, Option<PageId>), CatalogError> {
+        let page_id = page_id.unwrap_or_else(|| self.superblock.read().sys_columns_page);
+        let (tuples, next_page) = scan_visible_page(
+            &self.pool,
+            page_id,
+            ColumnInfo::SCHEMA,
+            snapshot,
+            &self.tx_manager,
+        )
+        .await?;
+
+        let columns = tuples
+            .into_iter()
+            .filter_map(|(_tid, record)| ColumnInfo::from_record(&record))
+            .collect();
+
+        Ok((columns, next_page))
+    }
+
     /// Looks up a table by name.
     ///
-    /// Scans the full sys_tables page chain to find the table metadata.
+    /// Iterates the sys_tables page chain via [`scan_tables`](Self::scan_tables)
+    /// and returns the first match.
     pub async fn get_table(
         &self,
         snapshot: &Snapshot,
         name: &str,
     ) -> Result<Option<TableInfo>, CatalogError> {
-        let sys_tables_page = self.superblock.read().sys_tables_page;
-        let mut current_page = Some(sys_tables_page);
-
-        while let Some(page_id) = current_page {
-            let (tuples, next_page) = scan_visible_page(
-                &self.pool,
-                page_id,
-                TableInfo::SCHEMA,
-                snapshot,
-                &self.tx_manager,
-            )
-            .await?;
-            current_page = next_page;
-
-            for (_tid, record) in tuples {
-                let Some(info) = TableInfo::from_record(&record) else {
-                    // NOTE: from_record() returns None when deserialization fails, indicating
-                    // possible data corruption. For learning purposes, we silently skip.
-                    // Production systems should either:
-                    // - Log corruption warnings and attempt recovery
-                    // - Return CatalogError::CorruptedMetadata to fail fast
-                    // - Use checksums (Step 13) to detect corruption earlier
-                    continue;
-                };
-
+        let mut next_page_id = Some(None);
+        while let Some(page_id) = next_page_id {
+            let (tables, next) = self.scan_tables(snapshot, page_id).await?;
+            for info in tables {
                 if info.table_name == name {
                     return Ok(Some(info));
                 }
             }
+            next_page_id = next.map(Some);
         }
-
         Ok(None)
-    }
-
-    /// Gets columns for a table.
-    ///
-    /// Scans the full sys_columns page chain to find the column metadata.
-    pub async fn get_columns(
-        &self,
-        snapshot: &Snapshot,
-        table_id: u32,
-    ) -> Result<Vec<ColumnInfo>, CatalogError> {
-        let sys_columns_page = self.superblock.read().sys_columns_page;
-        let mut current_page = Some(sys_columns_page);
-
-        let mut columns = Vec::new();
-        while let Some(page_id) = current_page {
-            let (tuples, next_page) = scan_visible_page(
-                &self.pool,
-                page_id,
-                ColumnInfo::SCHEMA,
-                snapshot,
-                &self.tx_manager,
-            )
-            .await?;
-            current_page = next_page;
-
-            for (_tid, record) in tuples {
-                let Some(col) = ColumnInfo::from_record(&record) else {
-                    // NOTE: Silently skipping corrupted records. See get_table() for details.
-                    continue;
-                };
-
-                if col.table_id != table_id {
-                    continue;
-                }
-
-                columns.push(col);
-            }
-        }
-
-        // Sort by column_num
-        columns.sort_by_key(|c| c.column_num);
-
-        Ok(columns)
     }
 
     /// Inserts a table record into sys_tables.
@@ -414,7 +418,7 @@ mod tests {
     use crate::storage::{LruReplacer, MemoryStorage, PageId};
 
     struct TestCatalog {
-        catalog: Catalog<MemoryStorage, LruReplacer>,
+        catalog: CatalogStore<MemoryStorage, LruReplacer>,
         tx_manager: Arc<TransactionManager>,
     }
 
@@ -423,7 +427,9 @@ mod tests {
         let replacer = LruReplacer::new(100);
         let pool = Arc::new(BufferPool::new(storage, replacer, 100));
         let tx_manager = Arc::new(TransactionManager::new());
-        let catalog = Catalog::bootstrap(pool, tx_manager.clone()).await.unwrap();
+        let catalog = CatalogStore::bootstrap(pool, tx_manager.clone())
+            .await
+            .unwrap();
 
         TestCatalog {
             catalog,
@@ -474,22 +480,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_columns() {
+    async fn test_scan_columns() {
         let tc = create_test_catalog().await;
         let txid = tc.tx_manager.begin();
         let snapshot = tc.tx_manager.snapshot(txid, CommandId::FIRST);
 
-        // Get sys_tables columns
-        let columns = tc
-            .catalog
-            .get_columns(&snapshot, TableInfo::TABLE_ID)
-            .await
-            .unwrap();
+        // Scan sys_columns from the beginning
+        let (columns, _next) = tc.catalog.scan_columns(&snapshot, None).await.unwrap();
 
-        assert_eq!(columns.len(), 3);
-        assert_eq!(columns[0].column_name, "table_id");
-        assert_eq!(columns[1].column_name, "table_name");
-        assert_eq!(columns[2].column_name, "first_page");
+        // Should contain columns for all 3 system catalog tables
+        let sys_tables_cols: Vec<_> = columns
+            .iter()
+            .filter(|c| c.table_id == TableInfo::TABLE_ID)
+            .collect();
+        assert_eq!(sys_tables_cols.len(), 3);
+        assert_eq!(sys_tables_cols[0].column_name, "table_id");
+        assert_eq!(sys_tables_cols[1].column_name, "table_name");
+        assert_eq!(sys_tables_cols[2].column_name, "first_page");
     }
 
     #[tokio::test]
@@ -519,12 +526,13 @@ mod tests {
         assert_eq!(table.table_name, "users");
         assert_eq!(table.table_id, LAST_RESERVED_TABLE_ID + 1);
 
-        // Verify columns
-        let columns = tc
-            .catalog
-            .get_columns(&snapshot, table.table_id)
-            .await
-            .unwrap();
+        // Verify columns via scan_columns
+        let (all_columns, _next) = tc.catalog.scan_columns(&snapshot, None).await.unwrap();
+        let mut columns: Vec<_> = all_columns
+            .into_iter()
+            .filter(|c| c.table_id == table.table_id)
+            .collect();
+        columns.sort_by_key(|c| c.column_num);
         assert_eq!(columns.len(), 2);
         assert_eq!(columns[0].column_name, "id");
         assert!(columns[0].is_serial());

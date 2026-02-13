@@ -437,6 +437,7 @@ impl ValuesScan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::CatalogSnapshot;
     use crate::datum::{Type, Value};
     use crate::db::Database;
     use crate::executor::ExecContextImpl;
@@ -463,19 +464,20 @@ mod tests {
         else {
             panic!("expected CreateTable");
         };
-        db.catalog().create_table(txid, cid, &stmt).await.unwrap();
+        db.catalog_store()
+            .create_table(txid, cid, &stmt)
+            .await
+            .unwrap();
         db.tx_manager().commit(txid).unwrap();
 
         let txid = db.tx_manager().begin();
         let cid = CommandId::FIRST;
         let snapshot = db.tx_manager().snapshot(txid, cid);
-        let table = db
-            .catalog()
-            .get_table(&snapshot, "test")
+        let catalog = CatalogSnapshot::load(db.catalog_store(), &snapshot)
             .await
-            .unwrap()
             .unwrap();
-        let first_page = table.first_page;
+        let table = &catalog.resolve_table("test").unwrap();
+        let first_page = table.info.first_page;
         {
             let page = db.pool().fetch_page_mut(first_page, true).await.unwrap();
             let mut heap = HeapPage::new(page);
@@ -503,19 +505,20 @@ mod tests {
         else {
             panic!("expected CreateTable");
         };
-        db.catalog().create_table(txid, cid, &stmt).await.unwrap();
+        db.catalog_store()
+            .create_table(txid, cid, &stmt)
+            .await
+            .unwrap();
         db.tx_manager().commit(txid).unwrap();
 
         let txid = db.tx_manager().begin();
         let cid = CommandId::FIRST;
         let snapshot = db.tx_manager().snapshot(txid, cid);
-        let table = db
-            .catalog()
-            .get_table(&snapshot, "test")
+        let catalog = CatalogSnapshot::load(db.catalog_store(), &snapshot)
             .await
-            .unwrap()
             .unwrap();
-        let first_page = table.first_page;
+        let table = &catalog.resolve_table("test").unwrap();
+        let first_page = table.info.first_page;
         {
             let page = db.pool().fetch_page_mut(first_page, true).await.unwrap();
             let mut heap = HeapPage::new(page);
@@ -791,15 +794,17 @@ mod tests {
 
     use crate::executor::planner;
 
-    /// Helper: create a table, plan an INSERT, execute it, then verify by scanning.
-    async fn setup_table_and_ctx(ddl: &str) -> (TestDb, crate::tx::Snapshot) {
+    /// Helper: create a table and return db, snapshot, and catalog snapshot for planning.
+    async fn setup_table_and_ctx(
+        ddl: &str,
+    ) -> (TestDb, crate::tx::Snapshot, crate::catalog::CatalogSnapshot) {
         let db = Database::open(MemoryStorage::new(), 100).await.unwrap();
         let txid = db.tx_manager().begin();
         let stmt = crate::sql::Parser::new(ddl).parse().unwrap().unwrap();
         let Statement::CreateTable(create_stmt) = stmt else {
             panic!("expected CreateTable");
         };
-        db.catalog()
+        db.catalog_store()
             .create_table(txid, CommandId::FIRST, &create_stmt)
             .await
             .unwrap();
@@ -807,7 +812,10 @@ mod tests {
 
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-        (db, snapshot)
+        let catalog = CatalogSnapshot::load(db.catalog_store(), &snapshot)
+            .await
+            .unwrap();
+        (db, snapshot, catalog)
     }
 
     fn parse_insert_stmt(sql: &str) -> crate::sql::InsertStmt {
@@ -836,12 +844,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_insert() {
-        let (db, snapshot) = setup_table_and_ctx("CREATE TABLE t (id INTEGER, name TEXT)").await;
+        let (db, snapshot, catalog) =
+            setup_table_and_ctx("CREATE TABLE t (id INTEGER, name TEXT)").await;
 
         let insert = parse_insert_stmt("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')");
-        let plan = planner::plan_insert(&insert, db.catalog(), &snapshot)
-            .await
-            .unwrap();
+        let plan = planner::plan_insert(&insert, &catalog).unwrap();
         let ctx = db.exec_context(snapshot.clone());
         let DmlResult::Insert { count } = plan.execute_dml(&ctx).await.unwrap() else {
             panic!("expected DmlResult::Insert");
@@ -852,15 +859,10 @@ mod tests {
         let snapshot2 = db
             .tx_manager()
             .snapshot(snapshot.current_txid, CommandId::new(1));
-        let table = db
-            .catalog()
-            .get_table(&snapshot2, "t")
-            .await
-            .unwrap()
-            .unwrap();
+        let table = &catalog.resolve_table("t").unwrap();
         let ctx2 = db.exec_context(snapshot2);
         let (tuples, _) = ctx2
-            .scan_heap_page(table.first_page, &[Type::Integer, Type::Text])
+            .scan_heap_page(table.info.first_page, &[Type::Integer, Type::Text])
             .await
             .unwrap();
         assert_eq!(tuples.len(), 2);
@@ -870,14 +872,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_delete() {
-        let (db, snapshot) = setup_table_and_ctx("CREATE TABLE t (id INTEGER, name TEXT)").await;
+        let (db, snapshot, catalog) =
+            setup_table_and_ctx("CREATE TABLE t (id INTEGER, name TEXT)").await;
 
         // First insert some data
         let insert =
             parse_insert_stmt("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')");
-        let plan = planner::plan_insert(&insert, db.catalog(), &snapshot)
-            .await
-            .unwrap();
+        let plan = planner::plan_insert(&insert, &catalog).unwrap();
         let ctx = db.exec_context(snapshot.clone());
         plan.execute_dml(&ctx).await.unwrap();
 
@@ -886,9 +887,7 @@ mod tests {
             .tx_manager()
             .snapshot(snapshot.current_txid, CommandId::new(1));
         let delete = parse_delete_stmt("DELETE FROM t WHERE id = 2");
-        let plan = planner::plan_delete(&delete, db.catalog(), &snapshot2)
-            .await
-            .unwrap();
+        let plan = planner::plan_delete(&delete, &catalog).unwrap();
         let ctx2 = db.exec_context(snapshot2);
         let DmlResult::Delete { count } = plan.execute_dml(&ctx2).await.unwrap() else {
             panic!("expected DmlResult::Delete");
@@ -899,15 +898,10 @@ mod tests {
         let snapshot3 = db
             .tx_manager()
             .snapshot(snapshot.current_txid, CommandId::new(2));
-        let table = db
-            .catalog()
-            .get_table(&snapshot3, "t")
-            .await
-            .unwrap()
-            .unwrap();
+        let table = &catalog.resolve_table("t").unwrap();
         let ctx3 = db.exec_context(snapshot3);
         let (tuples, _) = ctx3
-            .scan_heap_page(table.first_page, &[Type::Integer, Type::Text])
+            .scan_heap_page(table.info.first_page, &[Type::Integer, Type::Text])
             .await
             .unwrap();
         assert_eq!(tuples.len(), 2);
@@ -917,13 +911,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_update() {
-        let (db, snapshot) = setup_table_and_ctx("CREATE TABLE t (id INTEGER, name TEXT)").await;
+        let (db, snapshot, catalog) =
+            setup_table_and_ctx("CREATE TABLE t (id INTEGER, name TEXT)").await;
 
         // Insert initial data
         let insert = parse_insert_stmt("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')");
-        let plan = planner::plan_insert(&insert, db.catalog(), &snapshot)
-            .await
-            .unwrap();
+        let plan = planner::plan_insert(&insert, &catalog).unwrap();
         let ctx = db.exec_context(snapshot.clone());
         plan.execute_dml(&ctx).await.unwrap();
 
@@ -932,9 +925,7 @@ mod tests {
             .tx_manager()
             .snapshot(snapshot.current_txid, CommandId::new(1));
         let update = parse_update_stmt("UPDATE t SET name = 'Updated' WHERE id = 1");
-        let plan = planner::plan_update(&update, db.catalog(), &snapshot2)
-            .await
-            .unwrap();
+        let plan = planner::plan_update(&update, &catalog).unwrap();
         let ctx2 = db.exec_context(snapshot2);
         let DmlResult::Update { count } = plan.execute_dml(&ctx2).await.unwrap() else {
             panic!("expected DmlResult::Update");
@@ -945,15 +936,10 @@ mod tests {
         let snapshot3 = db
             .tx_manager()
             .snapshot(snapshot.current_txid, CommandId::new(2));
-        let table = db
-            .catalog()
-            .get_table(&snapshot3, "t")
-            .await
-            .unwrap()
-            .unwrap();
+        let table = &catalog.resolve_table("t").unwrap();
         let ctx3 = db.exec_context(snapshot3);
         let (tuples, _) = ctx3
-            .scan_heap_page(table.first_page, &[Type::Integer, Type::Text])
+            .scan_heap_page(table.info.first_page, &[Type::Integer, Type::Text])
             .await
             .unwrap();
         // Bob should remain, Alice's old version is deleted, new version is inserted
@@ -966,12 +952,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_insert_serial() {
-        let (db, snapshot) = setup_table_and_ctx("CREATE TABLE t (id SERIAL, name TEXT)").await;
+        let (db, snapshot, catalog) =
+            setup_table_and_ctx("CREATE TABLE t (id SERIAL, name TEXT)").await;
 
         let insert = parse_insert_stmt("INSERT INTO t (name) VALUES ('Alice'), ('Bob')");
-        let plan = planner::plan_insert(&insert, db.catalog(), &snapshot)
-            .await
-            .unwrap();
+        let plan = planner::plan_insert(&insert, &catalog).unwrap();
         let ctx = db.exec_context(snapshot.clone());
         let DmlResult::Insert { count } = plan.execute_dml(&ctx).await.unwrap() else {
             panic!("expected DmlResult::Insert");
@@ -982,15 +967,10 @@ mod tests {
         let snapshot2 = db
             .tx_manager()
             .snapshot(snapshot.current_txid, CommandId::new(1));
-        let table = db
-            .catalog()
-            .get_table(&snapshot2, "t")
-            .await
-            .unwrap()
-            .unwrap();
+        let table = &catalog.resolve_table("t").unwrap();
         let ctx2 = db.exec_context(snapshot2);
         let (tuples, _) = ctx2
-            .scan_heap_page(table.first_page, &[Type::Integer, Type::Text])
+            .scan_heap_page(table.info.first_page, &[Type::Integer, Type::Text])
             .await
             .unwrap();
         assert_eq!(tuples.len(), 2);
@@ -1000,13 +980,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_delete_without_where() {
-        let (db, snapshot) = setup_table_and_ctx("CREATE TABLE t (id INTEGER)").await;
+        let (db, snapshot, catalog) = setup_table_and_ctx("CREATE TABLE t (id INTEGER)").await;
 
         // Insert data
         let insert = parse_insert_stmt("INSERT INTO t VALUES (1), (2), (3)");
-        let plan = planner::plan_insert(&insert, db.catalog(), &snapshot)
-            .await
-            .unwrap();
+        let plan = planner::plan_insert(&insert, &catalog).unwrap();
         let ctx = db.exec_context(snapshot.clone());
         plan.execute_dml(&ctx).await.unwrap();
 
@@ -1015,9 +993,7 @@ mod tests {
             .tx_manager()
             .snapshot(snapshot.current_txid, CommandId::new(1));
         let delete = parse_delete_stmt("DELETE FROM t");
-        let plan = planner::plan_delete(&delete, db.catalog(), &snapshot2)
-            .await
-            .unwrap();
+        let plan = planner::plan_delete(&delete, &catalog).unwrap();
         let ctx2 = db.exec_context(snapshot2);
         let DmlResult::Delete { count } = plan.execute_dml(&ctx2).await.unwrap() else {
             panic!("expected DmlResult::Delete");
@@ -1028,15 +1004,10 @@ mod tests {
         let snapshot3 = db
             .tx_manager()
             .snapshot(snapshot.current_txid, CommandId::new(2));
-        let table = db
-            .catalog()
-            .get_table(&snapshot3, "t")
-            .await
-            .unwrap()
-            .unwrap();
+        let table = &catalog.resolve_table("t").unwrap();
         let ctx3 = db.exec_context(snapshot3);
         let (tuples, _) = ctx3
-            .scan_heap_page(table.first_page, &[Type::Integer])
+            .scan_heap_page(table.info.first_page, &[Type::Integer])
             .await
             .unwrap();
         assert_eq!(tuples.len(), 0);
