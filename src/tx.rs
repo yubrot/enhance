@@ -21,7 +21,7 @@ pub mod tuple_header;
 
 pub use error::TxError;
 pub use manager::TransactionManager;
-pub use snapshot::Snapshot;
+pub use snapshot::{Snapshot, Visibility};
 pub use tuple_header::{Infomask, TUPLE_HEADER_SIZE, TupleHeader};
 
 /// Transaction ID (64-bit).

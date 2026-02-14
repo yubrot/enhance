@@ -62,6 +62,24 @@ impl Infomask {
         Self(self.0 | Self::XMAX_ABORTED)
     }
 
+    /// Returns true if xmin has any hint bit set (committed or aborted).
+    pub const fn has_xmin_hint(&self) -> bool {
+        self.xmin_committed() || self.xmin_aborted()
+    }
+
+    /// Returns true if xmax has any hint bit set (committed or aborted).
+    pub const fn has_xmax_hint(&self) -> bool {
+        self.xmax_committed() || self.xmax_aborted()
+    }
+
+    /// Merges hint bits from another infomask using bitwise OR.
+    ///
+    /// Since hint bits are monotonic (once set, never cleared),
+    /// OR merging is always safe regardless of concurrent modifications.
+    pub const fn merge(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
     /// Get the raw u16 value.
     pub const fn as_u16(&self) -> u16 {
         self.0
@@ -202,5 +220,40 @@ mod tests {
                 assert_eq!(getter(&mask), i == j);
             }
         }
+    }
+
+    #[test]
+    fn test_has_hint() {
+        let empty = Infomask::empty();
+        assert!(!empty.has_xmin_hint());
+        assert!(!empty.has_xmax_hint());
+
+        assert!(Infomask::empty().with_xmin_committed().has_xmin_hint());
+        assert!(Infomask::empty().with_xmin_aborted().has_xmin_hint());
+        assert!(Infomask::empty().with_xmax_committed().has_xmax_hint());
+        assert!(Infomask::empty().with_xmax_aborted().has_xmax_hint());
+
+        // xmin hints don't affect xmax and vice versa
+        assert!(!Infomask::empty().with_xmin_committed().has_xmax_hint());
+        assert!(!Infomask::empty().with_xmax_committed().has_xmin_hint());
+    }
+
+    #[test]
+    fn test_merge() {
+        let a = Infomask::empty().with_xmin_committed();
+        let b = Infomask::empty().with_xmax_aborted();
+        let merged = a.merge(b);
+        assert!(merged.xmin_committed());
+        assert!(merged.xmax_aborted());
+        assert!(!merged.xmin_aborted());
+        assert!(!merged.xmax_committed());
+    }
+
+    #[test]
+    fn test_merge_idempotent() {
+        let a = Infomask::empty()
+            .with_xmin_committed()
+            .with_xmax_committed();
+        assert_eq!(a.merge(a), a);
     }
 }

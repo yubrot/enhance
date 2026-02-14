@@ -80,9 +80,9 @@ impl TransactionManager {
     ///
     /// Marks the transaction as aborted and removes it from the active list.
     ///
-    /// NOTE: This follows a lazy hint bit strategy (the same approach PostgreSQL uses) - hint bits
+    /// NOTE: This follows a lazy hint bit strategy (the same approach PostgreSQL uses) — hint bits
     /// are NOT set during abort. Instead:
-    /// - Readers (SeqScan) set hint bits when they first encounter tuples (Step 10)
+    /// - Readers (`scan_visible_page`) set hint bits when they first encounter tuples
     /// - VACUUM ensures all tuples eventually get hint bits set (Step 15)
     ///
     /// This keeps abort O(1) even for large transactions, avoiding the need to track and
