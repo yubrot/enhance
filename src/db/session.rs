@@ -349,14 +349,13 @@ impl<S: Storage, R: Replacer> Session<S, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::MemoryStorage;
+    use crate::datum::Value;
+    use crate::db::tests::{open_test_db, open_test_session};
     use crate::tx::TxState;
 
     #[tokio::test]
     async fn test_session_transaction_lifecycle() {
-        let storage = Arc::new(MemoryStorage::new());
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
         // Initially idle
         assert_eq!(session.transaction, None);
@@ -376,9 +375,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_rollback() {
-        let storage = Arc::new(MemoryStorage::new());
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
         session.begin();
         assert!(matches!(
@@ -392,9 +389,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_execute_query_empty() {
-        let storage = Arc::new(MemoryStorage::new());
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
         let result = session.execute_query("").await.unwrap();
         assert!(result.is_none());
@@ -402,18 +397,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_execute_query_create_table() {
-        let storage = Arc::new(MemoryStorage::new());
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
-        let result = session
-            .execute_query("CREATE TABLE test (id INT)")
-            .await
-            .unwrap();
-
-        let Some(QueryResult::Command { tag }) = result else {
-            panic!("expected Command result");
-        };
+        let tag = session.execute_command("CREATE TABLE test (id INT)").await;
         assert_eq!(tag, "CREATE TABLE");
 
         // Auto-commit should leave us in idle state
@@ -422,15 +408,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_execute_query_in_transaction() {
-        let storage = Arc::new(MemoryStorage::new());
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
         // Begin transaction
-        let result = session.execute_query("BEGIN").await.unwrap();
-        let Some(QueryResult::Command { tag }) = result else {
-            panic!("expected Command result");
-        };
+        let tag = session.execute_command("BEGIN").await;
         assert_eq!(tag, "BEGIN");
         assert!(matches!(
             session.transaction(),
@@ -448,19 +429,14 @@ mod tests {
         ));
 
         // Commit transaction
-        let result = session.execute_query("COMMIT").await.unwrap();
-        let Some(QueryResult::Command { tag }) = result else {
-            panic!("expected Command result");
-        };
+        let tag = session.execute_command("COMMIT").await;
         assert_eq!(tag, "COMMIT");
         assert!(session.transaction().is_none());
     }
 
     #[tokio::test]
     async fn test_session_parse_error() {
-        let storage = Arc::new(MemoryStorage::new());
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
         let result = session.execute_query("INVALID SQL").await;
         assert!(matches!(result, Err(DatabaseError::Parse(_))));
@@ -468,19 +444,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_select_from_sys_tables() {
-        let storage = Arc::new(MemoryStorage::new());
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
-        let result = session
-            .execute_query("SELECT * FROM sys_tables")
-            .await
-            .unwrap()
-            .unwrap();
-
-        let QueryResult::Rows { columns, rows } = result else {
-            panic!("expected Rows result");
-        };
+        let (columns, rows) = session.query_rows("SELECT * FROM sys_tables").await;
         assert_eq!(columns.len(), 3);
         assert_eq!(columns[0].name, "table_id");
         assert_eq!(columns[1].name, "table_name");
@@ -491,43 +457,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_select_with_where_filter() {
-        let storage = Arc::new(MemoryStorage::new());
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
-        let result = session
-            .execute_query("SELECT table_name FROM sys_tables WHERE table_id = 1")
-            .await
-            .unwrap()
-            .unwrap();
-
-        let QueryResult::Rows { columns, rows } = result else {
-            panic!("expected Rows result");
-        };
+        let (columns, rows) = session
+            .query_rows("SELECT table_name FROM sys_tables WHERE table_id = 1")
+            .await;
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0].name, "table_name");
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].record.values[0],
-            crate::datum::Value::Text("sys_tables".to_string())
+            Value::Text("sys_tables".to_string())
         );
     }
 
     #[tokio::test]
     async fn test_select_with_column_list() {
-        let storage = Arc::new(MemoryStorage::new());
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
-        let result = session
-            .execute_query("SELECT table_id, table_name FROM sys_tables")
-            .await
-            .unwrap()
-            .unwrap();
-
-        let QueryResult::Rows { columns, rows } = result else {
-            panic!("expected Rows result");
-        };
+        let (columns, rows) = session
+            .query_rows("SELECT table_id, table_name FROM sys_tables")
+            .await;
         assert_eq!(columns.len(), 2);
         assert_eq!(columns[0].name, "table_id");
         assert_eq!(columns[1].name, "table_name");
@@ -536,53 +486,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_select_no_from() {
-        let storage = Arc::new(MemoryStorage::new());
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
         // Arithmetic
-        let result = session
-            .execute_query("SELECT 2 * 3 + 1")
-            .await
-            .unwrap()
-            .unwrap();
-        let QueryResult::Rows { rows, columns } = result else {
-            panic!("expected Rows result");
-        };
+        let (columns, rows) = session.query_rows("SELECT 2 * 3 + 1").await;
         assert_eq!(columns.len(), 1);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].record.values[0], crate::datum::Value::Bigint(7));
+        assert_eq!(rows[0].record.values[0], Value::Bigint(7));
 
         // String concatenation
-        let result = session
-            .execute_query("SELECT 'hello' || ' world'")
-            .await
-            .unwrap()
-            .unwrap();
-        let QueryResult::Rows { rows, .. } = result else {
-            panic!("expected Rows result");
-        };
+        let (_, rows) = session.query_rows("SELECT 'hello' || ' world'").await;
         assert_eq!(
             rows[0].record.values[0],
-            crate::datum::Value::Text("hello world".to_string())
+            Value::Text("hello world".to_string())
         );
     }
 
     #[tokio::test]
     async fn test_explain_select() {
-        let storage = Arc::new(MemoryStorage::new());
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
-        let result = session
-            .execute_query("EXPLAIN SELECT * FROM sys_tables")
-            .await
-            .unwrap()
-            .unwrap();
-
-        let QueryResult::Rows { columns, rows } = result else {
-            panic!("expected Rows result");
-        };
+        let (columns, rows) = session.query_rows("EXPLAIN SELECT * FROM sys_tables").await;
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0].name, "QUERY PLAN");
         assert!(!rows.is_empty());
@@ -590,7 +514,7 @@ mod tests {
         let plan_text: String = rows
             .iter()
             .map(|r| match &r.record.values[0] {
-                crate::datum::Value::Text(s) => s.as_str(),
+                Value::Text(s) => s.as_str(),
                 _ => "",
             })
             .collect::<Vec<_>>()
@@ -601,9 +525,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_describe_explain_select() {
-        let storage = Arc::new(MemoryStorage::new());
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
         let stmt = Parser::new("EXPLAIN SELECT * FROM sys_tables")
             .parse()
@@ -624,9 +546,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_describe_select() {
-        let storage = Arc::new(MemoryStorage::new());
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
         let stmt = Parser::new("SELECT table_id, table_name FROM sys_tables")
             .parse()
@@ -646,9 +566,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_describe_non_query() {
-        let storage = Arc::new(MemoryStorage::new());
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
         let stmt = Parser::new("CREATE TABLE test (id INT)")
             .parse()
@@ -665,9 +583,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_explicit_transaction_error_sets_failed_flag() {
-        let storage = Arc::new(MemoryStorage::new());
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
         // Start explicit transaction
         session.execute_query("BEGIN").await.unwrap();
@@ -701,9 +617,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_select_table_not_found() {
-        let storage = Arc::new(MemoryStorage::new());
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
         let result = session.execute_query("SELECT * FROM nonexistent").await;
         assert!(matches!(result, Err(DatabaseError::Executor(_))));
@@ -711,9 +625,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_select_column_not_found() {
-        let storage = Arc::new(MemoryStorage::new());
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
         let result = session
             .execute_query("SELECT nonexistent_col FROM sys_tables")
@@ -723,8 +635,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_rolls_back_active_transaction() {
-        let storage = Arc::new(MemoryStorage::new());
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
+        let db = Arc::new(open_test_db().await);
         let tx_manager = Arc::clone(db.tx_manager());
 
         let txid = {
@@ -744,8 +655,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_without_transaction_is_noop() {
-        let storage = Arc::new(MemoryStorage::new());
-        let db = Arc::new(Database::open(storage, 100).await.unwrap());
+        let db = Arc::new(open_test_db().await);
 
         // Session with no transaction — drop should not panic
         let session = Session::new(db);
@@ -756,43 +666,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_and_select() {
-        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
         session
             .execute_query("CREATE TABLE t (id INTEGER, name TEXT)")
             .await
             .unwrap();
 
-        let result = session
-            .execute_query("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')")
-            .await
-            .unwrap()
-            .unwrap();
-        let QueryResult::Command { tag } = result else {
-            panic!("expected Command");
-        };
+        let tag = session
+            .execute_command("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')")
+            .await;
         assert_eq!(tag, "INSERT 0 2");
 
-        let result = session
-            .execute_query("SELECT name FROM t WHERE id = 1")
-            .await
-            .unwrap()
-            .unwrap();
-        let QueryResult::Rows { rows, .. } = result else {
-            panic!("expected Rows");
-        };
+        let (_, rows) = session.query_rows("SELECT name FROM t WHERE id = 1").await;
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].record.values[0],
-            crate::datum::Value::Text("Alice".into())
-        );
+        assert_eq!(rows[0].record.values[0], Value::Text("Alice".into()));
     }
 
     #[tokio::test]
     async fn test_update_and_select() {
-        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
         session
             .execute_query("CREATE TABLE t (id INTEGER, name TEXT)")
@@ -803,35 +696,19 @@ mod tests {
             .await
             .unwrap();
 
-        let result = session
-            .execute_query("UPDATE t SET name = 'Updated' WHERE id = 1")
-            .await
-            .unwrap()
-            .unwrap();
-        let QueryResult::Command { tag } = result else {
-            panic!("expected Command");
-        };
+        let tag = session
+            .execute_command("UPDATE t SET name = 'Updated' WHERE id = 1")
+            .await;
         assert_eq!(tag, "UPDATE 1");
 
-        let result = session
-            .execute_query("SELECT name FROM t WHERE id = 1")
-            .await
-            .unwrap()
-            .unwrap();
-        let QueryResult::Rows { rows, .. } = result else {
-            panic!("expected Rows");
-        };
+        let (_, rows) = session.query_rows("SELECT name FROM t WHERE id = 1").await;
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].record.values[0],
-            crate::datum::Value::Text("Updated".into())
-        );
+        assert_eq!(rows[0].record.values[0], Value::Text("Updated".into()));
     }
 
     #[tokio::test]
     async fn test_delete_and_select() {
-        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
         session
             .execute_query("CREATE TABLE t (id INTEGER, name TEXT)")
@@ -842,31 +719,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = session
-            .execute_query("DELETE FROM t WHERE id = 2")
-            .await
-            .unwrap()
-            .unwrap();
-        let QueryResult::Command { tag } = result else {
-            panic!("expected Command");
-        };
+        let tag = session.execute_command("DELETE FROM t WHERE id = 2").await;
         assert_eq!(tag, "DELETE 1");
 
-        let result = session
-            .execute_query("SELECT * FROM t")
-            .await
-            .unwrap()
-            .unwrap();
-        let QueryResult::Rows { rows, .. } = result else {
-            panic!("expected Rows");
-        };
+        let (_, rows) = session.query_rows("SELECT * FROM t").await;
         assert_eq!(rows.len(), 2);
     }
 
     #[tokio::test]
     async fn test_serial_auto_increment() {
-        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
         session
             .execute_query("CREATE TABLE t (id SERIAL, name TEXT)")
@@ -877,23 +739,15 @@ mod tests {
             .await
             .unwrap();
 
-        let result = session
-            .execute_query("SELECT id, name FROM t")
-            .await
-            .unwrap()
-            .unwrap();
-        let QueryResult::Rows { rows, .. } = result else {
-            panic!("expected Rows");
-        };
+        let (_, rows) = session.query_rows("SELECT id, name FROM t").await;
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].record.values[0], crate::datum::Value::Integer(1));
-        assert_eq!(rows[1].record.values[0], crate::datum::Value::Integer(2));
+        assert_eq!(rows[0].record.values[0], Value::Integer(1));
+        assert_eq!(rows[1].record.values[0], Value::Integer(2));
     }
 
     #[tokio::test]
     async fn test_transaction_dml_sequence() {
-        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
         session
             .execute_query("CREATE TABLE t (id INTEGER, val TEXT)")
@@ -915,51 +769,36 @@ mod tests {
             .await
             .unwrap();
 
-        let result = session
-            .execute_query("SELECT val FROM t")
-            .await
-            .unwrap()
-            .unwrap();
-        let QueryResult::Rows { rows, .. } = result else {
-            panic!("expected Rows");
-        };
+        let (_, rows) = session.query_rows("SELECT val FROM t").await;
         assert_eq!(rows.len(), 2);
-        let vals: Vec<&crate::datum::Value> = rows.iter().map(|r| &r.record.values[0]).collect();
-        assert!(vals.contains(&&crate::datum::Value::Text("a".into())));
-        assert!(vals.contains(&&crate::datum::Value::Text("x".into())));
+        let vals: Vec<&Value> = rows.iter().map(|r| &r.record.values[0]).collect();
+        assert!(vals.contains(&&Value::Text("a".into())));
+        assert!(vals.contains(&&Value::Text("x".into())));
 
         session.execute_query("COMMIT").await.unwrap();
     }
 
     #[tokio::test]
     async fn test_explain_insert() {
-        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
         session
             .execute_query("CREATE TABLE t (id INTEGER, name TEXT)")
             .await
             .unwrap();
 
-        let result = session
-            .execute_query("EXPLAIN INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')")
-            .await
-            .unwrap()
-            .unwrap();
-        let QueryResult::Rows { rows, .. } = result else {
-            panic!("expected Rows");
-        };
-        let plan_text = match &rows[0].record.values[0] {
-            crate::datum::Value::Text(s) => s.clone(),
-            v => panic!("expected Text, got {:?}", v),
+        let (_, rows) = session
+            .query_rows("EXPLAIN INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')")
+            .await;
+        let Value::Text(plan_text) = &rows[0].record.values[0] else {
+            panic!("expected Text, got {:?}", &rows[0].record.values[0]);
         };
         assert!(plan_text.contains("Insert on t"));
     }
 
     #[tokio::test]
     async fn test_commit_on_failed_transaction_acts_as_rollback() {
-        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
         session
             .execute_query("CREATE TABLE t (id INTEGER)")
@@ -981,29 +820,18 @@ mod tests {
         ));
 
         // COMMIT on failed transaction should act as ROLLBACK
-        let result = session.execute_query("COMMIT").await.unwrap().unwrap();
-        let QueryResult::Command { tag } = result else {
-            panic!("expected Command result");
-        };
+        let tag = session.execute_command("COMMIT").await;
         assert_eq!(tag, "ROLLBACK");
         assert!(session.transaction().is_none());
 
         // The INSERT before the error should NOT have been committed
-        let result = session
-            .execute_query("SELECT * FROM t")
-            .await
-            .unwrap()
-            .unwrap();
-        let QueryResult::Rows { rows, .. } = result else {
-            panic!("expected Rows result");
-        };
+        let (_, rows) = session.query_rows("SELECT * FROM t").await;
         assert_eq!(rows.len(), 0);
     }
 
     #[tokio::test]
     async fn test_insert_error_aborts_auto_commit() {
-        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
-        let mut session = Session::new(db);
+        let mut session = open_test_session().await;
 
         // INSERT into non-existent table without explicit transaction
         let result = session
@@ -1023,7 +851,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_catalog_cache_reflects_auto_commit_ddl() {
-        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
+        let db = Arc::new(open_test_db().await);
         let mut session = Session::new(Arc::clone(&db));
 
         // Before DDL: table should not exist in cached snapshot.
@@ -1047,7 +875,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_catalog_cache_reflects_explicit_commit_ddl() {
-        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
+        let db = Arc::new(open_test_db().await);
         let mut session = Session::new(Arc::clone(&db));
 
         session.execute_query("BEGIN").await.unwrap();
@@ -1074,7 +902,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_catalog_cache_not_updated_on_rollback() {
-        let db = Arc::new(Database::open(MemoryStorage::new(), 100).await.unwrap());
+        let db = Arc::new(open_test_db().await);
         let mut session = Session::new(Arc::clone(&db));
 
         session.execute_query("BEGIN").await.unwrap();

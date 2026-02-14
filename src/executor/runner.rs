@@ -439,36 +439,22 @@ mod tests {
     use super::*;
     use crate::catalog::CatalogSnapshot;
     use crate::datum::{Type, Value};
-    use crate::db::Database;
+    use crate::db::tests::{TestDb, open_test_db};
     use crate::executor::ExecContextImpl;
+    use crate::executor::tests::{bind_expr, int_col};
     use crate::heap::{HeapPage, Record};
-    use crate::sql::{Parser, Statement};
+    use crate::sql::tests::{parse_delete, parse_insert, parse_update};
     use crate::storage::{LruReplacer, MemoryStorage, PageId};
     use crate::tx::CommandId;
 
     type TestCtx = ExecContextImpl<MemoryStorage, LruReplacer>;
-    type TestDb = Database<MemoryStorage, LruReplacer>;
 
     /// Creates a test database with `CREATE TABLE test (id INT)` and inserts
     /// the given values via direct heap page writes. Returns the database
     /// and the table's first page ID.
     async fn setup_int_table(values: Vec<i64>) -> (TestDb, PageId) {
-        let db = Database::open(MemoryStorage::new(), 100).await.unwrap();
-
-        let txid = db.tx_manager().begin();
-        let cid = CommandId::FIRST;
-        let Statement::CreateTable(stmt) = Parser::new("CREATE TABLE test (id INT)")
-            .parse()
-            .unwrap()
-            .unwrap()
-        else {
-            panic!("expected CreateTable");
-        };
-        db.catalog_store()
-            .create_table(txid, cid, &stmt)
-            .await
-            .unwrap();
-        db.tx_manager().commit(txid).unwrap();
+        let db = open_test_db().await;
+        db.create_table("CREATE TABLE test (id INT)").await;
 
         let txid = db.tx_manager().begin();
         let cid = CommandId::FIRST;
@@ -494,22 +480,9 @@ mod tests {
     /// Creates a test database with `CREATE TABLE test (id INT, name TEXT)` and
     /// inserts the given rows. Returns the database and the table's first page ID.
     async fn setup_two_col_table(rows: Vec<(i64, &str)>) -> (TestDb, PageId) {
-        let db = Database::open(MemoryStorage::new(), 100).await.unwrap();
-
-        let txid = db.tx_manager().begin();
-        let cid = CommandId::FIRST;
-        let Statement::CreateTable(stmt) = Parser::new("CREATE TABLE test (id INT, name TEXT)")
-            .parse()
-            .unwrap()
-            .unwrap()
-        else {
-            panic!("expected CreateTable");
-        };
-        db.catalog_store()
-            .create_table(txid, cid, &stmt)
-            .await
-            .unwrap();
-        db.tx_manager().commit(txid).unwrap();
+        let db = open_test_db().await;
+        db.create_table("CREATE TABLE test (id INT, name TEXT)")
+            .await;
 
         let txid = db.tx_manager().begin();
         let cid = CommandId::FIRST;
@@ -537,23 +510,6 @@ mod tests {
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
         db.exec_context(snapshot)
-    }
-
-    fn int_col(name: &str) -> ColumnDesc {
-        ColumnDesc {
-            name: name.to_string(),
-            source: None,
-            ty: Type::Bigint,
-        }
-    }
-
-    /// Parses and binds a SQL expression against the given column descriptors.
-    fn bind_expr(sql: &str, columns: &[ColumnDesc]) -> BoundExpr {
-        Parser::new(sql)
-            .parse_expr()
-            .expect("parse error")
-            .bind(columns)
-            .expect("bind error")
     }
 
     #[tokio::test]
@@ -774,7 +730,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_values_scan() {
-        let db = Database::open(MemoryStorage::new(), 100).await.unwrap();
+        let db = open_test_db().await;
         let ctx = read_ctx(&db);
 
         let plan = QueryPlan::Projection {
@@ -798,17 +754,8 @@ mod tests {
     async fn setup_table_and_ctx(
         ddl: &str,
     ) -> (TestDb, crate::tx::Snapshot, crate::catalog::CatalogSnapshot) {
-        let db = Database::open(MemoryStorage::new(), 100).await.unwrap();
-        let txid = db.tx_manager().begin();
-        let stmt = crate::sql::Parser::new(ddl).parse().unwrap().unwrap();
-        let Statement::CreateTable(create_stmt) = stmt else {
-            panic!("expected CreateTable");
-        };
-        db.catalog_store()
-            .create_table(txid, CommandId::FIRST, &create_stmt)
-            .await
-            .unwrap();
-        db.tx_manager().commit(txid).unwrap();
+        let db = open_test_db().await;
+        db.create_table(ddl).await;
 
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
@@ -818,36 +765,12 @@ mod tests {
         (db, snapshot, catalog)
     }
 
-    fn parse_insert_stmt(sql: &str) -> crate::sql::InsertStmt {
-        let stmt = crate::sql::Parser::new(sql).parse().unwrap().unwrap();
-        let crate::sql::Statement::Insert(insert) = stmt else {
-            panic!("expected INSERT");
-        };
-        *insert
-    }
-
-    fn parse_update_stmt(sql: &str) -> crate::sql::UpdateStmt {
-        let stmt = crate::sql::Parser::new(sql).parse().unwrap().unwrap();
-        let crate::sql::Statement::Update(update) = stmt else {
-            panic!("expected UPDATE");
-        };
-        *update
-    }
-
-    fn parse_delete_stmt(sql: &str) -> crate::sql::DeleteStmt {
-        let stmt = crate::sql::Parser::new(sql).parse().unwrap().unwrap();
-        let crate::sql::Statement::Delete(delete) = stmt else {
-            panic!("expected DELETE");
-        };
-        *delete
-    }
-
     #[tokio::test]
     async fn test_execute_insert() {
         let (db, snapshot, catalog) =
             setup_table_and_ctx("CREATE TABLE t (id INTEGER, name TEXT)").await;
 
-        let insert = parse_insert_stmt("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')");
+        let insert = parse_insert("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')");
         let plan = planner::plan_insert(&insert, &catalog).unwrap();
         let ctx = db.exec_context(snapshot.clone());
         let DmlResult::Insert { count } = plan.execute_dml(&ctx).await.unwrap() else {
@@ -876,8 +799,7 @@ mod tests {
             setup_table_and_ctx("CREATE TABLE t (id INTEGER, name TEXT)").await;
 
         // First insert some data
-        let insert =
-            parse_insert_stmt("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')");
+        let insert = parse_insert("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')");
         let plan = planner::plan_insert(&insert, &catalog).unwrap();
         let ctx = db.exec_context(snapshot.clone());
         plan.execute_dml(&ctx).await.unwrap();
@@ -886,7 +808,7 @@ mod tests {
         let snapshot2 = db
             .tx_manager()
             .snapshot(snapshot.current_txid, CommandId::new(1));
-        let delete = parse_delete_stmt("DELETE FROM t WHERE id = 2");
+        let delete = parse_delete("DELETE FROM t WHERE id = 2");
         let plan = planner::plan_delete(&delete, &catalog).unwrap();
         let ctx2 = db.exec_context(snapshot2);
         let DmlResult::Delete { count } = plan.execute_dml(&ctx2).await.unwrap() else {
@@ -915,7 +837,7 @@ mod tests {
             setup_table_and_ctx("CREATE TABLE t (id INTEGER, name TEXT)").await;
 
         // Insert initial data
-        let insert = parse_insert_stmt("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')");
+        let insert = parse_insert("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')");
         let plan = planner::plan_insert(&insert, &catalog).unwrap();
         let ctx = db.exec_context(snapshot.clone());
         plan.execute_dml(&ctx).await.unwrap();
@@ -924,7 +846,7 @@ mod tests {
         let snapshot2 = db
             .tx_manager()
             .snapshot(snapshot.current_txid, CommandId::new(1));
-        let update = parse_update_stmt("UPDATE t SET name = 'Updated' WHERE id = 1");
+        let update = parse_update("UPDATE t SET name = 'Updated' WHERE id = 1");
         let plan = planner::plan_update(&update, &catalog).unwrap();
         let ctx2 = db.exec_context(snapshot2);
         let DmlResult::Update { count } = plan.execute_dml(&ctx2).await.unwrap() else {
@@ -955,7 +877,7 @@ mod tests {
         let (db, snapshot, catalog) =
             setup_table_and_ctx("CREATE TABLE t (id SERIAL, name TEXT)").await;
 
-        let insert = parse_insert_stmt("INSERT INTO t (name) VALUES ('Alice'), ('Bob')");
+        let insert = parse_insert("INSERT INTO t (name) VALUES ('Alice'), ('Bob')");
         let plan = planner::plan_insert(&insert, &catalog).unwrap();
         let ctx = db.exec_context(snapshot.clone());
         let DmlResult::Insert { count } = plan.execute_dml(&ctx).await.unwrap() else {
@@ -983,7 +905,7 @@ mod tests {
         let (db, snapshot, catalog) = setup_table_and_ctx("CREATE TABLE t (id INTEGER)").await;
 
         // Insert data
-        let insert = parse_insert_stmt("INSERT INTO t VALUES (1), (2), (3)");
+        let insert = parse_insert("INSERT INTO t VALUES (1), (2), (3)");
         let plan = planner::plan_insert(&insert, &catalog).unwrap();
         let ctx = db.exec_context(snapshot.clone());
         plan.execute_dml(&ctx).await.unwrap();
@@ -992,7 +914,7 @@ mod tests {
         let snapshot2 = db
             .tx_manager()
             .snapshot(snapshot.current_txid, CommandId::new(1));
-        let delete = parse_delete_stmt("DELETE FROM t");
+        let delete = parse_delete("DELETE FROM t");
         let plan = planner::plan_delete(&delete, &catalog).unwrap();
         let ctx2 = db.exec_context(snapshot2);
         let DmlResult::Delete { count } = plan.execute_dml(&ctx2).await.unwrap() else {

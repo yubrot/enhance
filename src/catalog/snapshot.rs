@@ -101,29 +101,11 @@ mod tests {
     use super::*;
     use crate::catalog::LAST_RESERVED_TABLE_ID;
     use crate::catalog::schema::{SequenceInfo, SystemCatalogTable};
+    use crate::catalog::tests::test_catalog_store;
     use crate::datum::Type;
-    use crate::sql::{Parser, Statement};
-    use crate::storage::{BufferPool, LruReplacer, MemoryStorage, PageId};
-    use crate::tx::{CommandId, TransactionManager};
-    use std::sync::Arc;
-
-    /// Bootstraps a `CatalogStore` backed by in-memory storage for testing.
-    ///
-    /// NOTE: This helper is duplicated in `cache::tests`. Extract into a shared
-    /// test utility if catalog test modules continue to grow.
-    async fn bootstrap_store() -> (
-        CatalogStore<MemoryStorage, LruReplacer>,
-        Arc<TransactionManager>,
-    ) {
-        let storage = MemoryStorage::new();
-        let replacer = LruReplacer::new(100);
-        let pool = Arc::new(BufferPool::new(storage, replacer, 100));
-        let tx_manager = Arc::new(TransactionManager::new());
-        let store = CatalogStore::bootstrap(pool, tx_manager.clone())
-            .await
-            .unwrap();
-        (store, tx_manager)
-    }
+    use crate::sql::tests::parse_create_table;
+    use crate::storage::PageId;
+    use crate::tx::CommandId;
 
     fn sample_tables() -> Vec<TableInfo> {
         vec![
@@ -195,7 +177,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_system_tables() {
-        let (store, tx_manager) = bootstrap_store().await;
+        let (store, tx_manager) = test_catalog_store().await;
         let txid = tx_manager.begin();
         let snapshot = tx_manager.snapshot(txid, CommandId::FIRST);
 
@@ -225,15 +207,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_with_user_table() {
-        let (store, tx_manager) = bootstrap_store().await;
+        let (store, tx_manager) = test_catalog_store().await;
         let txid = tx_manager.begin();
         let cid = CommandId::FIRST;
 
-        let Ok(Some(Statement::CreateTable(stmt))) =
-            Parser::new("CREATE TABLE users (id SERIAL, name TEXT)").parse()
-        else {
-            panic!("expected CreateTable");
-        };
+        let stmt = parse_create_table("CREATE TABLE users (id SERIAL, name TEXT)");
 
         store.create_table(txid, cid, &stmt).await.unwrap();
         tx_manager.commit(txid).unwrap();
@@ -254,15 +232,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_uncommitted_not_visible() {
-        let (store, tx_manager) = bootstrap_store().await;
+        let (store, tx_manager) = test_catalog_store().await;
         let txid = tx_manager.begin();
         let cid = CommandId::FIRST;
 
-        let Ok(Some(Statement::CreateTable(stmt))) =
-            Parser::new("CREATE TABLE invisible (id INTEGER)").parse()
-        else {
-            panic!("expected CreateTable");
-        };
+        let stmt = parse_create_table("CREATE TABLE invisible (id INTEGER)");
 
         store.create_table(txid, cid, &stmt).await.unwrap();
         // Do NOT commit

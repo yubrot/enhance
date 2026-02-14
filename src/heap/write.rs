@@ -152,24 +152,9 @@ mod tests {
     use super::*;
     use crate::datum::{Type, Value};
     use crate::heap::scan_visible_page;
-    use crate::storage::{BufferPool, LruReplacer, MemoryStorage};
+    use crate::storage::tests::test_pool;
+    use crate::storage::{LruReplacer, MemoryStorage};
     use crate::tx::TransactionManager;
-    use std::sync::Arc;
-
-    async fn create_pool() -> Arc<BufferPool<MemoryStorage, LruReplacer>> {
-        Arc::new(BufferPool::new(
-            MemoryStorage::new(),
-            LruReplacer::new(100),
-            100,
-        ))
-    }
-
-    async fn create_heap_table(pool: &BufferPool<MemoryStorage, LruReplacer>) -> PageId {
-        let guard = pool.new_page().await.unwrap();
-        let page_id = guard.page_id();
-        HeapPage::new(guard).init();
-        page_id
-    }
 
     /// Collects all visible tuples from a heap page chain using scan_visible_page.
     async fn collect_all_visible(
@@ -194,9 +179,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_cid_visibility() {
-        let pool = create_pool().await;
+        let pool = test_pool();
         let tx_manager = TransactionManager::new();
-        let first_page = create_heap_table(&pool).await;
+        let first_page = pool.new_heap_page(|_| {}).await;
         let schema = [Type::Integer, Type::Text];
 
         let txid = tx_manager.begin();
@@ -224,9 +209,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_cid_visibility() {
-        let pool = create_pool().await;
+        let pool = test_pool();
         let tx_manager = TransactionManager::new();
-        let first_page = create_heap_table(&pool).await;
+        let first_page = pool.new_heap_page(|_| {}).await;
         let schema = [Type::Integer];
 
         let txid = tx_manager.begin();
@@ -273,9 +258,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_cid_visibility() {
-        let pool = create_pool().await;
+        let pool = test_pool();
         let tx_manager = TransactionManager::new();
-        let first_page = create_heap_table(&pool).await;
+        let first_page = pool.new_heap_page(|_| {}).await;
         let schema = [Type::Integer, Type::Text];
 
         let txid = tx_manager.begin();
@@ -318,9 +303,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_into_empty_page() {
-        let pool = create_pool().await;
+        let pool = test_pool();
         let tx_manager = TransactionManager::new();
-        let first_page = create_heap_table(&pool).await;
+        let first_page = pool.new_heap_page(|_| {}).await;
 
         let record = Record::new(vec![Value::Integer(42)]);
         let tid = insert(&pool, first_page, &record, TxId::FROZEN, CommandId::FIRST)
@@ -341,9 +326,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_triggers_new_page_allocation() {
-        let pool = create_pool().await;
+        let pool = test_pool();
         let tx_manager = TransactionManager::new();
-        let first_page = create_heap_table(&pool).await;
+        let first_page = pool.new_heap_page(|_| {}).await;
 
         let txid = TxId::FROZEN;
         let cid = CommandId::FIRST;
@@ -378,8 +363,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_fills_existing_pages_before_allocating() {
-        let pool = create_pool().await;
-        let first_page = create_heap_table(&pool).await;
+        let pool = test_pool();
+        let first_page = pool.new_heap_page(|_| {}).await;
 
         let txid = TxId::FROZEN;
         let cid = CommandId::FIRST;
@@ -418,9 +403,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_marks_tuple_invisible() {
-        let pool = create_pool().await;
+        let pool = test_pool();
         let tx_manager = TransactionManager::new();
-        let first_page = create_heap_table(&pool).await;
+        let first_page = pool.new_heap_page(|_| {}).await;
 
         let txid = TxId::FROZEN;
         let cid = CommandId::FIRST;
@@ -452,8 +437,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_nonexistent_slot() {
-        let pool = create_pool().await;
-        let first_page = create_heap_table(&pool).await;
+        let pool = test_pool();
+        let first_page = pool.new_heap_page(|_| {}).await;
 
         let tid = TupleId {
             page_id: first_page,
@@ -469,9 +454,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_same_page() {
-        let pool = create_pool().await;
+        let pool = test_pool();
         let tx_manager = TransactionManager::new();
-        let first_page = create_heap_table(&pool).await;
+        let first_page = pool.new_heap_page(|_| {}).await;
 
         let txid = TxId::FROZEN;
         let cid = CommandId::FIRST;
@@ -504,9 +489,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_cross_page_fallback() {
-        let pool = create_pool().await;
+        let pool = test_pool();
         let tx_manager = TransactionManager::new();
-        let first_page = create_heap_table(&pool).await;
+        let first_page = pool.new_heap_page(|_| {}).await;
 
         let txid = TxId::FROZEN;
         let cid = CommandId::FIRST;
@@ -554,9 +539,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_empty_record() {
-        let pool = create_pool().await;
+        let pool = test_pool();
         let tx_manager = TransactionManager::new();
-        let first_page = create_heap_table(&pool).await;
+        let first_page = pool.new_heap_page(|_| {}).await;
 
         let record = Record::new(vec![]);
         let tid = insert(&pool, first_page, &record, TxId::FROZEN, CommandId::FIRST)
@@ -577,9 +562,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_on_second_page() {
-        let pool = create_pool().await;
+        let pool = test_pool();
         let tx_manager = TransactionManager::new();
-        let first_page = create_heap_table(&pool).await;
+        let first_page = pool.new_heap_page(|_| {}).await;
         let schema = [Type::Integer, Type::Text];
 
         let txid = TxId::FROZEN;
@@ -616,9 +601,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_multiple_tuples() {
-        let pool = create_pool().await;
+        let pool = test_pool();
         let tx_manager = TransactionManager::new();
-        let first_page = create_heap_table(&pool).await;
+        let first_page = pool.new_heap_page(|_| {}).await;
         let schema = [Type::Integer];
 
         let txid = TxId::FROZEN;
@@ -651,9 +636,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_on_non_first_page() {
-        let pool = create_pool().await;
+        let pool = test_pool();
         let tx_manager = TransactionManager::new();
-        let first_page = create_heap_table(&pool).await;
+        let first_page = pool.new_heap_page(|_| {}).await;
         let schema = [Type::Integer, Type::Text];
 
         let txid = TxId::FROZEN;
@@ -702,9 +687,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_sequential_same_tuple() {
-        let pool = create_pool().await;
+        let pool = test_pool();
         let tx_manager = TransactionManager::new();
-        let first_page = create_heap_table(&pool).await;
+        let first_page = pool.new_heap_page(|_| {}).await;
         let schema = [Type::Integer];
 
         let txid = tx_manager.begin();

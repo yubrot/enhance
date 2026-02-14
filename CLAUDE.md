@@ -37,7 +37,7 @@ This is a learning project, but we never take shortcuts that bypass real data pa
 
 ### Communication Style
 
-- When refactoring Rust code, always run `cargo test` AND `cargo clippy` after changes. Do not consider a task complete until both pass with zero warnings
+- When refactoring Rust code, always run `cargo test` AND `cargo clippy --all-targets` after changes. Do not consider a task complete until both pass with zero warnings
 - Do NOT make changes beyond what was explicitly requested. If you notice adjacent improvements (removing doc comments, inlining variables, removing calls), mention them but do not apply them without explicit approval
 - When the user suggests a design change, critically evaluate it against domain semantics before implementing. If the suggestion could violate correctness (e.g., RDBMS transaction semantics, PostgreSQL behavior), raise the concern BEFORE writing code rather than implementing and reverting
 - PostgreSQL is a design reference, not a compatibility target (see @README.md). Describe enhance's own behavior rather than implying PostgreSQL compatibility

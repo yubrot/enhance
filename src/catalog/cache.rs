@@ -155,32 +155,13 @@ fn find_visible_entry<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::CatalogStore;
-    use crate::sql::{Parser, Statement};
-    use crate::storage::{BufferPool, LruReplacer, MemoryStorage};
+    use crate::catalog::tests::test_catalog_store;
+    use crate::sql::tests::parse_create_table;
     use crate::tx::CommandId;
-
-    /// Bootstraps a `CatalogStore` backed by in-memory storage for testing.
-    ///
-    /// NOTE: This helper is duplicated in `snapshot::tests`. Extract into a shared
-    /// test utility if catalog test modules continue to grow.
-    async fn bootstrap_store() -> (
-        CatalogStore<MemoryStorage, LruReplacer>,
-        Arc<TransactionManager>,
-    ) {
-        let storage = MemoryStorage::new();
-        let replacer = LruReplacer::new(100);
-        let pool = Arc::new(BufferPool::new(storage, replacer, 100));
-        let tx_manager = Arc::new(TransactionManager::new());
-        let store = CatalogStore::bootstrap(pool, tx_manager.clone())
-            .await
-            .unwrap();
-        (store, tx_manager)
-    }
 
     #[tokio::test]
     async fn test_no_ddl_cache_hit() {
-        let (store, tx_manager) = bootstrap_store().await;
+        let (store, tx_manager) = test_catalog_store().await;
         let cache = CatalogCache::new();
 
         let txid = tx_manager.begin();
@@ -203,7 +184,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ddl_commit_invalidation() {
-        let (store, tx_manager) = bootstrap_store().await;
+        let (store, tx_manager) = test_catalog_store().await;
         let cache = CatalogCache::new();
 
         // Populate cache.
@@ -219,11 +200,7 @@ mod tests {
         // DDL: create table.
         let ddl_txid = tx_manager.begin();
         let cid = CommandId::FIRST;
-        let Ok(Some(Statement::CreateTable(stmt))) =
-            Parser::new("CREATE TABLE test_tbl (id INTEGER)").parse()
-        else {
-            panic!("expected CreateTable");
-        };
+        let stmt = parse_create_table("CREATE TABLE test_tbl (id INTEGER)");
         store.create_table(ddl_txid, cid, &stmt).await.unwrap();
 
         // Register DDL before commit.
@@ -245,7 +222,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ddl_abort_preserves_cache() {
-        let (store, tx_manager) = bootstrap_store().await;
+        let (store, tx_manager) = test_catalog_store().await;
         let cache = CatalogCache::new();
 
         // Populate cache.
@@ -260,11 +237,7 @@ mod tests {
         // DDL that gets aborted.
         let ddl_txid = tx_manager.begin();
         let cid = CommandId::FIRST;
-        let Ok(Some(Statement::CreateTable(stmt))) =
-            Parser::new("CREATE TABLE vanish (id INTEGER)").parse()
-        else {
-            panic!("expected CreateTable");
-        };
+        let stmt = parse_create_table("CREATE TABLE vanish (id INTEGER)");
         store.create_table(ddl_txid, cid, &stmt).await.unwrap();
         cache.register_ddl(ddl_txid, &tx_manager);
         let _ = tx_manager.abort(ddl_txid);
@@ -283,7 +256,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_self_ddl_bypass() {
-        let (store, tx_manager) = bootstrap_store().await;
+        let (store, tx_manager) = test_catalog_store().await;
         let cache = CatalogCache::new();
 
         // Populate cache.
@@ -298,11 +271,7 @@ mod tests {
         // Start a DDL transaction.
         let ddl_txid = tx_manager.begin();
         let cid = CommandId::FIRST;
-        let Ok(Some(Statement::CreateTable(stmt))) =
-            Parser::new("CREATE TABLE self_tbl (id INTEGER)").parse()
-        else {
-            panic!("expected CreateTable");
-        };
+        let stmt = parse_create_table("CREATE TABLE self_tbl (id INTEGER)");
         store.create_table(ddl_txid, cid, &stmt).await.unwrap();
         cache.register_ddl(ddl_txid, &tx_manager);
 

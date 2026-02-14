@@ -414,33 +414,15 @@ mod tests {
     use super::*;
     use crate::catalog::LAST_RESERVED_TABLE_ID;
     use crate::catalog::schema::SystemCatalogTable;
-    use crate::sql::{Parser, Statement};
-    use crate::storage::{LruReplacer, MemoryStorage, PageId};
-
-    struct TestCatalog {
-        catalog: CatalogStore<MemoryStorage, LruReplacer>,
-        tx_manager: Arc<TransactionManager>,
-    }
-
-    async fn create_test_catalog() -> TestCatalog {
-        let storage = MemoryStorage::new();
-        let replacer = LruReplacer::new(100);
-        let pool = Arc::new(BufferPool::new(storage, replacer, 100));
-        let tx_manager = Arc::new(TransactionManager::new());
-        let catalog = CatalogStore::bootstrap(pool, tx_manager.clone())
-            .await
-            .unwrap();
-
-        TestCatalog {
-            catalog,
-            tx_manager,
-        }
-    }
+    use crate::catalog::tests::test_catalog_store;
+    use crate::sql::tests::parse_create_table;
+    use crate::storage::PageId;
+    use crate::storage::tests::test_pool;
 
     #[tokio::test]
     async fn test_bootstrap_creates_catalog() {
-        let tc = create_test_catalog().await;
-        let sb = tc.catalog.superblock();
+        let (catalog, _tx_manager) = test_catalog_store().await;
+        let sb = catalog.superblock();
 
         assert!(sb.validate().is_ok());
         assert_eq!(sb.sys_tables_page, PageId::new(1));
@@ -451,42 +433,34 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_catalog_tables() {
-        let tc = create_test_catalog().await;
-        let txid = tc.tx_manager.begin();
-        let snapshot = tc.tx_manager.snapshot(txid, CommandId::FIRST);
+        let (catalog, tx_manager) = test_catalog_store().await;
+        let txid = tx_manager.begin();
+        let snapshot = tx_manager.snapshot(txid, CommandId::FIRST);
 
         // Should find sys_tables
-        let table = tc.catalog.get_table(&snapshot, "sys_tables").await.unwrap();
+        let table = catalog.get_table(&snapshot, "sys_tables").await.unwrap();
         assert!(table.is_some());
         let table = table.unwrap();
         assert_eq!(table.table_id, TableInfo::TABLE_ID);
         assert_eq!(table.table_name, "sys_tables");
 
         // Should find sys_columns
-        let table = tc
-            .catalog
-            .get_table(&snapshot, "sys_columns")
-            .await
-            .unwrap();
+        let table = catalog.get_table(&snapshot, "sys_columns").await.unwrap();
         assert!(table.is_some());
 
         // Should not find non-existent table
-        let table = tc
-            .catalog
-            .get_table(&snapshot, "nonexistent")
-            .await
-            .unwrap();
+        let table = catalog.get_table(&snapshot, "nonexistent").await.unwrap();
         assert!(table.is_none());
     }
 
     #[tokio::test]
     async fn test_scan_columns() {
-        let tc = create_test_catalog().await;
-        let txid = tc.tx_manager.begin();
-        let snapshot = tc.tx_manager.snapshot(txid, CommandId::FIRST);
+        let (catalog, tx_manager) = test_catalog_store().await;
+        let txid = tx_manager.begin();
+        let snapshot = tx_manager.snapshot(txid, CommandId::FIRST);
 
         // Scan sys_columns from the beginning
-        let (columns, _next) = tc.catalog.scan_columns(&snapshot, None).await.unwrap();
+        let (columns, _next) = catalog.scan_columns(&snapshot, None).await.unwrap();
 
         // Should contain columns for all 3 system catalog tables
         let sys_tables_cols: Vec<_> = columns
@@ -501,33 +475,29 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_table() {
-        let tc = create_test_catalog().await;
-        let txid = tc.tx_manager.begin();
+        let (catalog, tx_manager) = test_catalog_store().await;
+        let txid = tx_manager.begin();
         let cid = CommandId::FIRST;
 
-        let Ok(Some(Statement::CreateTable(stmt))) =
-            Parser::new("CREATE TABLE users (id SERIAL, name TEXT)").parse()
-        else {
-            panic!("expected CreateTable");
-        };
+        let stmt = parse_create_table("CREATE TABLE users (id SERIAL, name TEXT)");
 
-        let table_id = tc.catalog.create_table(txid, cid, &stmt).await.unwrap();
+        let table_id = catalog.create_table(txid, cid, &stmt).await.unwrap();
         assert_eq!(table_id, LAST_RESERVED_TABLE_ID + 1);
 
-        tc.tx_manager.commit(txid).unwrap();
+        tx_manager.commit(txid).unwrap();
 
         // Verify table exists
-        let txid2 = tc.tx_manager.begin();
-        let snapshot = tc.tx_manager.snapshot(txid2, CommandId::FIRST);
+        let txid2 = tx_manager.begin();
+        let snapshot = tx_manager.snapshot(txid2, CommandId::FIRST);
 
-        let Some(table) = tc.catalog.get_table(&snapshot, "users").await.unwrap() else {
+        let Some(table) = catalog.get_table(&snapshot, "users").await.unwrap() else {
             panic!("expected table exists");
         };
         assert_eq!(table.table_name, "users");
         assert_eq!(table.table_id, LAST_RESERVED_TABLE_ID + 1);
 
         // Verify columns via scan_columns
-        let (all_columns, _next) = tc.catalog.scan_columns(&snapshot, None).await.unwrap();
+        let (all_columns, _next) = catalog.scan_columns(&snapshot, None).await.unwrap();
         let mut columns: Vec<_> = all_columns
             .into_iter()
             .filter(|c| c.table_id == table.table_id)
@@ -542,22 +512,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_table_already_exists() {
-        let tc = create_test_catalog().await;
-        let txid = tc.tx_manager.begin();
+        let (catalog, tx_manager) = test_catalog_store().await;
+        let txid = tx_manager.begin();
         let cid = CommandId::FIRST;
 
-        let Ok(Some(Statement::CreateTable(stmt))) =
-            Parser::new("CREATE TABLE test (id INTEGER)").parse()
-        else {
-            panic!("expected CreateTable");
-        };
+        let stmt = parse_create_table("CREATE TABLE test (id INTEGER)");
 
-        tc.catalog.create_table(txid, cid, &stmt).await.unwrap();
-        tc.tx_manager.commit(txid).unwrap();
+        catalog.create_table(txid, cid, &stmt).await.unwrap();
+        tx_manager.commit(txid).unwrap();
 
         // Try to create again
-        let txid2 = tc.tx_manager.begin();
-        let result = tc.catalog.create_table(txid2, cid, &stmt).await;
+        let txid2 = tx_manager.begin();
+        let result = catalog.create_table(txid2, cid, &stmt).await;
         assert!(matches!(
             result,
             Err(CatalogError::TableAlreadyExists { .. })
@@ -566,23 +532,66 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_table_if_not_exists() {
-        let tc = create_test_catalog().await;
-        let txid = tc.tx_manager.begin();
+        let (catalog, tx_manager) = test_catalog_store().await;
+        let txid = tx_manager.begin();
         let cid = CommandId::FIRST;
 
-        let Ok(Some(Statement::CreateTable(stmt))) =
-            Parser::new("CREATE TABLE IF NOT EXISTS test (id INTEGER)").parse()
-        else {
-            panic!("expected CreateTable");
-        };
+        let stmt = parse_create_table("CREATE TABLE IF NOT EXISTS test (id INTEGER)");
 
-        let table_id = tc.catalog.create_table(txid, cid, &stmt).await.unwrap();
+        let table_id = catalog.create_table(txid, cid, &stmt).await.unwrap();
         assert!(table_id > 0);
-        tc.tx_manager.commit(txid).unwrap();
+        tx_manager.commit(txid).unwrap();
 
         // Try to create again with IF NOT EXISTS
-        let txid2 = tc.tx_manager.begin();
-        let table_id2 = tc.catalog.create_table(txid2, cid, &stmt).await.unwrap();
+        let txid2 = tx_manager.begin();
+        let table_id2 = catalog.create_table(txid2, cid, &stmt).await.unwrap();
         assert_eq!(table_id2, table_id);
+    }
+
+    #[tokio::test]
+    async fn test_open_reads_superblock() {
+        let pool = test_pool();
+        let tx_manager = Arc::new(TransactionManager::new());
+
+        // Bootstrap first
+        let bootstrapped = CatalogStore::bootstrap(pool.clone(), tx_manager.clone())
+            .await
+            .unwrap();
+        let expected_sb = bootstrapped.superblock();
+
+        // Open from the same pool
+        let opened = CatalogStore::open(pool, tx_manager).await.unwrap();
+        let actual_sb = opened.superblock();
+
+        assert_eq!(actual_sb.sys_tables_page, expected_sb.sys_tables_page);
+        assert_eq!(actual_sb.sys_columns_page, expected_sb.sys_columns_page);
+        assert_eq!(actual_sb.sys_sequences_page, expected_sb.sys_sequences_page);
+        assert_eq!(actual_sb.next_table_id, expected_sb.next_table_id);
+    }
+
+    #[tokio::test]
+    async fn test_open_catalog_is_queryable() {
+        let pool = test_pool();
+        let tx_manager = Arc::new(TransactionManager::new());
+
+        // Bootstrap and create a user table
+        let bootstrapped = CatalogStore::bootstrap(pool.clone(), tx_manager.clone())
+            .await
+            .unwrap();
+        let txid = tx_manager.begin();
+        let cid = CommandId::FIRST;
+        let stmt = parse_create_table("CREATE TABLE users (id INTEGER, name TEXT)");
+        bootstrapped.create_table(txid, cid, &stmt).await.unwrap();
+        tx_manager.commit(txid).unwrap();
+
+        // Open from the same pool and verify the table is visible
+        let opened = CatalogStore::open(pool, tx_manager.clone()).await.unwrap();
+        let txid2 = tx_manager.begin();
+        let snapshot = tx_manager.snapshot(txid2, CommandId::FIRST);
+
+        let Some(table) = opened.get_table(&snapshot, "users").await.unwrap() else {
+            panic!("expected 'users' table to exist after open");
+        };
+        assert_eq!(table.table_name, "users");
     }
 }

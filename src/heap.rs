@@ -46,3 +46,25 @@ pub struct TupleId {
     /// Slot within the page.
     pub slot_id: SlotId,
 }
+
+/// Test helpers for heap-layer tests used across multiple test modules.
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::storage::{BufferPool, PageId, Replacer, Storage};
+
+    impl<S: Storage, R: Replacer> BufferPool<S, R> {
+        /// Creates and initializes a heap table page.
+        pub async fn new_heap_page(
+            &self,
+            initializer: impl FnOnce(&mut HeapPage<&mut [u8]>),
+        ) -> PageId {
+            let mut guard = self.new_page().await.unwrap();
+            let page_id = guard.page_id();
+            let mut page = HeapPage::new(guard.as_mut());
+            page.init();
+            initializer(&mut page);
+            page_id
+        }
+    }
+}

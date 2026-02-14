@@ -55,3 +55,29 @@ pub use plan::{DmlPlan, QueryPlan};
 pub use planner::{plan_delete, plan_insert, plan_select, plan_update};
 pub use row::Row;
 pub use runner::{DmlResult, QueryNode};
+
+/// Test helpers for executor-layer tests used across multiple test modules.
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+    use crate::datum::Type;
+    use crate::sql::tests::parse_expr;
+
+    /// Parses and binds a SQL expression against the given column descriptors.
+    ///
+    /// # Panics
+    ///
+    /// Panics if parsing or binding fails.
+    pub fn bind_expr(sql: &str, columns: &[ColumnDesc]) -> BoundExpr {
+        parse_expr(sql).bind(columns).expect("bind error")
+    }
+
+    /// Creates a [`ColumnDesc`] with `Type::Bigint` and no source table.
+    pub fn int_col(name: &str) -> ColumnDesc {
+        ColumnDesc {
+            name: name.to_string(),
+            source: None,
+            ty: Type::Bigint,
+        }
+    }
+}

@@ -87,39 +87,36 @@ mod tests {
     use super::*;
     use crate::datum::Value;
     use crate::heap::page::HeapPage;
-    use crate::storage::{BufferPool, LruReplacer, MemoryStorage};
+    use crate::storage::tests::test_pool;
     use crate::tx::{CommandId, TransactionManager, TxId};
-    use std::sync::Arc;
-
-    async fn create_pool() -> Arc<BufferPool<MemoryStorage, LruReplacer>> {
-        Arc::new(BufferPool::new(
-            MemoryStorage::new(),
-            LruReplacer::new(100),
-            100,
-        ))
-    }
 
     #[tokio::test]
     async fn test_scan_visible_page_frozen_tuples() {
-        let pool = create_pool().await;
+        let pool = test_pool();
         let tx_manager = TransactionManager::new();
 
-        // Create a page with FROZEN tuples (always visible)
-        let guard = pool.new_page().await.unwrap();
-        let page_id = guard.page_id();
-        let mut page = HeapPage::new(guard);
-        page.init();
-
-        let record0 = Record::new(vec![Value::Bigint(10)]);
-        let record1 = Record::new(vec![Value::Bigint(20)]);
-        let record2 = Record::new(vec![Value::Bigint(30)]);
-        page.insert(&record0, TxId::FROZEN, CommandId::FIRST)
-            .unwrap();
-        page.insert(&record1, TxId::FROZEN, CommandId::FIRST)
-            .unwrap();
-        page.insert(&record2, TxId::FROZEN, CommandId::FIRST)
-            .unwrap();
-        drop(page);
+        let page_id = pool
+            .new_heap_page(|page| {
+                page.insert(
+                    &Record::new(vec![Value::Bigint(10)]),
+                    TxId::FROZEN,
+                    CommandId::FIRST,
+                )
+                .unwrap();
+                page.insert(
+                    &Record::new(vec![Value::Bigint(20)]),
+                    TxId::FROZEN,
+                    CommandId::FIRST,
+                )
+                .unwrap();
+                page.insert(
+                    &Record::new(vec![Value::Bigint(30)]),
+                    TxId::FROZEN,
+                    CommandId::FIRST,
+                )
+                .unwrap();
+            })
+            .await;
 
         let txid = tx_manager.begin();
         let snapshot = tx_manager.snapshot(txid, CommandId::FIRST);
@@ -141,12 +138,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_visible_page_empty() {
-        let pool = create_pool().await;
+        let pool = test_pool();
         let tx_manager = TransactionManager::new();
 
-        let guard = pool.new_page().await.unwrap();
-        let page_id = guard.page_id();
-        HeapPage::new(guard).init();
+        let page_id = pool.new_heap_page(|_| {}).await;
 
         let txid = tx_manager.begin();
         let snapshot = tx_manager.snapshot(txid, CommandId::FIRST);
@@ -163,17 +158,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_sets_xmin_committed_hint_bit() {
-        let pool = create_pool().await;
+        let pool = test_pool();
         let tx_manager = TransactionManager::new();
 
         let tx1 = tx_manager.begin();
-        let guard = pool.new_page().await.unwrap();
-        let page_id = guard.page_id();
-        let mut page = HeapPage::new(guard);
-        page.init();
-        page.insert(&Record::new(vec![Value::Bigint(42)]), tx1, CommandId::FIRST)
-            .unwrap();
-        drop(page);
+        let page_id = pool
+            .new_heap_page(|page| {
+                page.insert(&Record::new(vec![Value::Bigint(42)]), tx1, CommandId::FIRST)
+                    .unwrap();
+            })
+            .await;
         tx_manager.commit(tx1).unwrap();
 
         // Before scan: no hint bits
@@ -204,17 +198,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_sets_xmin_aborted_hint_bit() {
-        let pool = create_pool().await;
+        let pool = test_pool();
         let tx_manager = TransactionManager::new();
 
         let tx1 = tx_manager.begin();
-        let guard = pool.new_page().await.unwrap();
-        let page_id = guard.page_id();
-        let mut page = HeapPage::new(guard);
-        page.init();
-        page.insert(&Record::new(vec![Value::Bigint(42)]), tx1, CommandId::FIRST)
-            .unwrap();
-        drop(page);
+        let page_id = pool
+            .new_heap_page(|page| {
+                page.insert(&Record::new(vec![Value::Bigint(42)]), tx1, CommandId::FIRST)
+                    .unwrap();
+            })
+            .await;
         tx_manager.abort(tx1).unwrap();
 
         // Scan (tuple not visible, but hint bits should still be set)
@@ -237,18 +230,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_sets_xmax_hint_bits() {
-        let pool = create_pool().await;
+        let pool = test_pool();
         let tx_manager = TransactionManager::new();
 
         // Insert and commit
         let tx1 = tx_manager.begin();
-        let guard = pool.new_page().await.unwrap();
-        let page_id = guard.page_id();
-        let mut page = HeapPage::new(guard);
-        page.init();
-        page.insert(&Record::new(vec![Value::Bigint(1)]), tx1, CommandId::FIRST)
-            .unwrap();
-        drop(page);
+        let page_id = pool
+            .new_heap_page(|page| {
+                page.insert(&Record::new(vec![Value::Bigint(1)]), tx1, CommandId::FIRST)
+                    .unwrap();
+            })
+            .await;
         tx_manager.commit(tx1).unwrap();
 
         // Delete and commit
@@ -283,21 +275,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_skips_write_when_hints_already_set() {
-        let pool = create_pool().await;
+        let pool = test_pool();
         let tx_manager = TransactionManager::new();
 
         // Insert with FROZEN — no hint bit updates needed
-        let guard = pool.new_page().await.unwrap();
-        let page_id = guard.page_id();
-        let mut page = HeapPage::new(guard);
-        page.init();
-        page.insert(
-            &Record::new(vec![Value::Bigint(10)]),
-            TxId::FROZEN,
-            CommandId::FIRST,
-        )
-        .unwrap();
-        drop(page);
+        let page_id = pool
+            .new_heap_page(|page| {
+                page.insert(
+                    &Record::new(vec![Value::Bigint(10)]),
+                    TxId::FROZEN,
+                    CommandId::FIRST,
+                )
+                .unwrap();
+            })
+            .await;
 
         let tx = tx_manager.begin();
         let snapshot = tx_manager.snapshot(tx, CommandId::FIRST);
@@ -314,18 +305,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_visible_page_mvcc_filtering() {
-        let pool = create_pool().await;
+        let pool = test_pool();
         let tx_manager = TransactionManager::new();
 
         // tx1 inserts a tuple but does NOT commit
         let tx1 = tx_manager.begin();
-        let guard = pool.new_page().await.unwrap();
-        let page_id = guard.page_id();
-        let mut page = HeapPage::new(guard);
-        page.init();
-        page.insert(&Record::new(vec![Value::Bigint(42)]), tx1, CommandId::FIRST)
-            .unwrap();
-        drop(page);
+        let page_id = pool
+            .new_heap_page(|page| {
+                page.insert(&Record::new(vec![Value::Bigint(42)]), tx1, CommandId::FIRST)
+                    .unwrap();
+            })
+            .await;
 
         // tx2 takes a snapshot — tx1's uncommitted tuple should not be visible
         let tx2 = tx_manager.begin();

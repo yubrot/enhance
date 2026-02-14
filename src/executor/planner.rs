@@ -467,27 +467,17 @@ fn expand_columns(
 mod tests {
     use super::*;
     use crate::catalog::CatalogSnapshot;
-    use crate::db::Database;
-    use crate::sql::{Parser, Statement};
-    use crate::storage::MemoryStorage;
+    use crate::db::tests::open_test_db;
+    use crate::sql::tests::{parse_delete, parse_insert, parse_select, parse_update};
     use crate::tx::CommandId;
 
     async fn setup_catalog() -> CatalogSnapshot {
-        let storage = MemoryStorage::new();
-        let db = Database::open(storage, 100).await.unwrap();
+        let db = open_test_db().await;
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
         CatalogSnapshot::load(db.catalog_store(), &snapshot)
             .await
             .unwrap()
-    }
-
-    fn parse_select(sql: &str) -> SelectStmt {
-        let stmt = Parser::new(sql).parse().unwrap().unwrap();
-        let Statement::Select(select) = stmt else {
-            panic!("expected SELECT statement");
-        };
-        *select
     }
 
     #[tokio::test]
@@ -742,33 +732,14 @@ mod tests {
 
     /// Sets up a catalog snapshot with a user-defined table.
     async fn setup_catalog_with_table(ddl: &str) -> CatalogSnapshot {
-        let storage = MemoryStorage::new();
-        let db = Database::open(storage, 100).await.unwrap();
-
-        let txid = db.tx_manager().begin();
-        let stmt = Parser::new(ddl).parse().unwrap().unwrap();
-        let Statement::CreateTable(create_stmt) = stmt else {
-            panic!("expected CREATE TABLE");
-        };
-        db.catalog_store()
-            .create_table(txid, CommandId::FIRST, &create_stmt)
-            .await
-            .unwrap();
-        db.tx_manager().commit(txid).unwrap();
+        let db = open_test_db().await;
+        db.create_table(ddl).await;
 
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
         CatalogSnapshot::load(db.catalog_store(), &snapshot)
             .await
             .unwrap()
-    }
-
-    fn parse_insert(sql: &str) -> InsertStmt {
-        let stmt = Parser::new(sql).parse().unwrap().unwrap();
-        let Statement::Insert(insert) = stmt else {
-            panic!("expected INSERT statement");
-        };
-        *insert
     }
 
     #[tokio::test]
@@ -975,14 +946,6 @@ mod tests {
 
     // --- UPDATE planner tests ---
 
-    fn parse_update(sql: &str) -> UpdateStmt {
-        let stmt = Parser::new(sql).parse().unwrap().unwrap();
-        let Statement::Update(update) = stmt else {
-            panic!("expected UPDATE statement");
-        };
-        *update
-    }
-
     #[tokio::test]
     async fn test_plan_update_basic() {
         let catalog = setup_catalog_with_table("CREATE TABLE users (id INTEGER, name TEXT)").await;
@@ -1087,14 +1050,6 @@ mod tests {
     }
 
     // --- DELETE planner tests ---
-
-    fn parse_delete(sql: &str) -> DeleteStmt {
-        let stmt = Parser::new(sql).parse().unwrap().unwrap();
-        let Statement::Delete(delete) = stmt else {
-            panic!("expected DELETE statement");
-        };
-        *delete
-    }
 
     #[tokio::test]
     async fn test_plan_delete_basic() {

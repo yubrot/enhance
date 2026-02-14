@@ -472,7 +472,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_float_literal() {
-        assert_eq!(eval("3.14").unwrap(), Value::Double(3.14));
+        assert_eq!(eval("1.23").unwrap(), Value::Double(1.23));
         assert_eq!(eval("0.0").unwrap(), Value::Double(0.0));
     }
 
@@ -704,7 +704,7 @@ mod tests {
     #[test]
     fn test_unary_minus() {
         assert_eq!(eval("-42").unwrap(), Value::Bigint(-42));
-        assert_eq!(eval("-3.14").unwrap(), Value::Double(-3.14));
+        assert_eq!(eval("-1.23").unwrap(), Value::Double(-1.23));
         // -NULL = NULL
         assert!(eval("-NULL").unwrap().is_null());
     }
@@ -737,7 +737,7 @@ mod tests {
     #[test]
     fn test_unary_plus() {
         assert_eq!(eval("+42").unwrap(), Value::Bigint(42));
-        assert_eq!(eval("+3.14").unwrap(), Value::Double(3.14));
+        assert_eq!(eval("+1.23").unwrap(), Value::Double(1.23));
         // +NULL = NULL
         assert!(eval("+NULL").unwrap().is_null());
     }

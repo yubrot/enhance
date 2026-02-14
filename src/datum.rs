@@ -1125,8 +1125,8 @@ mod tests {
             Value::Bigint(-7)
         );
         assert_eq!(
-            Value::Text("3.14".into()).cast(&Type::Double).unwrap(),
-            Value::Double(3.14)
+            Value::Text("1.23".into()).cast(&Type::Double).unwrap(),
+            Value::Double(1.23)
         );
     }
 
@@ -1153,8 +1153,8 @@ mod tests {
             Value::Text("t".into())
         );
         assert_eq!(
-            Value::Double(3.14).cast(&Type::Text).unwrap(),
-            Value::Text("3.14".into())
+            Value::Double(1.23).cast(&Type::Text).unwrap(),
+            Value::Text("1.23".into())
         );
     }
 

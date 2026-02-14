@@ -448,17 +448,8 @@ fn resolve_column_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::Parser;
-
-    /// Parses a SQL expression string into an AST Expr.
-    fn parse_expr(sql: &str) -> Expr {
-        Parser::new(sql).parse_expr().expect("parse error")
-    }
-
-    /// Parses and binds a SQL expression against the given column descriptors.
-    fn bind_expr(sql: &str, columns: &[ColumnDesc]) -> BoundExpr {
-        parse_expr(sql).bind(columns).expect("bind error")
-    }
+    use crate::executor::tests::bind_expr;
+    use crate::sql::tests::parse_expr;
 
     fn make_columns() -> Vec<ColumnDesc> {
         use crate::executor::ColumnSource;
@@ -545,7 +536,7 @@ mod tests {
         ));
         assert!(matches!(bind_expr("42", &columns), BoundExpr::Integer(42)));
         assert!(
-            matches!(bind_expr("3.14", &columns), BoundExpr::Float(v) if (v - 3.14).abs() < f64::EPSILON)
+            matches!(bind_expr("1.23", &columns), BoundExpr::Float(v) if (v - 1.23).abs() < f64::EPSILON)
         );
         assert!(matches!(bind_expr("'hello'", &columns), BoundExpr::String(s) if s == "hello"));
     }

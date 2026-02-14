@@ -33,3 +33,22 @@ pub use buffer::{
 pub use error::StorageError;
 pub use io::{FileStorage, MemoryStorage, Storage};
 pub use page::{PAGE_HEADER_SIZE, PAGE_SIZE, PAGE_VERSION, PageData, PageHeader, PageId, PageType};
+
+/// Test helpers for storage-layer tests used across multiple test modules.
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Creates a [`BufferPool`] backed by in-memory storage for testing.
+    ///
+    /// Returns an `Arc`-wrapped pool with 10 frames, suitable for most tests
+    /// that need page I/O without persistence.
+    pub fn test_pool() -> Arc<BufferPool<MemoryStorage, LruReplacer>> {
+        Arc::new(BufferPool::new(
+            MemoryStorage::new(),
+            LruReplacer::new(10),
+            10,
+        ))
+    }
+}

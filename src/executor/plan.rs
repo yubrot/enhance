@@ -207,25 +207,8 @@ impl DmlPlan {
 mod tests {
     use super::*;
     use crate::datum::Type;
-    use crate::sql::Parser;
+    use crate::executor::tests::{bind_expr, int_col};
     use crate::storage::PageId;
-
-    fn int_col(name: &str) -> ColumnDesc {
-        ColumnDesc {
-            name: name.to_string(),
-            source: None,
-            ty: Type::Bigint,
-        }
-    }
-
-    /// Parses and binds a SQL expression against the given column descriptors.
-    fn bind_expr(sql: &str, columns: &[ColumnDesc]) -> BoundExpr {
-        Parser::new(sql)
-            .parse_expr()
-            .expect("parse error")
-            .bind(columns)
-            .expect("bind error")
-    }
 
     #[test]
     fn test_explain_seq_scan() {
