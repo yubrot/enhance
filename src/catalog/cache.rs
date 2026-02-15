@@ -5,14 +5,13 @@
 //! `TxId::FROZEN` serves as the universal fallback (always visible to every snapshot).
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 
 use super::error::CatalogError;
 use super::snapshot::Catalog;
-use super::store::CatalogStore;
-use crate::storage::{Replacer, Storage};
 use crate::tx::{Snapshot, TransactionManager, TxId, TxState};
 
 /// Shared, MVCC-aware cache for [`Catalog`].
@@ -52,13 +51,20 @@ impl CatalogCache {
         }
     }
 
-    /// Returns a cached [`Catalog`], or loads a fresh one from the heap.
-    pub async fn get_or_load<S: Storage, R: Replacer>(
+    /// Returns a cached [`Catalog`], or loads a fresh one using the provided loader.
+    ///
+    /// The `loader` closure is called only on cache miss and should scan the
+    /// catalog heap pages to build a fresh [`Catalog`].
+    pub async fn get_or_load<F, Fut>(
         &self,
-        store: &CatalogStore<S, R>,
+        loader: F,
         snapshot: &Snapshot,
         tx_manager: &TransactionManager,
-    ) -> Result<Arc<Catalog>, CatalogError> {
+    ) -> Result<Arc<Catalog>, CatalogError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Catalog, CatalogError>> + Send,
+    {
         // Phase 1: Write lock — find the visible entry (with aborted cleanup).
         {
             let mut inner = self.inner.write();
@@ -71,7 +77,7 @@ impl CatalogCache {
         // NOTE: Two threads may concurrently miss the cache and both perform a
         // heap load. This is harmless: Phase 3 re-checks and only one result
         // populates the slot; the other is used directly and discarded.
-        let loaded = Arc::new(Catalog::load(store, snapshot).await?);
+        let loaded = Arc::new(loader().await?);
 
         // Phase 3: Write lock — re-find and populate if still empty.
         {
@@ -155,28 +161,36 @@ fn find_visible_entry<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::tests::test_catalog_store;
+    use crate::engine::tests::open_test_engine;
     use crate::sql::tests::parse_create_table;
     use crate::tx::CommandId;
 
     #[tokio::test]
     async fn test_no_ddl_cache_hit() {
-        let (store, tx_manager) = test_catalog_store().await;
+        let engine = open_test_engine().await;
         let cache = CatalogCache::new();
 
-        let txid = tx_manager.begin();
-        let snapshot = tx_manager.snapshot(txid, CommandId::FIRST);
+        let txid = engine.tx_manager().begin();
+        let snapshot = engine.tx_manager().snapshot(txid, CommandId::FIRST);
 
         // First call: cache miss, loads from heap.
         let snap1 = cache
-            .get_or_load(&store, &snapshot, &tx_manager)
+            .get_or_load(
+                || engine.load_catalog(&snapshot),
+                &snapshot,
+                engine.tx_manager(),
+            )
             .await
             .unwrap();
         assert!(snap1.resolve_table("sys_tables").is_some());
 
         // Second call: cache hit, returns same Arc.
         let snap2 = cache
-            .get_or_load(&store, &snapshot, &tx_manager)
+            .get_or_load(
+                || engine.load_catalog(&snapshot),
+                &snapshot,
+                engine.tx_manager(),
+            )
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&snap1, &snap2));
@@ -184,34 +198,34 @@ mod tests {
 
     #[tokio::test]
     async fn test_ddl_commit_invalidation() {
-        let (store, tx_manager) = test_catalog_store().await;
+        let engine = open_test_engine().await;
         let cache = CatalogCache::new();
 
         // Populate cache.
-        let tx1 = tx_manager.begin();
-        let snap1 = tx_manager.snapshot(tx1, CommandId::FIRST);
+        let tx1 = engine.tx_manager().begin();
+        let snap1 = engine.tx_manager().snapshot(tx1, CommandId::FIRST);
         let initial = cache
-            .get_or_load(&store, &snap1, &tx_manager)
+            .get_or_load(|| engine.load_catalog(&snap1), &snap1, engine.tx_manager())
             .await
             .unwrap();
         assert!(initial.resolve_table("test_tbl").is_none());
-        let _ = tx_manager.abort(tx1);
+        let _ = engine.tx_manager().abort(tx1);
 
         // DDL: create table.
-        let ddl_txid = tx_manager.begin();
+        let ddl_txid = engine.tx_manager().begin();
         let cid = CommandId::FIRST;
         let stmt = parse_create_table("CREATE TABLE test_tbl (id INTEGER)");
-        store.create_table(ddl_txid, cid, &stmt).await.unwrap();
+        engine.create_table(ddl_txid, cid, &stmt).await.unwrap();
 
         // Register DDL before commit.
-        cache.register_ddl(ddl_txid, &tx_manager);
-        tx_manager.commit(ddl_txid).unwrap();
+        cache.register_ddl(ddl_txid, engine.tx_manager());
+        engine.tx_manager().commit(ddl_txid).unwrap();
 
         // New snapshot should see the DDL.
-        let tx2 = tx_manager.begin();
-        let snap2 = tx_manager.snapshot(tx2, CommandId::FIRST);
+        let tx2 = engine.tx_manager().begin();
+        let snap2 = engine.tx_manager().snapshot(tx2, CommandId::FIRST);
         let refreshed = cache
-            .get_or_load(&store, &snap2, &tx_manager)
+            .get_or_load(|| engine.load_catalog(&snap2), &snap2, engine.tx_manager())
             .await
             .unwrap();
 
@@ -222,32 +236,32 @@ mod tests {
 
     #[tokio::test]
     async fn test_ddl_abort_preserves_cache() {
-        let (store, tx_manager) = test_catalog_store().await;
+        let engine = open_test_engine().await;
         let cache = CatalogCache::new();
 
         // Populate cache.
-        let tx1 = tx_manager.begin();
-        let snap1 = tx_manager.snapshot(tx1, CommandId::FIRST);
+        let tx1 = engine.tx_manager().begin();
+        let snap1 = engine.tx_manager().snapshot(tx1, CommandId::FIRST);
         let cached = cache
-            .get_or_load(&store, &snap1, &tx_manager)
+            .get_or_load(|| engine.load_catalog(&snap1), &snap1, engine.tx_manager())
             .await
             .unwrap();
-        let _ = tx_manager.abort(tx1);
+        let _ = engine.tx_manager().abort(tx1);
 
         // DDL that gets aborted.
-        let ddl_txid = tx_manager.begin();
+        let ddl_txid = engine.tx_manager().begin();
         let cid = CommandId::FIRST;
         let stmt = parse_create_table("CREATE TABLE vanish (id INTEGER)");
-        store.create_table(ddl_txid, cid, &stmt).await.unwrap();
-        cache.register_ddl(ddl_txid, &tx_manager);
-        let _ = tx_manager.abort(ddl_txid);
+        engine.create_table(ddl_txid, cid, &stmt).await.unwrap();
+        cache.register_ddl(ddl_txid, engine.tx_manager());
+        let _ = engine.tx_manager().abort(ddl_txid);
 
         // After abort, the aborted entry is cleaned up and the original
         // cached catalog is returned (no redundant heap scan).
-        let tx2 = tx_manager.begin();
-        let snap2 = tx_manager.snapshot(tx2, CommandId::FIRST);
+        let tx2 = engine.tx_manager().begin();
+        let snap2 = engine.tx_manager().snapshot(tx2, CommandId::FIRST);
         let after = cache
-            .get_or_load(&store, &snap2, &tx_manager)
+            .get_or_load(|| engine.load_catalog(&snap2), &snap2, engine.tx_manager())
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&cached, &after));
@@ -256,40 +270,44 @@ mod tests {
 
     #[tokio::test]
     async fn test_self_ddl_bypass() {
-        let (store, tx_manager) = test_catalog_store().await;
+        let engine = open_test_engine().await;
         let cache = CatalogCache::new();
 
         // Populate cache.
-        let tx0 = tx_manager.begin();
-        let snap0 = tx_manager.snapshot(tx0, CommandId::FIRST);
+        let tx0 = engine.tx_manager().begin();
+        let snap0 = engine.tx_manager().snapshot(tx0, CommandId::FIRST);
         let _ = cache
-            .get_or_load(&store, &snap0, &tx_manager)
+            .get_or_load(|| engine.load_catalog(&snap0), &snap0, engine.tx_manager())
             .await
             .unwrap();
-        let _ = tx_manager.abort(tx0);
+        let _ = engine.tx_manager().abort(tx0);
 
         // Start a DDL transaction.
-        let ddl_txid = tx_manager.begin();
+        let ddl_txid = engine.tx_manager().begin();
         let cid = CommandId::FIRST;
         let stmt = parse_create_table("CREATE TABLE self_tbl (id INTEGER)");
-        store.create_table(ddl_txid, cid, &stmt).await.unwrap();
-        cache.register_ddl(ddl_txid, &tx_manager);
+        engine.create_table(ddl_txid, cid, &stmt).await.unwrap();
+        cache.register_ddl(ddl_txid, engine.tx_manager());
 
         // Self-DDL: the same txid should get a fresh load,
         // NOT the shared cache.
-        let self_snapshot = tx_manager.snapshot(ddl_txid, cid.next());
+        let self_snapshot = engine.tx_manager().snapshot(ddl_txid, cid.next());
         let self_catalog = cache
-            .get_or_load(&store, &self_snapshot, &tx_manager)
+            .get_or_load(
+                || engine.load_catalog(&self_snapshot),
+                &self_snapshot,
+                engine.tx_manager(),
+            )
             .await
             .unwrap();
         // The self-DDL result should see the uncommitted table.
         assert!(self_catalog.resolve_table("self_tbl").is_some());
 
         // But the shared cache should NOT have been updated.
-        let tx2 = tx_manager.begin();
-        let snap2 = tx_manager.snapshot(tx2, CommandId::FIRST);
+        let tx2 = engine.tx_manager().begin();
+        let snap2 = engine.tx_manager().snapshot(tx2, CommandId::FIRST);
         let shared = cache
-            .get_or_load(&store, &snap2, &tx_manager)
+            .get_or_load(|| engine.load_catalog(&snap2), &snap2, engine.tx_manager())
             .await
             .unwrap();
         // Other transactions can't see the uncommitted DDL.

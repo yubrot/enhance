@@ -2,17 +2,13 @@
 
 use std::collections::HashMap;
 
-use super::error::CatalogError;
 use super::schema::{ColumnInfo, TableInfo};
-use super::store::CatalogStore;
-use crate::storage::{Replacer, Storage};
-use crate::tx::Snapshot;
 
 /// An in-memory, MVCC-consistent view of the system catalog.
 ///
-/// Built by [`Catalog::load`], this type holds all table and column
-/// metadata visible at a given MVCC snapshot. All lookups are synchronous
-/// and carry no generic storage parameters.
+/// Built by [`Engine::load_catalog`](crate::engine::Engine), this type holds
+/// all table and column metadata visible at a given MVCC snapshot. All lookups
+/// are synchronous and carry no generic storage parameters.
 pub struct Catalog {
     /// Name → table_id index for O(1) name lookups.
     table_ids: HashMap<String, u32>,
@@ -29,36 +25,8 @@ pub struct TableEntry {
 }
 
 impl Catalog {
-    /// Loads all visible catalog data into a new `Catalog`.
-    ///
-    /// Iterates the sys_tables and sys_columns page chains via
-    /// [`CatalogStore::scan_tables`] and [`CatalogStore::scan_columns`],
-    /// groups columns by table, and returns an immutable in-memory view.
-    pub async fn load<S: Storage, R: Replacer>(
-        store: &CatalogStore<S, R>,
-        snapshot: &Snapshot,
-    ) -> Result<Self, CatalogError> {
-        let mut tables = Vec::new();
-        let mut next_page_id = Some(None);
-        while let Some(page_id) = next_page_id {
-            let (page_tables, next) = store.scan_tables(snapshot, page_id).await?;
-            tables.extend(page_tables);
-            next_page_id = next.map(Some);
-        }
-
-        let mut columns = Vec::new();
-        let mut next_page_id = Some(None);
-        while let Some(page_id) = next_page_id {
-            let (page_columns, next) = store.scan_columns(snapshot, page_id).await?;
-            columns.extend(page_columns);
-            next_page_id = next.map(Some);
-        }
-
-        Ok(Self::new(tables, columns))
-    }
-
     /// Creates a new `Catalog` from preloaded table and column data.
-    fn new(tables: Vec<TableInfo>, columns: Vec<ColumnInfo>) -> Self {
+    pub(crate) fn new(tables: Vec<TableInfo>, columns: Vec<ColumnInfo>) -> Self {
         let mut table_ids = HashMap::with_capacity(tables.len());
         let mut table_entries = HashMap::with_capacity(tables.len());
 
@@ -99,13 +67,8 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::LAST_RESERVED_TABLE_ID;
-    use crate::catalog::schema::{SequenceInfo, SystemCatalogTable};
-    use crate::catalog::tests::test_catalog_store;
     use crate::datum::Type;
-    use crate::sql::tests::parse_create_table;
     use crate::storage::PageId;
-    use crate::tx::CommandId;
 
     fn sample_tables() -> Vec<TableInfo> {
         vec![
@@ -171,85 +134,5 @@ mod tests {
         let entry = catalog.resolve_table("empty").unwrap();
         assert_eq!(entry.info.table_id, 100);
         assert!(entry.columns.is_empty());
-    }
-
-    // --- Integration tests using CatalogStore ---
-
-    #[tokio::test]
-    async fn test_load_system_tables() {
-        let (store, tx_manager) = test_catalog_store().await;
-        let txid = tx_manager.begin();
-        let snapshot = tx_manager.snapshot(txid, CommandId::FIRST);
-
-        let catalog = Catalog::load(&store, &snapshot).await.unwrap();
-
-        // Should contain the 3 system catalog tables
-        assert_eq!(
-            catalog.resolve_table("sys_tables").unwrap().info.table_id,
-            TableInfo::TABLE_ID
-        );
-        assert_eq!(
-            catalog.resolve_table("sys_columns").unwrap().info.table_id,
-            ColumnInfo::TABLE_ID
-        );
-        assert_eq!(
-            catalog
-                .resolve_table("sys_sequences")
-                .unwrap()
-                .info
-                .table_id,
-            SequenceInfo::TABLE_ID
-        );
-
-        // sys_tables should have 3 columns
-        let entry = catalog.resolve_table_by_id(TableInfo::TABLE_ID).unwrap();
-        assert_eq!(entry.columns.len(), 3);
-        assert_eq!(entry.columns[0].column_name, "table_id");
-        assert_eq!(entry.columns[1].column_name, "table_name");
-        assert_eq!(entry.columns[2].column_name, "first_page");
-    }
-
-    #[tokio::test]
-    async fn test_load_with_user_table() {
-        let (store, tx_manager) = test_catalog_store().await;
-        let txid = tx_manager.begin();
-        let cid = CommandId::FIRST;
-
-        let stmt = parse_create_table("CREATE TABLE users (id SERIAL, name TEXT)");
-
-        store.create_table(txid, cid, &stmt).await.unwrap();
-        tx_manager.commit(txid).unwrap();
-
-        // Load catalog with a new transaction
-        let txid2 = tx_manager.begin();
-        let snapshot = tx_manager.snapshot(txid2, CommandId::FIRST);
-        let catalog = Catalog::load(&store, &snapshot).await.unwrap();
-
-        let entry = catalog.resolve_table("users").unwrap();
-        assert_eq!(entry.info.table_id, LAST_RESERVED_TABLE_ID + 1);
-        assert_eq!(entry.columns.len(), 2);
-        assert_eq!(entry.columns[0].column_name, "id");
-        assert!(entry.columns[0].is_serial());
-        assert_eq!(entry.columns[1].column_name, "name");
-        assert!(!entry.columns[1].is_serial());
-    }
-
-    #[tokio::test]
-    async fn test_load_uncommitted_not_visible() {
-        let (store, tx_manager) = test_catalog_store().await;
-        let txid = tx_manager.begin();
-        let cid = CommandId::FIRST;
-
-        let stmt = parse_create_table("CREATE TABLE invisible (id INTEGER)");
-
-        store.create_table(txid, cid, &stmt).await.unwrap();
-        // Do NOT commit
-
-        // Another transaction should not see the uncommitted table
-        let txid2 = tx_manager.begin();
-        let snapshot = tx_manager.snapshot(txid2, CommandId::FIRST);
-        let catalog = Catalog::load(&store, &snapshot).await.unwrap();
-
-        assert!(catalog.resolve_table("invisible").is_none());
     }
 }

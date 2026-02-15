@@ -437,7 +437,6 @@ impl ValuesScan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::Catalog;
     use crate::datum::{Type, Value};
     use crate::engine::ExecContextImpl;
     use crate::engine::tests::{TestEngine, open_test_engine};
@@ -454,12 +453,12 @@ mod tests {
     /// and the table's first page ID.
     async fn setup_int_table(values: Vec<i64>) -> (TestEngine, PageId) {
         let db = open_test_engine().await;
-        db.create_table("CREATE TABLE test (id INT)").await;
+        db.create_test_table("CREATE TABLE test (id INT)").await;
 
         let txid = db.tx_manager().begin();
         let cid = CommandId::FIRST;
         let snapshot = db.tx_manager().snapshot(txid, cid);
-        let catalog = Catalog::load(db.catalog_store(), &snapshot).await.unwrap();
+        let catalog = db.load_catalog(&snapshot).await.unwrap();
         let table = &catalog.resolve_table("test").unwrap();
         let first_page = table.info.first_page;
         {
@@ -479,13 +478,13 @@ mod tests {
     /// inserts the given rows. Returns the database and the table's first page ID.
     async fn setup_two_col_table(rows: Vec<(i64, &str)>) -> (TestEngine, PageId) {
         let db = open_test_engine().await;
-        db.create_table("CREATE TABLE test (id INT, name TEXT)")
+        db.create_test_table("CREATE TABLE test (id INT, name TEXT)")
             .await;
 
         let txid = db.tx_manager().begin();
         let cid = CommandId::FIRST;
         let snapshot = db.tx_manager().snapshot(txid, cid);
-        let catalog = Catalog::load(db.catalog_store(), &snapshot).await.unwrap();
+        let catalog = db.load_catalog(&snapshot).await.unwrap();
         let table = &catalog.resolve_table("test").unwrap();
         let first_page = table.info.first_page;
         {
@@ -751,11 +750,11 @@ mod tests {
         ddl: &str,
     ) -> (TestEngine, crate::tx::Snapshot, crate::catalog::Catalog) {
         let db = open_test_engine().await;
-        db.create_table(ddl).await;
+        db.create_test_table(ddl).await;
 
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-        let catalog = Catalog::load(db.catalog_store(), &snapshot).await.unwrap();
+        let catalog = db.load_catalog(&snapshot).await.unwrap();
         (db, snapshot, catalog)
     }
 

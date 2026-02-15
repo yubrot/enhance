@@ -220,13 +220,10 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::CreateTable(create_stmt) => {
                 self.run_in_transaction(true, |engine, txid, cid| async move {
                     engine
-                        .catalog_store()
                         .create_table(txid, cid, create_stmt)
                         .await
                         .map_err(EngineError::Catalog)?;
-                    engine
-                        .catalog_cache()
-                        .register_ddl(txid, engine.tx_manager());
+                    engine.register_ddl(txid);
                     Ok(QueryResult::command("CREATE TABLE"))
                 })
                 .await

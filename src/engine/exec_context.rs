@@ -5,23 +5,22 @@
 
 use std::sync::Arc;
 
-use crate::catalog::CatalogStore;
+use parking_lot::RwLock;
+
+use crate::catalog::{CatalogError, SequenceInfo, Superblock, SystemCatalogTable};
 use crate::executor::{ExecContext, ExecutorError};
-use crate::heap::{Record, TupleId, delete, insert, scan_visible_page, update};
+use crate::heap::{HeapPage, Record, TupleId, delete, insert, scan_visible_page, update};
 use crate::storage::{BufferPool, PageId, Replacer, Storage};
 use crate::tx::{Snapshot, TransactionManager};
 
-/// Concrete [`ExecContext`] backed by a [`BufferPool`], [`TransactionManager`], and [`CatalogStore`].
+/// Concrete [`ExecContext`] backed by a [`BufferPool`], [`TransactionManager`], and [`Superblock`].
 ///
 /// Owns `Arc` references to shared components plus a cloned [`Snapshot`]
 /// for visibility checks. Cloning is lightweight.
 pub struct ExecContextImpl<S: Storage, R: Replacer> {
     pool: Arc<BufferPool<S, R>>,
     tx_manager: Arc<TransactionManager>,
-    // NOTE: The `CatalogStore` dependency in `ExecContextImpl` exists solely for `nextval`.
-    // A future refactor could extract sequence access into a dedicated trait, removing
-    // the `CatalogStore` dependency from the execution context.
-    catalog_store: CatalogStore<S, R>,
+    superblock: Arc<RwLock<Superblock>>,
     snapshot: Snapshot,
 }
 
@@ -30,7 +29,7 @@ impl<S: Storage, R: Replacer> Clone for ExecContextImpl<S, R> {
         Self {
             pool: Arc::clone(&self.pool),
             tx_manager: Arc::clone(&self.tx_manager),
-            catalog_store: self.catalog_store.clone(),
+            superblock: Arc::clone(&self.superblock),
             snapshot: self.snapshot.clone(),
         }
     }
@@ -41,13 +40,13 @@ impl<S: Storage, R: Replacer> ExecContextImpl<S, R> {
     pub fn new(
         pool: Arc<BufferPool<S, R>>,
         tx_manager: Arc<TransactionManager>,
-        catalog_store: CatalogStore<S, R>,
+        superblock: Arc<RwLock<Superblock>>,
         snapshot: Snapshot,
     ) -> Self {
         Self {
             pool,
             tx_manager,
-            catalog_store,
+            superblock,
             snapshot,
         }
     }
@@ -112,6 +111,39 @@ impl<S: Storage, R: Replacer> ExecContext for ExecContextImpl<S, R> {
     }
 
     async fn nextval(&self, seq_id: u32) -> Result<i64, ExecutorError> {
-        Ok(self.catalog_store.nextval(seq_id).await?)
+        Ok(nextval_impl(&self.pool, &self.superblock, seq_id).await?)
     }
+}
+
+/// Shared nextval implementation used by both [`Engine::nextval`](super::core::Engine::nextval)
+/// and [`ExecContextImpl::nextval`].
+///
+/// Sequences are NOT rolled back on transaction abort (following PostgreSQL's behavior).
+/// Each call increments the sequence permanently, independent of transaction state.
+pub(super) async fn nextval_impl<S: Storage, R: Replacer>(
+    pool: &BufferPool<S, R>,
+    superblock: &RwLock<Superblock>,
+    seq_id: u32,
+) -> Result<i64, CatalogError> {
+    // The page latch is held during the entire operation to ensure atomicity.
+    let sys_sequences_page = superblock.read().sys_sequences_page;
+    let mut page = HeapPage::new(pool.fetch_page_mut(sys_sequences_page, true).await?);
+
+    // Find the sequence
+    let (slot_id, mut seq) = page
+        .scan(SequenceInfo::SCHEMA)
+        .find_map(|(slot_id, _header, record)| {
+            let seq = SequenceInfo::from_record(&record)?;
+            (seq.seq_id == seq_id).then_some((slot_id, seq))
+        })
+        .ok_or(CatalogError::SequenceNotFound { seq_id })?;
+
+    let current_val = seq.next_val;
+    seq.next_val += 1;
+
+    // Update record in-place, bypassing MVCC
+    // The record size is unchanged (same seq_name, only next_val differs)
+    page.update_record_in_place(slot_id, &seq.to_record())?;
+
+    Ok(current_val)
 }

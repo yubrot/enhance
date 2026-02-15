@@ -460,7 +460,7 @@ mod tests {
         let db = open_test_engine().await;
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-        Catalog::load(db.catalog_store(), &snapshot).await.unwrap()
+        db.load_catalog(&snapshot).await.unwrap()
     }
 
     #[tokio::test]
@@ -716,11 +716,11 @@ mod tests {
     /// Sets up a catalog snapshot with a user-defined table.
     async fn setup_catalog_with_table(ddl: &str) -> Catalog {
         let db = open_test_engine().await;
-        db.create_table(ddl).await;
+        db.create_test_table(ddl).await;
 
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-        Catalog::load(db.catalog_store(), &snapshot).await.unwrap()
+        db.load_catalog(&snapshot).await.unwrap()
     }
 
     #[tokio::test]

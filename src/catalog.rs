@@ -27,9 +27,9 @@
 //!
 //! ## Components
 //!
-//! - [`CatalogStore`]: Low-level catalog operations (create table, heap lookups)
 //! - [`Superblock`]: Database metadata stored in page 0 (page IDs, ID generators)
 //! - [`TableInfo`], [`ColumnInfo`], [`SequenceInfo`]: Typed wrappers for catalog rows
+//! - [`CatalogCache`]: MVCC-aware cache for [`Catalog`]
 //!
 //! ## Bootstrap
 //!
@@ -47,37 +47,10 @@ mod cache;
 mod error;
 mod schema;
 mod snapshot;
-mod store;
 mod superblock;
 
 pub use cache::CatalogCache;
 pub use error::CatalogError;
 pub use schema::{ColumnInfo, LAST_RESERVED_TABLE_ID, SequenceInfo, SystemCatalogTable, TableInfo};
 pub use snapshot::{Catalog, TableEntry};
-pub use store::CatalogStore;
 pub use superblock::Superblock;
-
-/// Test helpers for catalog-layer tests used across multiple test modules.
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::tests::test_pool;
-    use crate::storage::{LruReplacer, MemoryStorage};
-    use crate::tx::TransactionManager;
-    use std::sync::Arc;
-
-    /// Bootstraps a [`CatalogStore`] backed by in-memory storage for testing.
-    ///
-    /// Returns the store and a shared [`TransactionManager`].
-    pub async fn test_catalog_store() -> (
-        CatalogStore<MemoryStorage, LruReplacer>,
-        Arc<TransactionManager>,
-    ) {
-        let pool = test_pool();
-        let tx_manager = Arc::new(TransactionManager::new());
-        let store = CatalogStore::bootstrap(pool, tx_manager.clone())
-            .await
-            .unwrap();
-        (store, tx_manager)
-    }
-}

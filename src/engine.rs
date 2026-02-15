@@ -2,7 +2,7 @@
 //!
 //! The [`Engine`] type is the main entry point for database infrastructure.
 //! It initializes or opens an existing database and provides access to
-//! the core components (buffer pool, transaction manager, catalog).
+//! the core components (buffer pool, transaction manager, catalog operations).
 //!
 //! # Architecture
 //!
@@ -12,9 +12,9 @@
 //! |  (Orchestrates core infrastructure components)                   |
 //! |                                                                  |
 //! |  +-----------------+  +--------------------+  +---------------+  |
-//! |  | Arc<BufferPool> |  | Arc<TxManager>     |  | CatalogStore |  |
+//! |  | Arc<BufferPool> |  | Arc<TxManager>     |  | Superblock   |  |
 //! |  | (Page I/O,      |  | (TxId allocation,  |  | (Table/column |  |
-//! |  |  LRU eviction)  |  |  commit/abort)     |  |  metadata)    |  |
+//! |  |  LRU eviction)  |  |  commit/abort)     |  |  page IDs)    |  |
 //! |  +--------+--------+  +--------------------+  +-------+-------+  |
 //! |           |                                           |          |
 //! +-----------+-------------------------------------------+----------+
@@ -55,11 +55,10 @@ pub mod tests {
         ///
         /// Parses the DDL string as a `CREATE TABLE` statement, executes it within
         /// a new transaction, and commits immediately.
-        pub async fn create_table(&self, ddl: &str) {
+        pub async fn create_test_table(&self, ddl: &str) {
             let txid = self.tx_manager().begin();
             let stmt = parse_create_table(ddl);
-            self.catalog_store()
-                .create_table(txid, CommandId::FIRST, &stmt)
+            self.create_table(txid, CommandId::FIRST, &stmt)
                 .await
                 .unwrap();
             self.tx_manager().commit(txid).unwrap();
