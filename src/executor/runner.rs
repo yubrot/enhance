@@ -437,7 +437,7 @@ impl ValuesScan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::CatalogSnapshot;
+    use crate::catalog::Catalog;
     use crate::datum::{Type, Value};
     use crate::db::tests::{TestDb, open_test_db};
     use crate::executor::ExecContextImpl;
@@ -459,9 +459,7 @@ mod tests {
         let txid = db.tx_manager().begin();
         let cid = CommandId::FIRST;
         let snapshot = db.tx_manager().snapshot(txid, cid);
-        let catalog = CatalogSnapshot::load(db.catalog_store(), &snapshot)
-            .await
-            .unwrap();
+        let catalog = Catalog::load(db.catalog_store(), &snapshot).await.unwrap();
         let table = &catalog.resolve_table("test").unwrap();
         let first_page = table.info.first_page;
         {
@@ -487,9 +485,7 @@ mod tests {
         let txid = db.tx_manager().begin();
         let cid = CommandId::FIRST;
         let snapshot = db.tx_manager().snapshot(txid, cid);
-        let catalog = CatalogSnapshot::load(db.catalog_store(), &snapshot)
-            .await
-            .unwrap();
+        let catalog = Catalog::load(db.catalog_store(), &snapshot).await.unwrap();
         let table = &catalog.resolve_table("test").unwrap();
         let first_page = table.info.first_page;
         {
@@ -753,15 +749,13 @@ mod tests {
     /// Helper: create a table and return db, snapshot, and catalog snapshot for planning.
     async fn setup_table_and_ctx(
         ddl: &str,
-    ) -> (TestDb, crate::tx::Snapshot, crate::catalog::CatalogSnapshot) {
+    ) -> (TestDb, crate::tx::Snapshot, crate::catalog::Catalog) {
         let db = open_test_db().await;
         db.create_table(ddl).await;
 
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-        let catalog = CatalogSnapshot::load(db.catalog_store(), &snapshot)
-            .await
-            .unwrap();
+        let catalog = Catalog::load(db.catalog_store(), &snapshot).await.unwrap();
         (db, snapshot, catalog)
     }
 

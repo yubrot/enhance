@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use super::error::DatabaseError;
-use crate::catalog::{CatalogCache, CatalogError, CatalogSnapshot, CatalogStore};
+use crate::catalog::{Catalog, CatalogCache, CatalogError, CatalogStore};
 use crate::executor::ExecContextImpl;
 use crate::storage::{BufferPool, LruReplacer, Replacer, Storage};
 use crate::tx::{Snapshot, TransactionManager};
@@ -94,14 +94,14 @@ impl<S: Storage, R: Replacer> Database<S, R> {
         &self.catalog_cache
     }
 
-    /// Returns a cached [`CatalogSnapshot`] for the given MVCC snapshot.
+    /// Returns a cached [`Catalog`] for the given MVCC snapshot.
     ///
     /// Delegates to [`CatalogCache::get_or_load`], which avoids redundant
     /// heap scans when no DDL has been committed since the last load.
     pub async fn catalog_snapshot(
         &self,
         snapshot: &Snapshot,
-    ) -> Result<Arc<CatalogSnapshot>, CatalogError> {
+    ) -> Result<Arc<Catalog>, CatalogError> {
         self.catalog_cache
             .get_or_load(&self.catalog_store, snapshot, &self.tx_manager)
             .await

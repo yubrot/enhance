@@ -53,7 +53,7 @@ mod superblock;
 pub use cache::CatalogCache;
 pub use error::CatalogError;
 pub use schema::{ColumnInfo, LAST_RESERVED_TABLE_ID, SequenceInfo, SystemCatalogTable, TableInfo};
-pub use snapshot::{CatalogSnapshot, TableEntry};
+pub use snapshot::{Catalog, TableEntry};
 pub use store::CatalogStore;
 pub use superblock::Superblock;
 

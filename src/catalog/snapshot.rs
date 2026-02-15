@@ -1,4 +1,4 @@
-//! In-memory catalog snapshot for synchronous metadata lookups.
+//! In-memory catalog view for synchronous metadata lookups.
 
 use std::collections::HashMap;
 
@@ -10,10 +10,10 @@ use crate::tx::Snapshot;
 
 /// An in-memory, MVCC-consistent view of the system catalog.
 ///
-/// Built by [`CatalogSnapshot::load`], this type holds all table and column
+/// Built by [`Catalog::load`], this type holds all table and column
 /// metadata visible at a given MVCC snapshot. All lookups are synchronous
 /// and carry no generic storage parameters.
-pub struct CatalogSnapshot {
+pub struct Catalog {
     /// Name → table_id index for O(1) name lookups.
     table_ids: HashMap<String, u32>,
     /// table_id → table entry (info + pre-sorted columns).
@@ -28,8 +28,8 @@ pub struct TableEntry {
     pub columns: Vec<ColumnInfo>,
 }
 
-impl CatalogSnapshot {
-    /// Loads all visible catalog data into a new `CatalogSnapshot`.
+impl Catalog {
+    /// Loads all visible catalog data into a new `Catalog`.
     ///
     /// Iterates the sys_tables and sys_columns page chains via
     /// [`CatalogStore::scan_tables`] and [`CatalogStore::scan_columns`],
@@ -57,7 +57,7 @@ impl CatalogSnapshot {
         Ok(Self::new(tables, columns))
     }
 
-    /// Creates a new `CatalogSnapshot` from preloaded table and column data.
+    /// Creates a new `Catalog` from preloaded table and column data.
     fn new(tables: Vec<TableInfo>, columns: Vec<ColumnInfo>) -> Self {
         let mut table_ids = HashMap::with_capacity(tables.len());
         let mut table_entries = HashMap::with_capacity(tables.len());
@@ -128,9 +128,9 @@ mod tests {
 
     #[test]
     fn test_resolve_table_by_name() {
-        let snap = CatalogSnapshot::new(sample_tables(), sample_columns());
+        let catalog = Catalog::new(sample_tables(), sample_columns());
 
-        let entry = snap.resolve_table("users").unwrap();
+        let entry = catalog.resolve_table("users").unwrap();
         assert_eq!(entry.info.table_id, 100);
         assert_eq!(entry.info.table_name, "users");
         assert_eq!(entry.columns.len(), 2);
@@ -140,35 +140,35 @@ mod tests {
         assert_eq!(entry.columns[1].column_name, "name");
         assert_eq!(entry.columns[1].column_num, 1);
 
-        let entry = snap.resolve_table("sys_tables").unwrap();
+        let entry = catalog.resolve_table("sys_tables").unwrap();
         assert_eq!(entry.info.table_id, 1);
 
-        assert!(snap.resolve_table("nonexistent").is_none());
+        assert!(catalog.resolve_table("nonexistent").is_none());
     }
 
     #[test]
     fn test_resolve_table_by_id() {
-        let snap = CatalogSnapshot::new(sample_tables(), sample_columns());
+        let catalog = Catalog::new(sample_tables(), sample_columns());
 
-        let entry = snap.resolve_table_by_id(100).unwrap();
+        let entry = catalog.resolve_table_by_id(100).unwrap();
         assert_eq!(entry.info.table_name, "users");
 
-        assert!(snap.resolve_table_by_id(999).is_none());
+        assert!(catalog.resolve_table_by_id(999).is_none());
     }
 
     #[test]
-    fn test_empty_snapshot() {
-        let snap = CatalogSnapshot::new(vec![], vec![]);
-        assert!(snap.resolve_table("anything").is_none());
-        assert!(snap.resolve_table_by_id(1).is_none());
+    fn test_empty_catalog() {
+        let catalog = Catalog::new(vec![], vec![]);
+        assert!(catalog.resolve_table("anything").is_none());
+        assert!(catalog.resolve_table_by_id(1).is_none());
     }
 
     #[test]
     fn test_table_with_no_columns() {
         let tables = vec![TableInfo::new(100, "empty".to_string(), PageId::new(4))];
-        let snap = CatalogSnapshot::new(tables, vec![]);
+        let catalog = Catalog::new(tables, vec![]);
 
-        let entry = snap.resolve_table("empty").unwrap();
+        let entry = catalog.resolve_table("empty").unwrap();
         assert_eq!(entry.info.table_id, 100);
         assert!(entry.columns.is_empty());
     }
@@ -181,24 +181,28 @@ mod tests {
         let txid = tx_manager.begin();
         let snapshot = tx_manager.snapshot(txid, CommandId::FIRST);
 
-        let snap = CatalogSnapshot::load(&store, &snapshot).await.unwrap();
+        let catalog = Catalog::load(&store, &snapshot).await.unwrap();
 
         // Should contain the 3 system catalog tables
         assert_eq!(
-            snap.resolve_table("sys_tables").unwrap().info.table_id,
+            catalog.resolve_table("sys_tables").unwrap().info.table_id,
             TableInfo::TABLE_ID
         );
         assert_eq!(
-            snap.resolve_table("sys_columns").unwrap().info.table_id,
+            catalog.resolve_table("sys_columns").unwrap().info.table_id,
             ColumnInfo::TABLE_ID
         );
         assert_eq!(
-            snap.resolve_table("sys_sequences").unwrap().info.table_id,
+            catalog
+                .resolve_table("sys_sequences")
+                .unwrap()
+                .info
+                .table_id,
             SequenceInfo::TABLE_ID
         );
 
         // sys_tables should have 3 columns
-        let entry = snap.resolve_table_by_id(TableInfo::TABLE_ID).unwrap();
+        let entry = catalog.resolve_table_by_id(TableInfo::TABLE_ID).unwrap();
         assert_eq!(entry.columns.len(), 3);
         assert_eq!(entry.columns[0].column_name, "table_id");
         assert_eq!(entry.columns[1].column_name, "table_name");
@@ -216,12 +220,12 @@ mod tests {
         store.create_table(txid, cid, &stmt).await.unwrap();
         tx_manager.commit(txid).unwrap();
 
-        // Load snapshot with a new transaction
+        // Load catalog with a new transaction
         let txid2 = tx_manager.begin();
         let snapshot = tx_manager.snapshot(txid2, CommandId::FIRST);
-        let snap = CatalogSnapshot::load(&store, &snapshot).await.unwrap();
+        let catalog = Catalog::load(&store, &snapshot).await.unwrap();
 
-        let entry = snap.resolve_table("users").unwrap();
+        let entry = catalog.resolve_table("users").unwrap();
         assert_eq!(entry.info.table_id, LAST_RESERVED_TABLE_ID + 1);
         assert_eq!(entry.columns.len(), 2);
         assert_eq!(entry.columns[0].column_name, "id");
@@ -244,8 +248,8 @@ mod tests {
         // Another transaction should not see the uncommitted table
         let txid2 = tx_manager.begin();
         let snapshot = tx_manager.snapshot(txid2, CommandId::FIRST);
-        let snap = CatalogSnapshot::load(&store, &snapshot).await.unwrap();
+        let catalog = Catalog::load(&store, &snapshot).await.unwrap();
 
-        assert!(snap.resolve_table("invisible").is_none());
+        assert!(catalog.resolve_table("invisible").is_none());
     }
 }

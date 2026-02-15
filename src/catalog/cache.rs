@@ -1,6 +1,6 @@
-//! Multi-version catalog snapshot cache with MVCC-aware invalidation.
+//! Multi-version catalog cache with MVCC-aware invalidation.
 //!
-//! The cache maintains a [`VecDeque`] of `(TxId, Option<Arc<CatalogSnapshot>>)` entries,
+//! The cache maintains a [`VecDeque`] of `(TxId, Option<Arc<Catalog>>)` entries,
 //! ordered from oldest to newest. Each entry represents a DDL epoch.
 //! `TxId::FROZEN` serves as the universal fallback (always visible to every snapshot).
 
@@ -10,18 +10,18 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use super::error::CatalogError;
-use super::snapshot::CatalogSnapshot;
+use super::snapshot::Catalog;
 use super::store::CatalogStore;
 use crate::storage::{Replacer, Storage};
 use crate::tx::{Snapshot, TransactionManager, TxId, TxState};
 
-/// Shared, MVCC-aware cache for [`CatalogSnapshot`].
+/// Shared, MVCC-aware cache for [`Catalog`].
 ///
 /// Maintains a small queue of versioned cache slots keyed by DDL transaction ID.
 /// Readers select the most recent entry visible to their MVCC snapshot, avoiding
 /// redundant heap scans of `sys_tables` / `sys_columns`.
 pub struct CatalogCache {
-    inner: RwLock<VecDeque<(TxId, Option<Arc<CatalogSnapshot>>)>>,
+    inner: RwLock<VecDeque<(TxId, Option<Arc<Catalog>>)>>,
 }
 
 impl CatalogCache {
@@ -52,13 +52,13 @@ impl CatalogCache {
         }
     }
 
-    /// Returns a cached [`CatalogSnapshot`], or loads a fresh one from the heap.
+    /// Returns a cached [`Catalog`], or loads a fresh one from the heap.
     pub async fn get_or_load<S: Storage, R: Replacer>(
         &self,
         store: &CatalogStore<S, R>,
         snapshot: &Snapshot,
         tx_manager: &TransactionManager,
-    ) -> Result<Arc<CatalogSnapshot>, CatalogError> {
+    ) -> Result<Arc<Catalog>, CatalogError> {
         // Phase 1: Write lock — find the visible entry (with aborted cleanup).
         {
             let mut inner = self.inner.write();
@@ -71,7 +71,7 @@ impl CatalogCache {
         // NOTE: Two threads may concurrently miss the cache and both perform a
         // heap load. This is harmless: Phase 3 re-checks and only one result
         // populates the slot; the other is used directly and discarded.
-        let loaded = Arc::new(CatalogSnapshot::load(store, snapshot).await?);
+        let loaded = Arc::new(Catalog::load(store, snapshot).await?);
 
         // Phase 3: Write lock — re-find and populate if still empty.
         {
@@ -97,7 +97,7 @@ impl Default for CatalogCache {
 /// NOTE: This panic will be replaced by a DDL lock in a future step,
 /// which prevents concurrent DDL at a higher level.
 fn deny_concurrent_ddl(
-    entries: &mut VecDeque<(TxId, Option<Arc<CatalogSnapshot>>)>,
+    entries: &mut VecDeque<(TxId, Option<Arc<Catalog>>)>,
     tx_manager: &TransactionManager,
 ) {
     if let Some(&(txid, _)) = entries.back()
@@ -114,7 +114,7 @@ fn deny_concurrent_ddl(
 /// here; non-tail aborted entries are skipped during the scan below and
 /// naturally evicted by register_ddl's size limit.
 fn clean_up_latest_aborted_entry(
-    entries: &mut VecDeque<(TxId, Option<Arc<CatalogSnapshot>>)>,
+    entries: &mut VecDeque<(TxId, Option<Arc<Catalog>>)>,
     tx_manager: &TransactionManager,
 ) {
     if entries.len() > 1
@@ -128,13 +128,13 @@ fn clean_up_latest_aborted_entry(
 /// Finds the most recent cache entry visible to the given MVCC snapshot.
 ///
 /// Returns `Some(slot)` for the best visible committed entry (which may
-/// or may not contain a cached snapshot), or `None` for self-DDL and
+/// or may not contain a cached catalog), or `None` for self-DDL and
 /// stale-read scenarios where the cache must be bypassed.
 fn find_visible_entry<'a>(
-    entries: &'a mut VecDeque<(TxId, Option<Arc<CatalogSnapshot>>)>,
+    entries: &'a mut VecDeque<(TxId, Option<Arc<Catalog>>)>,
     snapshot: &Snapshot,
     tx_manager: &TransactionManager,
-) -> Option<&'a mut Option<Arc<CatalogSnapshot>>> {
+) -> Option<&'a mut Option<Arc<Catalog>>> {
     clean_up_latest_aborted_entry(entries, tx_manager);
 
     for (txid, slot) in entries.iter_mut().rev() {
@@ -243,7 +243,7 @@ mod tests {
         let _ = tx_manager.abort(ddl_txid);
 
         // After abort, the aborted entry is cleaned up and the original
-        // cached snapshot is returned (no redundant heap scan).
+        // cached catalog is returned (no redundant heap scan).
         let tx2 = tx_manager.begin();
         let snap2 = tx_manager.snapshot(tx2, CommandId::FIRST);
         let after = cache
@@ -275,15 +275,15 @@ mod tests {
         store.create_table(ddl_txid, cid, &stmt).await.unwrap();
         cache.register_ddl(ddl_txid, &tx_manager);
 
-        // Self-DDL: snapshot from the same txid should get a fresh load,
+        // Self-DDL: the same txid should get a fresh load,
         // NOT the shared cache.
-        let snap_self = tx_manager.snapshot(ddl_txid, cid.next());
-        let self_snap = cache
-            .get_or_load(&store, &snap_self, &tx_manager)
+        let self_snapshot = tx_manager.snapshot(ddl_txid, cid.next());
+        let self_catalog = cache
+            .get_or_load(&store, &self_snapshot, &tx_manager)
             .await
             .unwrap();
         // The self-DDL result should see the uncommitted table.
-        assert!(self_snap.resolve_table("self_tbl").is_some());
+        assert!(self_catalog.resolve_table("self_tbl").is_some());
 
         // But the shared cache should NOT have been updated.
         let tx2 = tx_manager.begin();

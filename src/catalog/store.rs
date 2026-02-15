@@ -1,8 +1,8 @@
 //! Low-level catalog store for table and column metadata management.
 //!
 //! This module provides direct heap access to system catalog tables.
-//! For efficient in-memory lookups, use [`CatalogSnapshot`](super::CatalogSnapshot)
-//! built via [`CatalogSnapshot::load`](CatalogSnapshot::load).
+//! For efficient in-memory lookups, use [`Catalog`](super::Catalog)
+//! built via [`Catalog::load`].
 
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ use crate::tx::{CommandId, Snapshot, TransactionManager, TxId};
 /// (sys_tables, sys_columns, sys_sequences). All methods are async because
 /// they perform heap page I/O through the buffer pool.
 ///
-/// For synchronous, cached access during query planning, use [`CatalogSnapshot`](super::CatalogSnapshot).
+/// For synchronous, cached access during query planning, use [`Catalog`](super::Catalog).
 pub struct CatalogStore<S: Storage, R: Replacer> {
     /// Buffer pool for page access.
     pool: Arc<BufferPool<S, R>>,

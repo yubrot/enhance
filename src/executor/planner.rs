@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use crate::catalog::{CatalogSnapshot, ColumnInfo};
+use crate::catalog::{Catalog, ColumnInfo};
 use crate::datum::Type;
 use crate::sql::{
     DeleteStmt, Expr, FromClause, InsertStmt, SelectItem, SelectStmt, TableRef, UpdateStmt,
@@ -28,10 +28,7 @@ use super::{ColumnDesc, ColumnSource};
 ///
 /// Returns [`ExecutorError`] for unresolvable tables/columns, unsupported
 /// features (JOINs, subqueries), or catalog lookup errors.
-pub fn plan_select(
-    select: &SelectStmt,
-    catalog: &CatalogSnapshot,
-) -> Result<QueryPlan, ExecutorError> {
+pub fn plan_select(select: &SelectStmt, catalog: &Catalog) -> Result<QueryPlan, ExecutorError> {
     // Check for unsupported features
     if select.distinct {
         return Err(ExecutorError::Unsupported("DISTINCT".to_string()));
@@ -85,10 +82,7 @@ pub fn plan_select(
 ///
 /// Returns [`ExecutorError`] for unknown tables/columns, column count
 /// mismatches, duplicate columns, or type coercion failures.
-pub fn plan_insert(
-    insert: &InsertStmt,
-    catalog: &CatalogSnapshot,
-) -> Result<DmlPlan, ExecutorError> {
+pub fn plan_insert(insert: &InsertStmt, catalog: &Catalog) -> Result<DmlPlan, ExecutorError> {
     // Look up the target table and columns
     let entry =
         catalog
@@ -175,10 +169,7 @@ pub fn plan_insert(
 ///
 /// Returns [`ExecutorError`] for unknown tables/columns, or expression binding
 /// errors.
-pub fn plan_update(
-    update: &UpdateStmt,
-    catalog: &CatalogSnapshot,
-) -> Result<DmlPlan, ExecutorError> {
+pub fn plan_update(update: &UpdateStmt, catalog: &Catalog) -> Result<DmlPlan, ExecutorError> {
     // Build the input scan plan
     let scan_plan = build_seq_scan_plan(&update.table, None, catalog)?;
 
@@ -187,7 +178,7 @@ pub fn plan_update(
     let input_columns = input.columns().to_vec();
 
     // NOTE: This duplicates the table/column lookup already done inside build_seq_scan_plan.
-    // With CatalogSnapshot this is a cheap HashMap lookup, so no performance concern.
+    // With Catalog this is a cheap HashMap lookup, so no performance concern.
     let entry =
         catalog
             .resolve_table(&update.table)
@@ -236,10 +227,7 @@ pub fn plan_update(
 /// # Errors
 ///
 /// Returns [`ExecutorError`] for unknown tables or expression binding errors.
-pub fn plan_delete(
-    delete: &DeleteStmt,
-    catalog: &CatalogSnapshot,
-) -> Result<DmlPlan, ExecutorError> {
+pub fn plan_delete(delete: &DeleteStmt, catalog: &Catalog) -> Result<DmlPlan, ExecutorError> {
     // Build the input scan plan
     let scan_plan = build_seq_scan_plan(&delete.table, None, catalog)?;
 
@@ -295,10 +283,7 @@ fn apply_filter(plan: QueryPlan, where_clause: Option<&Expr>) -> Result<QueryPla
 }
 
 /// Builds a plan from a FROM clause.
-fn build_from_plan(
-    from: &FromClause,
-    catalog: &CatalogSnapshot,
-) -> Result<QueryPlan, ExecutorError> {
+fn build_from_plan(from: &FromClause, catalog: &Catalog) -> Result<QueryPlan, ExecutorError> {
     if from.tables.len() != 1 {
         return Err(ExecutorError::Unsupported(
             "multiple tables in FROM (use JOIN)".to_string(),
@@ -310,7 +295,7 @@ fn build_from_plan(
 /// Builds a plan from a table reference.
 fn build_table_ref_plan(
     table_ref: &TableRef,
-    catalog: &CatalogSnapshot,
+    catalog: &Catalog,
 ) -> Result<QueryPlan, ExecutorError> {
     match table_ref {
         TableRef::Table { name, alias } => build_seq_scan_plan(name, alias.as_deref(), catalog),
@@ -331,7 +316,7 @@ fn build_table_ref_plan(
 fn build_seq_scan_plan(
     table_name: &str,
     alias: Option<&str>,
-    catalog: &CatalogSnapshot,
+    catalog: &Catalog,
 ) -> Result<QueryPlan, ExecutorError> {
     // Look up table and columns in catalog
     let entry = catalog
@@ -466,18 +451,16 @@ fn expand_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::CatalogSnapshot;
+    use crate::catalog::Catalog;
     use crate::db::tests::open_test_db;
     use crate::sql::tests::{parse_delete, parse_insert, parse_select, parse_update};
     use crate::tx::CommandId;
 
-    async fn setup_catalog() -> CatalogSnapshot {
+    async fn setup_catalog() -> Catalog {
         let db = open_test_db().await;
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-        CatalogSnapshot::load(db.catalog_store(), &snapshot)
-            .await
-            .unwrap()
+        Catalog::load(db.catalog_store(), &snapshot).await.unwrap()
     }
 
     #[tokio::test]
@@ -731,15 +714,13 @@ mod tests {
     // --- INSERT planner tests ---
 
     /// Sets up a catalog snapshot with a user-defined table.
-    async fn setup_catalog_with_table(ddl: &str) -> CatalogSnapshot {
+    async fn setup_catalog_with_table(ddl: &str) -> Catalog {
         let db = open_test_db().await;
         db.create_table(ddl).await;
 
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-        CatalogSnapshot::load(db.catalog_store(), &snapshot)
-            .await
-            .unwrap()
+        Catalog::load(db.catalog_store(), &snapshot).await.unwrap()
     }
 
     #[tokio::test]
