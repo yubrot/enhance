@@ -54,7 +54,7 @@ pub enum ExecutorError {
     /// Unsupported operation or feature.
     Unsupported(String),
 
-    /// Heap operation error (insert, delete, update).
+    /// Internal heap operation error (insert, delete, update).
     Heap(HeapError),
 }
 

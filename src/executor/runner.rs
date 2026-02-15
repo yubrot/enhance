@@ -436,16 +436,24 @@ impl ValuesScan {
 
 #[cfg(test)]
 mod tests {
+    //! NOTE: This module depends on `crate::engine` (a higher layer) for test
+    //! setup. Constructing `ExecContext` implementors and their prerequisites
+    //! (buffer pool, transaction snapshots, catalog, etc.) by hand would be
+    //! prohibitively verbose, so we use `Engine` helpers as a pragmatic
+    //! exception to the normal layering direction.
+
     use super::*;
     use crate::datum::{Type, Value};
     use std::sync::Arc;
 
     use crate::engine::ExecutionPoint;
     use crate::engine::tests::{TestEngine, open_test_engine};
+    use crate::executor::planner;
     use crate::executor::tests::{bind_expr, int_col};
     use crate::heap::{HeapPage, Record};
     use crate::sql::tests::{parse_delete, parse_insert, parse_update};
     use crate::storage::{LruReplacer, MemoryStorage, PageId};
+
     use crate::tx::CommandId;
 
     type TestCtx = ExecutionPoint<MemoryStorage, LruReplacer>;
@@ -460,7 +468,7 @@ mod tests {
         let txid = db.tx_manager().begin();
         let cid = CommandId::FIRST;
         let snapshot = db.tx_manager().snapshot(txid, cid);
-        let catalog = db.load_catalog(&snapshot).await.unwrap();
+        let catalog = db.catalog(&snapshot).await.unwrap();
         let table = &catalog.resolve_table("test").unwrap();
         let first_page = table.info.first_page;
         {
@@ -486,7 +494,7 @@ mod tests {
         let txid = db.tx_manager().begin();
         let cid = CommandId::FIRST;
         let snapshot = db.tx_manager().snapshot(txid, cid);
-        let catalog = db.load_catalog(&snapshot).await.unwrap();
+        let catalog = db.catalog(&snapshot).await.unwrap();
         let table = &catalog.resolve_table("test").unwrap();
         let first_page = table.info.first_page;
         {
@@ -507,6 +515,23 @@ mod tests {
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
         db.execution_point(snapshot)
+    }
+
+    /// Helper: create a table and return db, snapshot, and catalog snapshot for planning.
+    async fn setup_table_and_ctx(
+        ddl: &str,
+    ) -> (
+        Arc<TestEngine>,
+        crate::tx::Snapshot,
+        Arc<crate::catalog::Catalog>,
+    ) {
+        let db = open_test_engine().await;
+        db.create_test_table(ddl).await;
+
+        let txid = db.tx_manager().begin();
+        let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
+        let catalog = db.catalog(&snapshot).await.unwrap();
+        (db, snapshot, catalog)
     }
 
     #[tokio::test]
@@ -744,25 +769,6 @@ mod tests {
     }
 
     // --- DML execution tests ---
-
-    use crate::executor::planner;
-
-    /// Helper: create a table and return db, snapshot, and catalog snapshot for planning.
-    async fn setup_table_and_ctx(
-        ddl: &str,
-    ) -> (
-        Arc<TestEngine>,
-        crate::tx::Snapshot,
-        crate::catalog::Catalog,
-    ) {
-        let db = open_test_engine().await;
-        db.create_test_table(ddl).await;
-
-        let txid = db.tx_manager().begin();
-        let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-        let catalog = db.load_catalog(&snapshot).await.unwrap();
-        (db, snapshot, catalog)
-    }
 
     #[tokio::test]
     async fn test_execute_insert() {

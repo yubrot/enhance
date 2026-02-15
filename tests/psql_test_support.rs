@@ -3,6 +3,7 @@
 //! Provides a simple interface for setting up a test server and running psql commands.
 
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -57,7 +58,7 @@ impl PsqlTestServer {
 
         // Initialize engine with in-memory storage
         let storage = MemoryStorage::new();
-        let engine = Engine::open(storage, 100).await.unwrap();
+        let engine = Arc::new(Engine::open(storage, 100).await.unwrap());
 
         let server = Server::new(listener, engine);
         let handle = tokio::spawn(async move {

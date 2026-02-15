@@ -167,7 +167,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::Select(select_stmt) => {
                 self.run_in_transaction(false, |engine, txid, cid| async move {
                     let snapshot = engine.tx_manager().snapshot(txid, cid);
-                    let catalog = engine.catalog_snapshot(&snapshot).await?;
+                    let catalog = engine.catalog(&snapshot).await?;
                     let plan = executor::plan_select(select_stmt, &catalog)?;
                     Ok(Some(plan.columns().to_vec()))
                 })
@@ -220,7 +220,6 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::CreateTable(create_stmt) => {
                 self.run_in_transaction(true, |engine, txid, cid| async move {
                     engine.create_table(txid, cid, create_stmt).await?;
-                    engine.register_ddl(txid);
                     Ok(QueryResult::command("CREATE TABLE"))
                 })
                 .await
@@ -228,7 +227,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::Select(select_stmt) => {
                 self.run_in_transaction(false, |engine, txid, cid| async move {
                     let snapshot = engine.tx_manager().snapshot(txid, cid);
-                    let catalog = engine.catalog_snapshot(&snapshot).await?;
+                    let catalog = engine.catalog(&snapshot).await?;
                     let plan = executor::plan_select(select_stmt, &catalog)?;
                     let columns = plan.columns().to_vec();
 
@@ -245,7 +244,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
                 self.run_in_transaction(true, |engine, txid, cid| async move {
                     let snapshot = engine.tx_manager().snapshot(txid, cid);
-                    let catalog = engine.catalog_snapshot(&snapshot).await?;
+                    let catalog = engine.catalog(&snapshot).await?;
                     let plan = match stmt {
                         Statement::Insert(s) => executor::plan_insert(s, &catalog)?,
                         Statement::Update(s) => executor::plan_update(s, &catalog)?,
@@ -265,7 +264,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::Explain(inner_stmt) => {
                 self.run_in_transaction(false, |engine, txid, cid| async move {
                     let snapshot = engine.tx_manager().snapshot(txid, cid);
-                    let catalog = engine.catalog_snapshot(&snapshot).await?;
+                    let catalog = engine.catalog(&snapshot).await?;
                     let explain_text = match inner_stmt.as_ref() {
                         Statement::Select(s) => executor::plan_select(s, &catalog)?.explain(),
                         Statement::Insert(s) => executor::plan_insert(s, &catalog)?.explain(),
@@ -662,21 +661,20 @@ mod tests {
     #[tokio::test]
     async fn test_drop_rolls_back_active_transaction() {
         let engine = open_test_engine().await;
-        let tx_manager = Arc::clone(engine.tx_manager());
 
         let txid = {
-            let mut session = Session::new(engine);
+            let mut session = Session::new(Arc::clone(&engine));
             session.begin();
             let txid = session.transaction().unwrap().txid;
 
             // Transaction should be in-progress before drop
-            assert_eq!(tx_manager.state(txid), TxState::InProgress);
+            assert_eq!(engine.tx_manager().state(txid), TxState::InProgress);
             txid
             // session is dropped here
         };
 
         // After drop, the transaction should be aborted
-        assert_eq!(tx_manager.state(txid), TxState::Aborted);
+        assert_eq!(engine.tx_manager().state(txid), TxState::Aborted);
     }
 
     #[tokio::test]
@@ -883,8 +881,8 @@ mod tests {
         // Before DDL: table should not exist in cached snapshot.
         let txid = engine.tx_manager().begin();
         let snapshot = engine.tx_manager().snapshot(txid, CommandId::FIRST);
-        let snap = engine.catalog_snapshot(&snapshot).await.unwrap();
-        assert!(snap.resolve_table("t").is_none());
+        let catalog = engine.catalog(&snapshot).await.unwrap();
+        assert!(catalog.resolve_table("t").is_none());
         let _ = engine.tx_manager().abort(txid);
 
         session
@@ -895,8 +893,8 @@ mod tests {
         // After auto-commit DDL: table should be visible.
         let txid2 = engine.tx_manager().begin();
         let snapshot2 = engine.tx_manager().snapshot(txid2, CommandId::FIRST);
-        let snap2 = engine.catalog_snapshot(&snapshot2).await.unwrap();
-        assert!(snap2.resolve_table("t").is_some());
+        let catalog2 = engine.catalog(&snapshot2).await.unwrap();
+        assert!(catalog2.resolve_table("t").is_some());
     }
 
     #[tokio::test]
@@ -913,8 +911,8 @@ mod tests {
         // Not yet committed — other sessions should not see the table.
         let txid = engine.tx_manager().begin();
         let snapshot = engine.tx_manager().snapshot(txid, CommandId::FIRST);
-        let snap = engine.catalog_snapshot(&snapshot).await.unwrap();
-        assert!(snap.resolve_table("t").is_none());
+        let catalog = engine.catalog(&snapshot).await.unwrap();
+        assert!(catalog.resolve_table("t").is_none());
         let _ = engine.tx_manager().abort(txid);
 
         session.execute_query("COMMIT").await.unwrap();
@@ -922,8 +920,8 @@ mod tests {
         // After commit, the table should be visible.
         let txid2 = engine.tx_manager().begin();
         let snapshot2 = engine.tx_manager().snapshot(txid2, CommandId::FIRST);
-        let snap2 = engine.catalog_snapshot(&snapshot2).await.unwrap();
-        assert!(snap2.resolve_table("t").is_some());
+        let catalog2 = engine.catalog(&snapshot2).await.unwrap();
+        assert!(catalog2.resolve_table("t").is_some());
     }
 
     #[tokio::test]
@@ -941,7 +939,7 @@ mod tests {
         // DDL was rolled back — table should not exist.
         let txid = engine.tx_manager().begin();
         let snapshot = engine.tx_manager().snapshot(txid, CommandId::FIRST);
-        let snap = engine.catalog_snapshot(&snapshot).await.unwrap();
-        assert!(snap.resolve_table("t").is_none());
+        let catalog = engine.catalog(&snapshot).await.unwrap();
+        assert!(catalog.resolve_table("t").is_none());
     }
 }

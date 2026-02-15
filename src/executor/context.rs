@@ -67,3 +67,10 @@ pub trait ExecContext: Send + Clone {
     /// Sequences are NOT rolled back on transaction abort (following PostgreSQL behavior).
     fn nextval(&self, seq_id: u32) -> impl Future<Output = Result<i64, ExecutorError>> + Send;
 }
+
+// NOTE: All methods return the concrete `ExecutorError` type, which forces
+// `ExecutorError` to include implementation-detail variants such as
+// `Heap(HeapError)`. Adding an associated `type Error` to this trait would
+// let each implementation choose its own error type and keep `ExecutorError`
+// focused on semantic query-execution errors, but this is premature while
+// there is only one implementation.

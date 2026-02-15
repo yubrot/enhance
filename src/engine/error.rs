@@ -24,8 +24,6 @@ pub enum EngineError {
     TransactionAborted,
     /// Table already exists.
     TableAlreadyExists { name: String },
-    /// Sequence not found.
-    SequenceNotFound { seq_id: u32 },
     /// Invalid superblock magic number.
     InvalidMagic { expected: u32, found: u32 },
     /// Unsupported superblock version.
@@ -46,9 +44,6 @@ impl std::fmt::Display for EngineError {
             ),
             EngineError::TableAlreadyExists { name } => {
                 write!(f, "table \"{}\" already exists", name)
-            }
-            EngineError::SequenceNotFound { seq_id } => {
-                write!(f, "sequence {} not found", seq_id)
             }
             EngineError::InvalidMagic { expected, found } => {
                 write!(
@@ -113,7 +108,12 @@ impl From<TxError> for EngineError {
 
 impl From<ExecutorError> for EngineError {
     fn from(e: ExecutorError) -> Self {
-        EngineError::Executor(e)
+        // Normalize implementation-detail variants into EngineError's own
+        // constructors rather than wrapping them opaquely in Executor.
+        match e {
+            ExecutorError::Heap(he) => EngineError::Heap(he),
+            other => EngineError::Executor(other),
+        }
     }
 }
 

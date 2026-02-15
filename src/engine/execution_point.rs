@@ -1,23 +1,14 @@
 //! Concrete execution context backed by an [`Engine`] reference.
-//!
-//! [`ExecutionPoint`] implements the [`ExecContext`](crate::executor::ExecContext)
-//! trait, providing storage operations to executor nodes. It holds an
-//! `Arc<Engine>` and a [`Snapshot`], replacing the previous design that
-//! cloned each engine component individually.
 
 use std::sync::Arc;
 
-use super::core::Engine;
-use super::error::EngineError;
+use super::Engine;
 use crate::executor::{ExecContext, ExecutorError};
 use crate::heap::{Record, TupleId, delete, insert, scan_visible_page, update};
 use crate::storage::{PageId, Replacer, Storage};
 use crate::tx::Snapshot;
 
 /// Concrete [`ExecContext`] backed by an [`Engine`] and a [`Snapshot`].
-///
-/// Owns an `Arc<Engine>` plus a cloned [`Snapshot`] for visibility checks.
-/// Cloning is lightweight (one Arc bump + snapshot clone).
 pub struct ExecutionPoint<S: Storage, R: Replacer> {
     engine: Arc<Engine<S, R>>,
     snapshot: Snapshot,
@@ -98,11 +89,6 @@ impl<S: Storage, R: Replacer> ExecContext for ExecutionPoint<S, R> {
     }
 
     async fn nextval(&self, seq_id: u32) -> Result<i64, ExecutorError> {
-        self.engine.nextval(seq_id).await.map_err(|e| match e {
-            EngineError::SequenceNotFound { seq_id } => ExecutorError::SequenceNotFound { seq_id },
-            EngineError::BufferPool(e) => ExecutorError::Heap(e.into()),
-            EngineError::Heap(e) => ExecutorError::Heap(e),
-            other => ExecutorError::Unsupported(other.to_string()),
-        })
+        self.engine.nextval(seq_id).await
     }
 }

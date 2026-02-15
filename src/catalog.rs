@@ -3,8 +3,8 @@
 //! This module manages metadata about tables, columns, and sequences.
 //! Schema types ([`TableInfo`], [`ColumnInfo`], [`SequenceInfo`]) describe
 //! catalog rows, and [`Catalog`] is the in-memory snapshot used by the
-//! planner and executor. MVCC-aware caching is handled by the
-//! [`Engine`](crate::engine::Engine).
+//! planner and executor. MVCC-aware caching is provided by [`CatalogVC`],
+//! which the [`Engine`](crate::engine::Engine) delegates to.
 //!
 //! ## Catalog Tables
 //!
@@ -20,8 +20,10 @@
 //! which orchestrates the buffer pool, transaction manager, and catalog.
 
 mod schema;
+mod vc;
 
 pub use schema::{ColumnInfo, LAST_RESERVED_TABLE_ID, SequenceInfo, SystemCatalogTable, TableInfo};
+pub use vc::CatalogVC;
 
 use std::collections::HashMap;
 
@@ -47,7 +49,7 @@ pub struct Catalog {
 
 impl Catalog {
     /// Creates a new `Catalog` from preloaded table and column data.
-    pub(crate) fn new(tables: Vec<TableInfo>, columns: Vec<ColumnInfo>) -> Self {
+    pub fn new(tables: Vec<TableInfo>, columns: Vec<ColumnInfo>) -> Self {
         let mut table_ids = HashMap::with_capacity(tables.len());
         let mut table_entries = HashMap::with_capacity(tables.len());
 

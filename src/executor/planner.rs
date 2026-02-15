@@ -22,7 +22,7 @@ use super::{ColumnDesc, ColumnSource};
 /// # Arguments
 ///
 /// * `select` - The parsed SELECT statement
-/// * `catalog` - Catalog snapshot for table/column metadata lookups
+/// * `catalog` - Catalog for table/column metadata lookups
 ///
 /// # Errors
 ///
@@ -76,7 +76,7 @@ pub fn plan_select(select: &SelectStmt, catalog: &Catalog) -> Result<QueryPlan, 
 /// # Arguments
 ///
 /// * `insert` - The parsed INSERT statement
-/// * `catalog` - Catalog snapshot for table/column metadata lookups
+/// * `catalog` - Catalog for table/column metadata lookups
 ///
 /// # Errors
 ///
@@ -450,17 +450,35 @@ fn expand_columns(
 
 #[cfg(test)]
 mod tests {
+    //! NOTE: This module depends on `crate::engine` (a higher layer) for test
+    //! setup. Constructing a `Catalog` requires a running engine with
+    //! bootstrapped system tables, which is prohibitively verbose to set up by
+    //! hand, so we use `Engine` helpers as a pragmatic exception to the normal
+    //! layering direction.
+
+    use std::sync::Arc;
+
     use super::*;
     use crate::catalog::Catalog;
     use crate::engine::tests::open_test_engine;
     use crate::sql::tests::{parse_delete, parse_insert, parse_select, parse_update};
     use crate::tx::CommandId;
 
-    async fn setup_catalog() -> Catalog {
+    async fn setup_catalog() -> Arc<Catalog> {
         let db = open_test_engine().await;
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-        db.load_catalog(&snapshot).await.unwrap()
+        db.catalog(&snapshot).await.unwrap()
+    }
+
+    /// Sets up a catalog with a user-defined table.
+    async fn setup_catalog_with_table(ddl: &str) -> Arc<Catalog> {
+        let db = open_test_engine().await;
+        db.create_test_table(ddl).await;
+
+        let txid = db.tx_manager().begin();
+        let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
+        db.catalog(&snapshot).await.unwrap()
     }
 
     #[tokio::test]
@@ -712,16 +730,6 @@ mod tests {
     }
 
     // --- INSERT planner tests ---
-
-    /// Sets up a catalog snapshot with a user-defined table.
-    async fn setup_catalog_with_table(ddl: &str) -> Catalog {
-        let db = open_test_engine().await;
-        db.create_test_table(ddl).await;
-
-        let txid = db.tx_manager().begin();
-        let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-        db.load_catalog(&snapshot).await.unwrap()
-    }
 
     #[tokio::test]
     async fn test_plan_insert_basic() {
