@@ -12,6 +12,9 @@ pub enum ExecutorError {
     /// Referenced column does not exist.
     ColumnNotFound { name: String },
 
+    /// Sequence not found during nextval.
+    SequenceNotFound { seq_id: u32 },
+
     /// Column reference is ambiguous (matches multiple columns).
     AmbiguousColumn { name: String },
 
@@ -51,9 +54,6 @@ pub enum ExecutorError {
     /// Unsupported operation or feature.
     Unsupported(String),
 
-    /// Sequence not found during nextval.
-    SequenceNotFound { seq_id: u32 },
-
     /// Heap operation error (insert, delete, update).
     Heap(HeapError),
 }
@@ -66,6 +66,9 @@ impl std::fmt::Display for ExecutorError {
             }
             ExecutorError::ColumnNotFound { name } => {
                 write!(f, "column \"{}\" does not exist", name)
+            }
+            ExecutorError::SequenceNotFound { seq_id } => {
+                write!(f, "sequence {} not found", seq_id)
             }
             ExecutorError::AmbiguousColumn { name } => {
                 write!(f, "column reference \"{}\" is ambiguous", name)
@@ -107,9 +110,6 @@ impl std::fmt::Display for ExecutorError {
                 write!(f, "column \"{}\" specified more than once", name)
             }
             ExecutorError::Unsupported(msg) => write!(f, "unsupported: {}", msg),
-            ExecutorError::SequenceNotFound { seq_id } => {
-                write!(f, "sequence {} not found", seq_id)
-            }
             ExecutorError::Heap(e) => write!(f, "{}", e),
         }
     }

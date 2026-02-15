@@ -645,7 +645,10 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> HeapPage<T> {
 mod tests {
     use super::*;
 
-    use crate::storage::{PAGE_VERSION, PageType};
+    use crate::datum::{Type, Value};
+    use crate::heap::Record;
+    use crate::storage::{PAGE_VERSION, PageId, PageType};
+    use crate::tx::{CommandId, Infomask, TupleHeader, TxId};
 
     fn create_slotted_page() -> SlottedPage<Vec<u8>> {
         let mut page = SlottedPage::new(vec![0u8; PAGE_SIZE], HEAP_FOOTER_SIZE);
@@ -859,10 +862,6 @@ mod tests {
 
     #[test]
     fn test_heap_page_insert() {
-        use crate::datum::{Type, Value};
-        use crate::heap::Record;
-        use crate::tx::{CommandId, TxId};
-
         let mut page = create_heap_page();
         let record = Record::new(vec![Value::Integer(42), Value::Text("hello".to_string())]);
 
@@ -884,8 +883,6 @@ mod tests {
 
     #[test]
     fn test_heap_page_get_none_for_deleted_slot() {
-        use crate::datum::Type;
-
         let page = create_heap_page();
         let schema = [Type::Integer];
 
@@ -895,10 +892,6 @@ mod tests {
 
     #[test]
     fn test_heap_page_update_header() {
-        use crate::datum::{Type, Value};
-        use crate::heap::Record;
-        use crate::tx::{CommandId, Infomask, TupleHeader, TxId};
-
         let mut page = create_heap_page();
         let record = Record::new(vec![Value::Integer(100)]);
 
@@ -928,10 +921,6 @@ mod tests {
 
     #[test]
     fn test_heap_page_scan() {
-        use crate::datum::{Type, Value};
-        use crate::heap::Record;
-        use crate::tx::{CommandId, TxId};
-
         let mut page = create_heap_page();
 
         // Insert multiple tuples
@@ -966,10 +955,6 @@ mod tests {
 
     #[test]
     fn test_heap_page_insert_with_null_values() {
-        use crate::datum::{Type, Value};
-        use crate::heap::Record;
-        use crate::tx::{CommandId, TxId};
-
         let mut page = create_heap_page();
         let record = Record::new(vec![
             Value::Integer(42),
@@ -992,8 +977,6 @@ mod tests {
 
     #[test]
     fn test_heap_page_update_header_invalid_slot() {
-        use crate::tx::{CommandId, TupleHeader, TxId};
-
         let mut page = create_heap_page();
         let header = TupleHeader::new(TxId::new(1), CommandId::FIRST);
 
@@ -1005,10 +988,6 @@ mod tests {
 
     #[test]
     fn test_heap_page_update_record_in_place() {
-        use crate::datum::{Type, Value};
-        use crate::heap::Record;
-        use crate::tx::{CommandId, TxId};
-
         let mut page = create_heap_page();
 
         // Insert initial record
@@ -1035,10 +1014,6 @@ mod tests {
 
     #[test]
     fn test_heap_page_update_record_in_place_size_mismatch() {
-        use crate::datum::Value;
-        use crate::heap::Record;
-        use crate::tx::{CommandId, TxId};
-
         let mut page = create_heap_page();
 
         // Insert initial record
@@ -1056,8 +1031,6 @@ mod tests {
 
     #[test]
     fn test_heap_page_next_page_roundtrip() {
-        use crate::storage::PageId;
-
         let mut page = create_heap_page();
 
         // Initially no next page
@@ -1078,8 +1051,6 @@ mod tests {
 
     #[test]
     fn test_heap_page_init_clears_next_page() {
-        use crate::storage::PageId;
-
         let mut page = create_heap_page();
         page.set_next_page(Some(PageId::new(42)));
         assert_eq!(page.next_page(), Some(PageId::new(42)));
@@ -1091,11 +1062,6 @@ mod tests {
 
     #[test]
     fn test_heap_page_next_page_does_not_interfere_with_tuples() {
-        use crate::datum::{Type, Value};
-        use crate::heap::Record;
-        use crate::storage::PageId;
-        use crate::tx::{CommandId, TxId};
-
         let mut page = create_heap_page();
         page.set_next_page(Some(PageId::new(99)));
 
