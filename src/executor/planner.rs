@@ -452,12 +452,12 @@ fn expand_columns(
 mod tests {
     use super::*;
     use crate::catalog::Catalog;
-    use crate::db::tests::open_test_db;
+    use crate::engine::tests::open_test_engine;
     use crate::sql::tests::{parse_delete, parse_insert, parse_select, parse_update};
     use crate::tx::CommandId;
 
     async fn setup_catalog() -> Catalog {
-        let db = open_test_db().await;
+        let db = open_test_engine().await;
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
         Catalog::load(db.catalog_store(), &snapshot).await.unwrap()
@@ -715,7 +715,7 @@ mod tests {
 
     /// Sets up a catalog snapshot with a user-defined table.
     async fn setup_catalog_with_table(ddl: &str) -> Catalog {
-        let db = open_test_db().await;
+        let db = open_test_engine().await;
         db.create_table(ddl).await;
 
         let txid = db.tx_manager().begin();

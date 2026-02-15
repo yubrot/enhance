@@ -1,4 +1,4 @@
-use enhance::db::Database;
+use enhance::engine::Engine;
 use enhance::server::Server;
 use enhance::storage::MemoryStorage;
 use tokio::net::TcpListener;
@@ -26,14 +26,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // let storage = FileStorage::open("enhance.db").await?;
     let storage = MemoryStorage::new();
 
-    // Initialize database (bootstraps catalog if new)
-    let database = Database::open(storage, pool_size).await?;
+    // Initialize engine (bootstraps catalog if new)
+    let engine = Engine::open(storage, pool_size).await?;
 
     // Bind listener
     let listener = TcpListener::bind(addr).await?;
 
     // Create and run server
-    let server = Server::new(listener, database);
+    let server = Server::new(listener, engine);
     server.serve().await?;
 
     Ok(())

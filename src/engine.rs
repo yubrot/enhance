@@ -1,6 +1,6 @@
-//! Database orchestrator for managing buffer pool, transaction manager, and catalog.
+//! Engine orchestrator for managing buffer pool, transaction manager, and catalog.
 //!
-//! The [`Database`] type is the main entry point for database infrastructure.
+//! The [`Engine`] type is the main entry point for database infrastructure.
 //! It initializes or opens an existing database and provides access to
 //! the core components (buffer pool, transaction manager, catalog).
 //!
@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! +------------------------------------------------------------------+
-//! |                         Database                                 |
+//! |                          Engine                                   |
 //! |  (Orchestrates core infrastructure components)                   |
 //! |                                                                  |
 //! |  +-----------------+  +--------------------+  +---------------+  |
@@ -26,13 +26,13 @@
 //!       +---------------------+
 //! ```
 
-mod database;
+mod core;
 mod error;
 
-pub use database::Database;
-pub use error::DatabaseError;
+pub use core::Engine;
+pub use error::EngineError;
 
-/// Test helpers for database-layer tests used across multiple test modules.
+/// Test helpers for engine-layer tests used across multiple test modules.
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -40,15 +40,15 @@ pub mod tests {
     use crate::storage::{LruReplacer, MemoryStorage};
     use crate::tx::CommandId;
 
-    /// Type alias for a test database backed by in-memory storage.
-    pub type TestDb = Database<MemoryStorage, LruReplacer>;
+    /// Type alias for a test engine backed by in-memory storage.
+    pub type TestEngine = Engine<MemoryStorage, LruReplacer>;
 
-    /// Opens a test database with in-memory storage and 100-frame buffer pool.
-    pub async fn open_test_db() -> TestDb {
-        Database::open(MemoryStorage::new(), 100).await.unwrap()
+    /// Opens a test engine with in-memory storage and 100-frame buffer pool.
+    pub async fn open_test_engine() -> TestEngine {
+        Engine::open(MemoryStorage::new(), 100).await.unwrap()
     }
 
-    impl TestDb {
+    impl TestEngine {
         /// Creates a table using the given DDL and commits it in its own transaction.
         ///
         /// Parses the DDL string as a `CREATE TABLE` statement, executes it within

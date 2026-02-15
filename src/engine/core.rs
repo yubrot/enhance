@@ -1,25 +1,25 @@
-//! Database orchestrator for buffer pool, transaction manager, and catalog.
+//! Engine orchestrator for buffer pool, transaction manager, and catalog.
 
 use std::sync::Arc;
 
-use super::error::DatabaseError;
+use super::error::EngineError;
 use crate::catalog::{Catalog, CatalogCache, CatalogError, CatalogStore};
 use crate::executor::ExecContextImpl;
 use crate::storage::{BufferPool, LruReplacer, Replacer, Storage};
 use crate::tx::{Snapshot, TransactionManager};
 
-/// Database orchestrates the core components: BufferPool, TransactionManager, and CatalogStore.
+/// Engine orchestrates the core components: BufferPool, TransactionManager, and CatalogStore.
 ///
 /// This is the main entry point for database operations. It initializes or opens
 /// an existing database and provides access to its components.
-pub struct Database<S: Storage, R: Replacer> {
+pub struct Engine<S: Storage, R: Replacer> {
     pool: Arc<BufferPool<S, R>>,
     tx_manager: Arc<TransactionManager>,
     catalog_store: CatalogStore<S, R>,
     catalog_cache: CatalogCache,
 }
 
-impl<S: Storage> Database<S, LruReplacer> {
+impl<S: Storage> Engine<S, LruReplacer> {
     /// Opens or initializes a database with LRU replacement policy.
     ///
     /// If the storage is empty (page_count == 0), bootstraps a new database.
@@ -35,13 +35,13 @@ impl<S: Storage> Database<S, LruReplacer> {
     /// Returns an error if:
     /// - Storage I/O fails
     /// - Superblock validation fails (invalid magic or version)
-    pub async fn open(storage: S, pool_size: usize) -> Result<Self, DatabaseError> {
+    pub async fn open(storage: S, pool_size: usize) -> Result<Self, EngineError> {
         let replacer = LruReplacer::new(pool_size);
         Self::open_with_replacer(storage, replacer, pool_size).await
     }
 }
 
-impl<S: Storage, R: Replacer> Database<S, R> {
+impl<S: Storage, R: Replacer> Engine<S, R> {
     /// Opens or initializes a database with a custom replacement policy.
     ///
     /// If the storage is empty (page_count == 0), bootstraps a new database.
@@ -56,7 +56,7 @@ impl<S: Storage, R: Replacer> Database<S, R> {
         storage: S,
         replacer: R,
         pool_size: usize,
-    ) -> Result<Self, DatabaseError> {
+    ) -> Result<Self, EngineError> {
         let pool = Arc::new(BufferPool::new(storage, replacer, pool_size));
         let tx_manager = Arc::new(TransactionManager::new());
 
@@ -120,7 +120,7 @@ impl<S: Storage, R: Replacer> Database<S, R> {
     /// Flushes all dirty pages to storage.
     ///
     /// This ensures all changes are persisted to disk.
-    pub async fn flush(&self) -> Result<(), DatabaseError> {
+    pub async fn flush(&self) -> Result<(), EngineError> {
         self.pool.flush_all().await?;
         Ok(())
     }
@@ -133,24 +133,24 @@ mod tests {
     use crate::storage::MemoryStorage;
 
     #[tokio::test]
-    async fn test_database_open() {
+    async fn test_engine_open() {
         let storage = Arc::new(MemoryStorage::new());
         // First open: should bootstrap a new database
         {
-            let db = Database::open(Arc::clone(&storage), 100).await.unwrap();
+            let engine = Engine::open(Arc::clone(&storage), 100).await.unwrap();
 
             // Verify catalog is initialized
-            let sb = db.catalog_store().superblock();
+            let sb = engine.catalog_store().superblock();
             assert_eq!(sb.next_table_id, LAST_RESERVED_TABLE_ID + 1);
-            assert!(db.pool().page_count().await > 0);
+            assert!(engine.pool().page_count().await > 0);
         };
 
         // Second open: should open existing database (not bootstrap)
         {
-            let db = Database::open(storage, 100).await.unwrap();
+            let engine = Engine::open(storage, 100).await.unwrap();
 
             // Verify catalog was opened (not re-bootstrapped)
-            let sb = db.catalog_store().superblock();
+            let sb = engine.catalog_store().superblock();
             assert_eq!(sb.next_table_id, LAST_RESERVED_TABLE_ID + 1);
         }
     }

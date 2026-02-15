@@ -11,7 +11,7 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
 use crate::datum::Value;
-use crate::db::Database;
+use crate::engine::Engine;
 use crate::protocol::{
     BackendMessage, BindMessage, CloseMessage, CloseTarget, DataValue, DescribeMessage,
     DescribeTarget, ErrorInfo, ExecuteMessage, FieldDescription, FormatCode, FrontendMessage,
@@ -44,17 +44,17 @@ pub struct Connection<S: Storage, R: Replacer> {
 }
 
 impl<S: Storage, R: Replacer> Connection<S, R> {
-    /// Creates a new connection with the given database.
+    /// Creates a new connection with the given engine.
     pub fn new(
         framed: Framed<TcpStream, PostgresCodec>,
         pid: i32,
-        database: Arc<Database<S, R>>,
+        engine: Arc<Engine<S, R>>,
     ) -> Self {
         Self {
             framed,
             pid,
             state: ConnectionState::new(),
-            session: Session::new(database),
+            session: Session::new(engine),
         }
     }
 

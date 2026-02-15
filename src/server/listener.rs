@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use tokio::net::TcpListener;
 
-use crate::db::Database;
+use crate::engine::Engine;
 use crate::server::connection::Connection;
 use crate::server::handshake::{Handshake, HandshakeResult};
 use crate::server::registry::Registry;
@@ -14,17 +14,17 @@ pub struct Server<S: Storage, R: Replacer> {
     listener: TcpListener,
     next_pid: Arc<AtomicI32>,
     registry: Arc<Registry>,
-    database: Arc<Database<S, R>>,
+    engine: Arc<Engine<S, R>>,
 }
 
 impl<S: Storage + 'static, R: Replacer + 'static> Server<S, R> {
-    /// Creates a new server with a given listener and database.
-    pub fn new(listener: TcpListener, database: Database<S, R>) -> Self {
+    /// Creates a new server with a given listener and engine.
+    pub fn new(listener: TcpListener, engine: Engine<S, R>) -> Self {
         Self {
             listener,
             next_pid: Arc::new(AtomicI32::new(1)),
             registry: Arc::new(Registry::new()),
-            database: Arc::new(database),
+            engine: Arc::new(engine),
         }
     }
 
@@ -61,7 +61,7 @@ impl<S: Storage + 'static, R: Replacer + 'static> Server<S, R> {
             let (socket, peer_addr) = self.listener.accept().await?;
             let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
             let registry = self.registry.clone();
-            let database = self.database.clone();
+            let engine = self.engine.clone();
 
             println!("(pid={}) Accepted connection from {}", pid, peer_addr);
 
@@ -70,7 +70,7 @@ impl<S: Storage + 'static, R: Replacer + 'static> Server<S, R> {
                 let (mut connection, secret_key) = match handshake.run().await {
                     Ok(HandshakeResult::Success { framed, secret_key }) => {
                         println!("(pid={}) Connection ready", pid);
-                        (Connection::new(framed, pid, database), secret_key)
+                        (Connection::new(framed, pid, engine), secret_key)
                     }
                     Ok(HandshakeResult::CancelRequested {
                         pid: target_pid,

@@ -1,6 +1,6 @@
 pub mod catalog;
 pub mod datum;
-pub mod db;
+pub mod engine;
 pub mod executor;
 pub mod heap;
 pub mod protocol;

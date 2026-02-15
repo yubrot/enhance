@@ -40,7 +40,7 @@
 //!
 //! ## Usage
 //!
-//! The catalog is accessed through the [`Database`](crate::db::Database) type,
+//! The catalog is accessed through the [`Engine`](crate::engine::Engine) type,
 //! which orchestrates the buffer pool, transaction manager, and catalog.
 
 mod cache;

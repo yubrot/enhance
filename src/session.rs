@@ -2,13 +2,12 @@
 //!
 //! The [`Session`] type represents a single client session and manages
 //! transaction state and SQL execution. It sits between the protocol layer
-//! (Connection) and the infrastructure layer (Database).
+//! (Connection) and the infrastructure layer (Engine).
 
 use std::future::Future;
 use std::sync::Arc;
 
-use crate::db::Database;
-use crate::db::DatabaseError;
+use crate::engine::{Engine, EngineError};
 use crate::executor::{self, ColumnDesc, Row};
 use crate::sql::{Parser, Statement};
 use crate::storage::{Replacer, Storage};
@@ -54,7 +53,7 @@ pub struct TransactionState {
 /// A client session managing transaction state and SQL execution.
 ///
 /// Session provides the business logic layer between the protocol layer
-/// (Connection) and the infrastructure layer (Database). It handles:
+/// (Connection) and the infrastructure layer (Engine). It handles:
 /// - Transaction lifecycle (BEGIN/COMMIT/ROLLBACK)
 /// - Auto-commit mode for individual statements
 /// - SQL parsing and execution coordination
@@ -65,7 +64,7 @@ pub struct TransactionState {
 /// automatically rolled back. This prevents zombie transactions from accumulating
 /// in the transaction manager (e.g., when a client disconnects unexpectedly).
 pub struct Session<S: Storage, R: Replacer> {
-    database: Arc<Database<S, R>>,
+    engine: Arc<Engine<S, R>>,
     transaction: Option<TransactionState>,
 }
 
@@ -76,17 +75,17 @@ impl<S: Storage, R: Replacer> Drop for Session<S, R> {
 }
 
 impl<S: Storage, R: Replacer> Session<S, R> {
-    /// Creates a new session with the given database.
-    pub fn new(database: Arc<Database<S, R>>) -> Self {
+    /// Creates a new session with the given engine.
+    pub fn new(engine: Arc<Engine<S, R>>) -> Self {
         Self {
-            database,
+            engine,
             transaction: None,
         }
     }
 
-    /// Returns a reference to the underlying database.
-    pub fn database(&self) -> &Arc<Database<S, R>> {
-        &self.database
+    /// Returns a reference to the underlying engine.
+    pub fn engine(&self) -> &Arc<Engine<S, R>> {
+        &self.engine
     }
 
     /// Returns the current transaction state, if any.
@@ -99,7 +98,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
     /// If already in a transaction, this is a no-op (following PostgreSQL behavior).
     pub fn begin(&mut self) {
         if self.transaction.is_none() {
-            let txid = self.database.tx_manager().begin();
+            let txid = self.engine.tx_manager().begin();
             self.transaction = Some(TransactionState {
                 txid,
                 cid: CommandId::FIRST,
@@ -115,9 +114,9 @@ impl<S: Storage, R: Replacer> Session<S, R> {
     /// # Errors
     ///
     /// Returns an error if the transaction manager fails to commit.
-    pub fn commit(&mut self) -> Result<(), DatabaseError> {
+    pub fn commit(&mut self) -> Result<(), EngineError> {
         if let Some(tx) = self.transaction.take() {
-            self.database.tx_manager().commit(tx.txid)?;
+            self.engine.tx_manager().commit(tx.txid)?;
         }
         Ok(())
     }
@@ -127,7 +126,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
     /// If not in a transaction, this is a no-op.
     pub fn rollback(&mut self) {
         if let Some(tx) = self.transaction.take() {
-            let _ = self.database.tx_manager().abort(tx.txid);
+            let _ = self.engine.tx_manager().abort(tx.txid);
         }
     }
 
@@ -139,16 +138,13 @@ impl<S: Storage, R: Replacer> Session<S, R> {
     ///
     /// * `Ok(None)` - Empty query (no statement parsed)
     /// * `Ok(Some(QueryResult))` - Execution result
-    /// * `Err(DatabaseError::Parse)` - If SQL parsing fails
-    /// * `Err(DatabaseError::*)` - If execution fails
-    pub async fn execute_query(
-        &mut self,
-        query: &str,
-    ) -> Result<Option<QueryResult>, DatabaseError> {
+    /// * `Err(EngineError::Parse)` - If SQL parsing fails
+    /// * `Err(EngineError::*)` - If execution fails
+    pub async fn execute_query(&mut self, query: &str) -> Result<Option<QueryResult>, EngineError> {
         match Parser::new(query).parse() {
             Ok(None) => Ok(None),
             Ok(Some(stmt)) => Ok(Some(self.execute_statement(&stmt).await?)),
-            Err(err) => Err(DatabaseError::Parse(err)),
+            Err(err) => Err(EngineError::Parse(err)),
         }
     }
 
@@ -166,12 +162,12 @@ impl<S: Storage, R: Replacer> Session<S, R> {
     pub async fn describe_statement(
         &mut self,
         stmt: &Statement,
-    ) -> Result<Option<Vec<ColumnDesc>>, DatabaseError> {
+    ) -> Result<Option<Vec<ColumnDesc>>, EngineError> {
         match stmt {
             Statement::Select(select_stmt) => {
-                self.run_in_transaction(false, |db, txid, cid| async move {
-                    let snapshot = db.tx_manager().snapshot(txid, cid);
-                    let catalog = db.catalog_snapshot(&snapshot).await?;
+                self.run_in_transaction(false, |engine, txid, cid| async move {
+                    let snapshot = engine.tx_manager().snapshot(txid, cid);
+                    let catalog = engine.catalog_snapshot(&snapshot).await?;
                     let plan = executor::plan_select(select_stmt, &catalog)?;
                     Ok(Some(plan.columns().to_vec()))
                 })
@@ -196,11 +192,11 @@ impl<S: Storage, R: Replacer> Session<S, R> {
     /// # Returns
     ///
     /// * `Ok(QueryResult)` - Execution result with command tag
-    /// * `Err(DatabaseError)` - If execution fails
+    /// * `Err(EngineError)` - If execution fails
     pub async fn execute_statement(
         &mut self,
         stmt: &Statement,
-    ) -> Result<QueryResult, DatabaseError> {
+    ) -> Result<QueryResult, EngineError> {
         match stmt {
             Statement::Begin => {
                 self.begin();
@@ -222,24 +218,27 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 Ok(QueryResult::command("ROLLBACK"))
             }
             Statement::CreateTable(create_stmt) => {
-                self.run_in_transaction(true, |db, txid, cid| async move {
-                    db.catalog_store()
+                self.run_in_transaction(true, |engine, txid, cid| async move {
+                    engine
+                        .catalog_store()
                         .create_table(txid, cid, create_stmt)
                         .await
-                        .map_err(DatabaseError::Catalog)?;
-                    db.catalog_cache().register_ddl(txid, db.tx_manager());
+                        .map_err(EngineError::Catalog)?;
+                    engine
+                        .catalog_cache()
+                        .register_ddl(txid, engine.tx_manager());
                     Ok(QueryResult::command("CREATE TABLE"))
                 })
                 .await
             }
             Statement::Select(select_stmt) => {
-                self.run_in_transaction(false, |db, txid, cid| async move {
-                    let snapshot = db.tx_manager().snapshot(txid, cid);
-                    let catalog = db.catalog_snapshot(&snapshot).await?;
+                self.run_in_transaction(false, |engine, txid, cid| async move {
+                    let snapshot = engine.tx_manager().snapshot(txid, cid);
+                    let catalog = engine.catalog_snapshot(&snapshot).await?;
                     let plan = executor::plan_select(select_stmt, &catalog)?;
                     let columns = plan.columns().to_vec();
 
-                    let ctx = db.exec_context(snapshot);
+                    let ctx = engine.exec_context(snapshot);
                     let mut node = plan.prepare_for_execute(&ctx);
                     let mut rows = Vec::new();
                     while let Some(row) = node.next().await? {
@@ -250,16 +249,16 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                 .await
             }
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
-                self.run_in_transaction(true, |db, txid, cid| async move {
-                    let snapshot = db.tx_manager().snapshot(txid, cid);
-                    let catalog = db.catalog_snapshot(&snapshot).await?;
+                self.run_in_transaction(true, |engine, txid, cid| async move {
+                    let snapshot = engine.tx_manager().snapshot(txid, cid);
+                    let catalog = engine.catalog_snapshot(&snapshot).await?;
                     let plan = match stmt {
                         Statement::Insert(s) => executor::plan_insert(s, &catalog)?,
                         Statement::Update(s) => executor::plan_update(s, &catalog)?,
                         Statement::Delete(s) => executor::plan_delete(s, &catalog)?,
                         _ => unreachable!(),
                     };
-                    let ctx = db.exec_context(snapshot);
+                    let ctx = engine.exec_context(snapshot);
                     let result = plan.execute_dml(&ctx).await?;
                     Ok(QueryResult::command(result.command_tag()))
                 })
@@ -270,16 +269,16 @@ impl<S: Storage, R: Replacer> Session<S, R> {
             Statement::DropIndex(_) => Ok(QueryResult::command("DROP INDEX")),
             Statement::Set(_) => Ok(QueryResult::command("SET")),
             Statement::Explain(inner_stmt) => {
-                self.run_in_transaction(false, |db, txid, cid| async move {
-                    let snapshot = db.tx_manager().snapshot(txid, cid);
-                    let catalog = db.catalog_snapshot(&snapshot).await?;
+                self.run_in_transaction(false, |engine, txid, cid| async move {
+                    let snapshot = engine.tx_manager().snapshot(txid, cid);
+                    let catalog = engine.catalog_snapshot(&snapshot).await?;
                     let explain_text = match inner_stmt.as_ref() {
                         Statement::Select(s) => executor::plan_select(s, &catalog)?.explain(),
                         Statement::Insert(s) => executor::plan_insert(s, &catalog)?.explain(),
                         Statement::Update(s) => executor::plan_update(s, &catalog)?.explain(),
                         Statement::Delete(s) => executor::plan_delete(s, &catalog)?.explain(),
                         _ => {
-                            return Err(DatabaseError::Executor(
+                            return Err(EngineError::Executor(
                                 crate::executor::ExecutorError::Unsupported(
                                     "EXPLAIN for this statement type".to_string(),
                                 ),
@@ -309,34 +308,34 @@ impl<S: Storage, R: Replacer> Session<S, R> {
         &mut self,
         commit_on_auto: bool,
         f: F,
-    ) -> Result<T, DatabaseError>
+    ) -> Result<T, EngineError>
     where
-        F: FnOnce(Arc<Database<S, R>>, TxId, CommandId) -> Fut,
-        Fut: Future<Output = Result<T, DatabaseError>>,
+        F: FnOnce(Arc<Engine<S, R>>, TxId, CommandId) -> Fut,
+        Fut: Future<Output = Result<T, EngineError>>,
     {
         let (txid, cid, auto_commit) = match &mut self.transaction {
             Some(tx) if !tx.failed => {
                 tx.cid = tx.cid.next();
                 (tx.txid, tx.cid, false)
             }
-            Some(_) => return Err(DatabaseError::TransactionAborted),
-            None => (self.database.tx_manager().begin(), CommandId::FIRST, true),
+            Some(_) => return Err(EngineError::TransactionAborted),
+            None => (self.engine.tx_manager().begin(), CommandId::FIRST, true),
         };
 
-        match f(Arc::clone(&self.database), txid, cid).await {
+        match f(Arc::clone(&self.engine), txid, cid).await {
             Ok(result) => {
                 if auto_commit {
                     if commit_on_auto {
-                        self.database.tx_manager().commit(txid)?;
+                        self.engine.tx_manager().commit(txid)?;
                     } else {
-                        let _ = self.database.tx_manager().abort(txid);
+                        let _ = self.engine.tx_manager().abort(txid);
                     }
                 }
                 Ok(result)
             }
             Err(e) => {
                 if auto_commit {
-                    let _ = self.database.tx_manager().abort(txid);
+                    let _ = self.engine.tx_manager().abort(txid);
                 } else if let Some(tx) = &mut self.transaction {
                     tx.failed = true;
                 }
@@ -350,17 +349,17 @@ impl<S: Storage, R: Replacer> Session<S, R> {
 mod tests {
     use super::*;
     use crate::datum::Value;
-    use crate::db::tests::open_test_db;
+    use crate::engine::tests::open_test_engine;
     use crate::storage::{LruReplacer, MemoryStorage};
     use crate::tx::TxState;
 
     /// Type alias for a test session backed by in-memory storage.
     pub type TestSession = Session<MemoryStorage, LruReplacer>;
 
-    /// Opens a test database and creates a [`Session`] connected to it.
+    /// Opens a test engine and creates a [`Session`] connected to it.
     pub async fn open_test_session() -> TestSession {
-        let db = Arc::new(open_test_db().await);
-        Session::new(db)
+        let engine = Arc::new(open_test_engine().await);
+        Session::new(engine)
     }
 
     impl TestSession {
@@ -473,7 +472,7 @@ mod tests {
         let mut session = open_test_session().await;
 
         let result = session.execute_query("INVALID SQL").await;
-        assert!(matches!(result, Err(DatabaseError::Parse(_))));
+        assert!(matches!(result, Err(EngineError::Parse(_))));
     }
 
     #[tokio::test]
@@ -628,7 +627,7 @@ mod tests {
 
         // Cause an error within the transaction
         let result = session.execute_query("SELECT * FROM nonexistent").await;
-        assert!(matches!(result, Err(DatabaseError::Executor(_))));
+        assert!(matches!(result, Err(EngineError::Executor(_))));
 
         // Transaction should be marked as failed
         assert!(matches!(
@@ -638,7 +637,7 @@ mod tests {
 
         // Subsequent commands should be rejected with TransactionAborted
         let result = session.execute_query("SELECT 1").await;
-        assert!(matches!(result, Err(DatabaseError::TransactionAborted)));
+        assert!(matches!(result, Err(EngineError::TransactionAborted)));
 
         // ROLLBACK should clear the failed state
         session.execute_query("ROLLBACK").await.unwrap();
@@ -654,7 +653,7 @@ mod tests {
         let mut session = open_test_session().await;
 
         let result = session.execute_query("SELECT * FROM nonexistent").await;
-        assert!(matches!(result, Err(DatabaseError::Executor(_))));
+        assert!(matches!(result, Err(EngineError::Executor(_))));
     }
 
     #[tokio::test]
@@ -664,16 +663,16 @@ mod tests {
         let result = session
             .execute_query("SELECT nonexistent_col FROM sys_tables")
             .await;
-        assert!(matches!(result, Err(DatabaseError::Executor(_))));
+        assert!(matches!(result, Err(EngineError::Executor(_))));
     }
 
     #[tokio::test]
     async fn test_drop_rolls_back_active_transaction() {
-        let db = Arc::new(open_test_db().await);
-        let tx_manager = Arc::clone(db.tx_manager());
+        let engine = Arc::new(open_test_engine().await);
+        let tx_manager = Arc::clone(engine.tx_manager());
 
         let txid = {
-            let mut session = Session::new(db);
+            let mut session = Session::new(engine);
             session.begin();
             let txid = session.transaction().unwrap().txid;
 
@@ -689,10 +688,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_without_transaction_is_noop() {
-        let db = Arc::new(open_test_db().await);
+        let engine = Arc::new(open_test_engine().await);
 
         // Session with no transaction — drop should not panic
-        let session = Session::new(db);
+        let session = Session::new(engine);
         drop(session);
     }
 
@@ -871,7 +870,7 @@ mod tests {
         let result = session
             .execute_query("INSERT INTO nonexistent VALUES (1)")
             .await;
-        assert!(matches!(result, Err(DatabaseError::Executor(_))));
+        assert!(matches!(result, Err(EngineError::Executor(_))));
 
         // Auto-commit transaction should be aborted; session should be idle
         assert!(session.transaction().is_none());
@@ -885,15 +884,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_catalog_cache_reflects_auto_commit_ddl() {
-        let db = Arc::new(open_test_db().await);
-        let mut session = Session::new(Arc::clone(&db));
+        let engine = Arc::new(open_test_engine().await);
+        let mut session = Session::new(Arc::clone(&engine));
 
         // Before DDL: table should not exist in cached snapshot.
-        let txid = db.tx_manager().begin();
-        let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-        let snap = db.catalog_snapshot(&snapshot).await.unwrap();
+        let txid = engine.tx_manager().begin();
+        let snapshot = engine.tx_manager().snapshot(txid, CommandId::FIRST);
+        let snap = engine.catalog_snapshot(&snapshot).await.unwrap();
         assert!(snap.resolve_table("t").is_none());
-        let _ = db.tx_manager().abort(txid);
+        let _ = engine.tx_manager().abort(txid);
 
         session
             .execute_query("CREATE TABLE t (id INTEGER)")
@@ -901,16 +900,16 @@ mod tests {
             .unwrap();
 
         // After auto-commit DDL: table should be visible.
-        let txid2 = db.tx_manager().begin();
-        let snapshot2 = db.tx_manager().snapshot(txid2, CommandId::FIRST);
-        let snap2 = db.catalog_snapshot(&snapshot2).await.unwrap();
+        let txid2 = engine.tx_manager().begin();
+        let snapshot2 = engine.tx_manager().snapshot(txid2, CommandId::FIRST);
+        let snap2 = engine.catalog_snapshot(&snapshot2).await.unwrap();
         assert!(snap2.resolve_table("t").is_some());
     }
 
     #[tokio::test]
     async fn test_catalog_cache_reflects_explicit_commit_ddl() {
-        let db = Arc::new(open_test_db().await);
-        let mut session = Session::new(Arc::clone(&db));
+        let engine = Arc::new(open_test_engine().await);
+        let mut session = Session::new(Arc::clone(&engine));
 
         session.execute_query("BEGIN").await.unwrap();
         session
@@ -919,25 +918,25 @@ mod tests {
             .unwrap();
 
         // Not yet committed — other sessions should not see the table.
-        let txid = db.tx_manager().begin();
-        let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-        let snap = db.catalog_snapshot(&snapshot).await.unwrap();
+        let txid = engine.tx_manager().begin();
+        let snapshot = engine.tx_manager().snapshot(txid, CommandId::FIRST);
+        let snap = engine.catalog_snapshot(&snapshot).await.unwrap();
         assert!(snap.resolve_table("t").is_none());
-        let _ = db.tx_manager().abort(txid);
+        let _ = engine.tx_manager().abort(txid);
 
         session.execute_query("COMMIT").await.unwrap();
 
         // After commit, the table should be visible.
-        let txid2 = db.tx_manager().begin();
-        let snapshot2 = db.tx_manager().snapshot(txid2, CommandId::FIRST);
-        let snap2 = db.catalog_snapshot(&snapshot2).await.unwrap();
+        let txid2 = engine.tx_manager().begin();
+        let snapshot2 = engine.tx_manager().snapshot(txid2, CommandId::FIRST);
+        let snap2 = engine.catalog_snapshot(&snapshot2).await.unwrap();
         assert!(snap2.resolve_table("t").is_some());
     }
 
     #[tokio::test]
     async fn test_catalog_cache_not_updated_on_rollback() {
-        let db = Arc::new(open_test_db().await);
-        let mut session = Session::new(Arc::clone(&db));
+        let engine = Arc::new(open_test_engine().await);
+        let mut session = Session::new(Arc::clone(&engine));
 
         session.execute_query("BEGIN").await.unwrap();
         session
@@ -947,9 +946,9 @@ mod tests {
         session.execute_query("ROLLBACK").await.unwrap();
 
         // DDL was rolled back — table should not exist.
-        let txid = db.tx_manager().begin();
-        let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-        let snap = db.catalog_snapshot(&snapshot).await.unwrap();
+        let txid = engine.tx_manager().begin();
+        let snapshot = engine.tx_manager().snapshot(txid, CommandId::FIRST);
+        let snap = engine.catalog_snapshot(&snapshot).await.unwrap();
         assert!(snap.resolve_table("t").is_none());
     }
 }

@@ -439,7 +439,7 @@ mod tests {
     use super::*;
     use crate::catalog::Catalog;
     use crate::datum::{Type, Value};
-    use crate::db::tests::{TestDb, open_test_db};
+    use crate::engine::tests::{TestEngine, open_test_engine};
     use crate::executor::ExecContextImpl;
     use crate::executor::tests::{bind_expr, int_col};
     use crate::heap::{HeapPage, Record};
@@ -452,8 +452,8 @@ mod tests {
     /// Creates a test database with `CREATE TABLE test (id INT)` and inserts
     /// the given values via direct heap page writes. Returns the database
     /// and the table's first page ID.
-    async fn setup_int_table(values: Vec<i64>) -> (TestDb, PageId) {
-        let db = open_test_db().await;
+    async fn setup_int_table(values: Vec<i64>) -> (TestEngine, PageId) {
+        let db = open_test_engine().await;
         db.create_table("CREATE TABLE test (id INT)").await;
 
         let txid = db.tx_manager().begin();
@@ -477,8 +477,8 @@ mod tests {
 
     /// Creates a test database with `CREATE TABLE test (id INT, name TEXT)` and
     /// inserts the given rows. Returns the database and the table's first page ID.
-    async fn setup_two_col_table(rows: Vec<(i64, &str)>) -> (TestDb, PageId) {
-        let db = open_test_db().await;
+    async fn setup_two_col_table(rows: Vec<(i64, &str)>) -> (TestEngine, PageId) {
+        let db = open_test_engine().await;
         db.create_table("CREATE TABLE test (id INT, name TEXT)")
             .await;
 
@@ -502,7 +502,7 @@ mod tests {
     }
 
     /// Creates an ExecContext from a database with a fresh read-only snapshot.
-    fn read_ctx(db: &TestDb) -> TestCtx {
+    fn read_ctx(db: &TestEngine) -> TestCtx {
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
         db.exec_context(snapshot)
@@ -726,7 +726,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_values_scan() {
-        let db = open_test_db().await;
+        let db = open_test_engine().await;
         let ctx = read_ctx(&db);
 
         let plan = QueryPlan::Projection {
@@ -749,8 +749,8 @@ mod tests {
     /// Helper: create a table and return db, snapshot, and catalog snapshot for planning.
     async fn setup_table_and_ctx(
         ddl: &str,
-    ) -> (TestDb, crate::tx::Snapshot, crate::catalog::Catalog) {
-        let db = open_test_db().await;
+    ) -> (TestEngine, crate::tx::Snapshot, crate::catalog::Catalog) {
+        let db = open_test_engine().await;
         db.create_table(ddl).await;
 
         let txid = db.tx_manager().begin();
