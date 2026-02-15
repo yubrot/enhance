@@ -5,6 +5,7 @@ pub mod executor;
 pub mod heap;
 pub mod protocol;
 pub mod server;
+pub mod session;
 pub mod sql;
 pub mod storage;
 pub mod tx;

@@ -11,12 +11,13 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
 use crate::datum::Value;
-use crate::db::{Database, QueryResult, Session};
+use crate::db::Database;
 use crate::protocol::{
     BackendMessage, BindMessage, CloseMessage, CloseTarget, DataValue, DescribeMessage,
     DescribeTarget, ErrorInfo, ExecuteMessage, FieldDescription, FormatCode, FrontendMessage,
     ParseMessage, PostgresCodec, TransactionStatus, sql_state,
 };
+use crate::session::{QueryResult, Session};
 use crate::sql::Parser;
 use crate::storage::{Replacer, Storage};
 

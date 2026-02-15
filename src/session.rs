@@ -7,8 +7,8 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use super::Database;
-use super::error::DatabaseError;
+use crate::db::Database;
+use crate::db::DatabaseError;
 use crate::executor::{self, ColumnDesc, Row};
 use crate::sql::{Parser, Statement};
 use crate::storage::{Replacer, Storage};
@@ -350,8 +350,42 @@ impl<S: Storage, R: Replacer> Session<S, R> {
 mod tests {
     use super::*;
     use crate::datum::Value;
-    use crate::db::tests::{open_test_db, open_test_session};
+    use crate::db::tests::open_test_db;
+    use crate::storage::{LruReplacer, MemoryStorage};
     use crate::tx::TxState;
+
+    /// Type alias for a test session backed by in-memory storage.
+    pub type TestSession = Session<MemoryStorage, LruReplacer>;
+
+    /// Opens a test database and creates a [`Session`] connected to it.
+    pub async fn open_test_session() -> TestSession {
+        let db = Arc::new(open_test_db().await);
+        Session::new(db)
+    }
+
+    impl TestSession {
+        /// Executes a query and extracts the `Rows` result.
+        ///
+        /// Panics if the query fails, returns no result, or returns a `Command`.
+        pub async fn query_rows(&mut self, sql: &str) -> (Vec<ColumnDesc>, Vec<Row>) {
+            let result = self.execute_query(sql).await.unwrap().unwrap();
+            let QueryResult::Rows { columns, rows } = result else {
+                panic!("expected Rows result from: {sql}");
+            };
+            (columns, rows)
+        }
+
+        /// Executes a statement and extracts the command tag.
+        ///
+        /// Panics if the query fails, returns no result, or returns `Rows`.
+        pub async fn execute_command(&mut self, sql: &str) -> String {
+            let result = self.execute_query(sql).await.unwrap().unwrap();
+            let QueryResult::Command { tag } = result else {
+                panic!("expected Command result from: {sql}");
+            };
+            tag
+        }
+    }
 
     #[tokio::test]
     async fn test_session_transaction_lifecycle() {
