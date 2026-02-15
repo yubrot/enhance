@@ -19,12 +19,12 @@ pub struct Server<S: Storage, R: Replacer> {
 
 impl<S: Storage + 'static, R: Replacer + 'static> Server<S, R> {
     /// Creates a new server with a given listener and engine.
-    pub fn new(listener: TcpListener, engine: Engine<S, R>) -> Self {
+    pub fn new(listener: TcpListener, engine: Arc<Engine<S, R>>) -> Self {
         Self {
             listener,
             next_pid: Arc::new(AtomicI32::new(1)),
             registry: Arc::new(Registry::new()),
-            engine: Arc::new(engine),
+            engine,
         }
     }
 

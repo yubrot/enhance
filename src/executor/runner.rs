@@ -438,7 +438,9 @@ impl ValuesScan {
 mod tests {
     use super::*;
     use crate::datum::{Type, Value};
-    use crate::engine::ExecContextImpl;
+    use std::sync::Arc;
+
+    use crate::engine::ExecutionPoint;
     use crate::engine::tests::{TestEngine, open_test_engine};
     use crate::executor::tests::{bind_expr, int_col};
     use crate::heap::{HeapPage, Record};
@@ -446,12 +448,12 @@ mod tests {
     use crate::storage::{LruReplacer, MemoryStorage, PageId};
     use crate::tx::CommandId;
 
-    type TestCtx = ExecContextImpl<MemoryStorage, LruReplacer>;
+    type TestCtx = ExecutionPoint<MemoryStorage, LruReplacer>;
 
     /// Creates a test database with `CREATE TABLE test (id INT)` and inserts
     /// the given values via direct heap page writes. Returns the database
     /// and the table's first page ID.
-    async fn setup_int_table(values: Vec<i64>) -> (TestEngine, PageId) {
+    async fn setup_int_table(values: Vec<i64>) -> (Arc<TestEngine>, PageId) {
         let db = open_test_engine().await;
         db.create_test_table("CREATE TABLE test (id INT)").await;
 
@@ -476,7 +478,7 @@ mod tests {
 
     /// Creates a test database with `CREATE TABLE test (id INT, name TEXT)` and
     /// inserts the given rows. Returns the database and the table's first page ID.
-    async fn setup_two_col_table(rows: Vec<(i64, &str)>) -> (TestEngine, PageId) {
+    async fn setup_two_col_table(rows: Vec<(i64, &str)>) -> (Arc<TestEngine>, PageId) {
         let db = open_test_engine().await;
         db.create_test_table("CREATE TABLE test (id INT, name TEXT)")
             .await;
@@ -500,11 +502,11 @@ mod tests {
         (db, first_page)
     }
 
-    /// Creates an ExecContext from a database with a fresh read-only snapshot.
-    fn read_ctx(db: &TestEngine) -> TestCtx {
+    /// Creates an execution point from a database with a fresh read-only snapshot.
+    fn read_ctx(db: &Arc<TestEngine>) -> TestCtx {
         let txid = db.tx_manager().begin();
         let snapshot = db.tx_manager().snapshot(txid, CommandId::FIRST);
-        db.exec_context(snapshot)
+        db.execution_point(snapshot)
     }
 
     #[tokio::test]
@@ -748,7 +750,11 @@ mod tests {
     /// Helper: create a table and return db, snapshot, and catalog snapshot for planning.
     async fn setup_table_and_ctx(
         ddl: &str,
-    ) -> (TestEngine, crate::tx::Snapshot, crate::catalog::Catalog) {
+    ) -> (
+        Arc<TestEngine>,
+        crate::tx::Snapshot,
+        crate::catalog::Catalog,
+    ) {
         let db = open_test_engine().await;
         db.create_test_table(ddl).await;
 
@@ -765,7 +771,7 @@ mod tests {
 
         let insert = parse_insert("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')");
         let plan = planner::plan_insert(&insert, &catalog).unwrap();
-        let ctx = db.exec_context(snapshot.clone());
+        let ctx = db.execution_point(snapshot.clone());
         let DmlResult::Insert { count } = plan.execute_dml(&ctx).await.unwrap() else {
             panic!("expected DmlResult::Insert");
         };
@@ -776,7 +782,7 @@ mod tests {
             .tx_manager()
             .snapshot(snapshot.current_txid, CommandId::new(1));
         let table = &catalog.resolve_table("t").unwrap();
-        let ctx2 = db.exec_context(snapshot2);
+        let ctx2 = db.execution_point(snapshot2);
         let (tuples, _) = ctx2
             .scan_heap_page(table.info.first_page, &[Type::Integer, Type::Text])
             .await
@@ -794,7 +800,7 @@ mod tests {
         // First insert some data
         let insert = parse_insert("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')");
         let plan = planner::plan_insert(&insert, &catalog).unwrap();
-        let ctx = db.exec_context(snapshot.clone());
+        let ctx = db.execution_point(snapshot.clone());
         plan.execute_dml(&ctx).await.unwrap();
 
         // Delete where id = 2
@@ -803,7 +809,7 @@ mod tests {
             .snapshot(snapshot.current_txid, CommandId::new(1));
         let delete = parse_delete("DELETE FROM t WHERE id = 2");
         let plan = planner::plan_delete(&delete, &catalog).unwrap();
-        let ctx2 = db.exec_context(snapshot2);
+        let ctx2 = db.execution_point(snapshot2);
         let DmlResult::Delete { count } = plan.execute_dml(&ctx2).await.unwrap() else {
             panic!("expected DmlResult::Delete");
         };
@@ -814,7 +820,7 @@ mod tests {
             .tx_manager()
             .snapshot(snapshot.current_txid, CommandId::new(2));
         let table = &catalog.resolve_table("t").unwrap();
-        let ctx3 = db.exec_context(snapshot3);
+        let ctx3 = db.execution_point(snapshot3);
         let (tuples, _) = ctx3
             .scan_heap_page(table.info.first_page, &[Type::Integer, Type::Text])
             .await
@@ -832,7 +838,7 @@ mod tests {
         // Insert initial data
         let insert = parse_insert("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')");
         let plan = planner::plan_insert(&insert, &catalog).unwrap();
-        let ctx = db.exec_context(snapshot.clone());
+        let ctx = db.execution_point(snapshot.clone());
         plan.execute_dml(&ctx).await.unwrap();
 
         // Update: SET name = 'Updated' WHERE id = 1
@@ -841,7 +847,7 @@ mod tests {
             .snapshot(snapshot.current_txid, CommandId::new(1));
         let update = parse_update("UPDATE t SET name = 'Updated' WHERE id = 1");
         let plan = planner::plan_update(&update, &catalog).unwrap();
-        let ctx2 = db.exec_context(snapshot2);
+        let ctx2 = db.execution_point(snapshot2);
         let DmlResult::Update { count } = plan.execute_dml(&ctx2).await.unwrap() else {
             panic!("expected DmlResult::Update");
         };
@@ -852,7 +858,7 @@ mod tests {
             .tx_manager()
             .snapshot(snapshot.current_txid, CommandId::new(2));
         let table = &catalog.resolve_table("t").unwrap();
-        let ctx3 = db.exec_context(snapshot3);
+        let ctx3 = db.execution_point(snapshot3);
         let (tuples, _) = ctx3
             .scan_heap_page(table.info.first_page, &[Type::Integer, Type::Text])
             .await
@@ -872,7 +878,7 @@ mod tests {
 
         let insert = parse_insert("INSERT INTO t (name) VALUES ('Alice'), ('Bob')");
         let plan = planner::plan_insert(&insert, &catalog).unwrap();
-        let ctx = db.exec_context(snapshot.clone());
+        let ctx = db.execution_point(snapshot.clone());
         let DmlResult::Insert { count } = plan.execute_dml(&ctx).await.unwrap() else {
             panic!("expected DmlResult::Insert");
         };
@@ -883,7 +889,7 @@ mod tests {
             .tx_manager()
             .snapshot(snapshot.current_txid, CommandId::new(1));
         let table = &catalog.resolve_table("t").unwrap();
-        let ctx2 = db.exec_context(snapshot2);
+        let ctx2 = db.execution_point(snapshot2);
         let (tuples, _) = ctx2
             .scan_heap_page(table.info.first_page, &[Type::Integer, Type::Text])
             .await
@@ -900,7 +906,7 @@ mod tests {
         // Insert data
         let insert = parse_insert("INSERT INTO t VALUES (1), (2), (3)");
         let plan = planner::plan_insert(&insert, &catalog).unwrap();
-        let ctx = db.exec_context(snapshot.clone());
+        let ctx = db.execution_point(snapshot.clone());
         plan.execute_dml(&ctx).await.unwrap();
 
         // Delete all rows
@@ -909,7 +915,7 @@ mod tests {
             .snapshot(snapshot.current_txid, CommandId::new(1));
         let delete = parse_delete("DELETE FROM t");
         let plan = planner::plan_delete(&delete, &catalog).unwrap();
-        let ctx2 = db.exec_context(snapshot2);
+        let ctx2 = db.execution_point(snapshot2);
         let DmlResult::Delete { count } = plan.execute_dml(&ctx2).await.unwrap() else {
             panic!("expected DmlResult::Delete");
         };
@@ -920,7 +926,7 @@ mod tests {
             .tx_manager()
             .snapshot(snapshot.current_txid, CommandId::new(2));
         let table = &catalog.resolve_table("t").unwrap();
-        let ctx3 = db.exec_context(snapshot3);
+        let ctx3 = db.execution_point(snapshot3);
         let (tuples, _) = ctx3
             .scan_heap_page(table.info.first_page, &[Type::Integer])
             .await

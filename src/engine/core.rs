@@ -6,7 +6,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use super::error::EngineError;
-use super::exec_context::ExecContextImpl;
+use super::execution_point::ExecutionPoint;
 use super::superblock::Superblock;
 use crate::catalog::{Catalog, ColumnInfo, SequenceInfo, SystemCatalogTable, TableInfo};
 use crate::heap::{HeapPage, insert, scan_visible_page};
@@ -46,7 +46,7 @@ impl<S: Storage> Engine<S, LruReplacer> {
     /// Returns an error if:
     /// - Storage I/O fails
     /// - Superblock validation fails (invalid magic or version)
-    pub async fn open(storage: S, pool_size: usize) -> Result<Self, EngineError> {
+    pub async fn open(storage: S, pool_size: usize) -> Result<Arc<Self>, EngineError> {
         let replacer = LruReplacer::new(pool_size);
         Self::open_with_replacer(storage, replacer, pool_size).await
     }
@@ -67,7 +67,7 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
         storage: S,
         replacer: R,
         pool_size: usize,
-    ) -> Result<Self, EngineError> {
+    ) -> Result<Arc<Self>, EngineError> {
         let pool = Arc::new(BufferPool::new(storage, replacer, pool_size));
         let tx_manager = Arc::new(TransactionManager::new());
 
@@ -77,7 +77,7 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
             _ => Self::open_superblock(&pool).await?,
         };
 
-        Ok(Self {
+        Ok(Arc::new(Self {
             pool,
             tx_manager,
             superblock: Arc::new(RwLock::new(superblock)),
@@ -86,7 +86,7 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
                 deque.push_back((TxId::FROZEN, None));
                 RwLock::new(deque)
             },
-        })
+        }))
     }
 
     /// Bootstraps the catalog for a fresh database.
@@ -191,15 +191,7 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
         // NOTE: Two threads may concurrently miss the cache and both perform a
         // heap load. This is harmless: Phase 3 re-checks and only one result
         // populates the slot; the other is used directly and discarded.
-        let loaded = Arc::new(
-            Self::load_catalog_static(
-                Arc::clone(&self.pool),
-                Arc::clone(&self.tx_manager),
-                Arc::clone(&self.superblock),
-                snapshot.clone(),
-            )
-            .await?,
-        );
+        let loaded = Arc::new(self.load_catalog(snapshot).await?);
 
         // Phase 3: Write lock — re-find and populate if still empty.
         {
@@ -212,14 +204,12 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
         Ok(loaded)
     }
 
-    /// Creates an [`ExecContextImpl`] for query execution with the given snapshot.
-    pub fn exec_context(&self, snapshot: Snapshot) -> ExecContextImpl<S, R> {
-        ExecContextImpl::new(
-            Arc::clone(&self.pool),
-            Arc::clone(&self.tx_manager),
-            Arc::clone(&self.superblock),
-            snapshot,
-        )
+    /// Creates an [`ExecutionPoint`] for query execution with the given snapshot.
+    ///
+    /// Requires `&Arc<Self>` so the execution point can hold a lightweight
+    /// `Arc` clone of the engine instead of cloning each component separately.
+    pub fn execution_point(self: &Arc<Self>, snapshot: Snapshot) -> ExecutionPoint<S, R> {
+        ExecutionPoint::new(Arc::clone(self), snapshot)
     }
 
     /// Flushes all dirty pages to storage.
@@ -328,40 +318,45 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
     /// Sequences are NOT rolled back on transaction abort (following PostgreSQL's behavior).
     /// Each call increments the sequence permanently, independent of transaction state.
     pub async fn nextval(&self, seq_id: u32) -> Result<i64, EngineError> {
-        super::exec_context::nextval_impl(&self.pool, &self.superblock, seq_id).await
+        // The page latch is held during the entire operation to ensure atomicity.
+        let sys_sequences_page = self.superblock.read().sys_sequences_page;
+        let mut page = HeapPage::new(self.pool.fetch_page_mut(sys_sequences_page, true).await?);
+
+        // Find the sequence
+        let (slot_id, mut seq) = page
+            .scan(SequenceInfo::SCHEMA)
+            .find_map(|(slot_id, _header, record)| {
+                let seq = SequenceInfo::from_record(&record)?;
+                (seq.seq_id == seq_id).then_some((slot_id, seq))
+            })
+            .ok_or(EngineError::SequenceNotFound { seq_id })?;
+
+        let current_val = seq.next_val;
+        seq.next_val += 1;
+
+        // Update record in-place, bypassing MVCC
+        // The record size is unchanged (same seq_name, only next_val differs)
+        page.update_record_in_place(slot_id, &seq.to_record())?;
+
+        Ok(current_val)
     }
 
     /// Loads all visible catalog data into a new [`Catalog`].
     ///
     /// Scans sys_tables and sys_columns page chains, then calls [`Catalog::new`]
     /// to build the in-memory view.
-    #[cfg(test)]
     pub(crate) async fn load_catalog(&self, snapshot: &Snapshot) -> Result<Catalog, EngineError> {
-        Self::load_catalog_static(
-            Arc::clone(&self.pool),
-            Arc::clone(&self.tx_manager),
-            Arc::clone(&self.superblock),
-            snapshot.clone(),
-        )
-        .await
-    }
-
-    /// Static version of `load_catalog` that takes owned Arcs.
-    ///
-    /// Used by `catalog_snapshot` to create a `'static` loader future for the
-    /// catalog cache.
-    async fn load_catalog_static(
-        pool: Arc<BufferPool<S, R>>,
-        tx_manager: Arc<TransactionManager>,
-        superblock: Arc<RwLock<Superblock>>,
-        snapshot: Snapshot,
-    ) -> Result<Catalog, EngineError> {
         let mut tables = Vec::new();
-        let mut next_page_id: Option<PageId> = Some(superblock.read().sys_tables_page);
+        let mut next_page_id: Option<PageId> = Some(self.superblock.read().sys_tables_page);
         while let Some(page_id) = next_page_id {
-            let (tuples, next) =
-                scan_visible_page(&pool, page_id, TableInfo::SCHEMA, &snapshot, &tx_manager)
-                    .await?;
+            let (tuples, next) = scan_visible_page(
+                &self.pool,
+                page_id,
+                TableInfo::SCHEMA,
+                snapshot,
+                &self.tx_manager,
+            )
+            .await?;
             let page_tables: Vec<TableInfo> = tuples
                 .into_iter()
                 .filter_map(|(_tid, record)| TableInfo::from_record(&record))
@@ -371,11 +366,16 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
         }
 
         let mut columns = Vec::new();
-        let mut next_page_id: Option<PageId> = Some(superblock.read().sys_columns_page);
+        let mut next_page_id: Option<PageId> = Some(self.superblock.read().sys_columns_page);
         while let Some(page_id) = next_page_id {
-            let (tuples, next) =
-                scan_visible_page(&pool, page_id, ColumnInfo::SCHEMA, &snapshot, &tx_manager)
-                    .await?;
+            let (tuples, next) = scan_visible_page(
+                &self.pool,
+                page_id,
+                ColumnInfo::SCHEMA,
+                snapshot,
+                &self.tx_manager,
+            )
+            .await?;
             let page_columns: Vec<ColumnInfo> = tuples
                 .into_iter()
                 .filter_map(|(_tid, record)| ColumnInfo::from_record(&record))

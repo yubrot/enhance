@@ -232,7 +232,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                     let plan = executor::plan_select(select_stmt, &catalog)?;
                     let columns = plan.columns().to_vec();
 
-                    let ctx = engine.exec_context(snapshot);
+                    let ctx = engine.execution_point(snapshot);
                     let mut node = plan.prepare_for_execute(&ctx);
                     let mut rows = Vec::new();
                     while let Some(row) = node.next().await? {
@@ -252,7 +252,7 @@ impl<S: Storage, R: Replacer> Session<S, R> {
                         Statement::Delete(s) => executor::plan_delete(s, &catalog)?,
                         _ => unreachable!(),
                     };
-                    let ctx = engine.exec_context(snapshot);
+                    let ctx = engine.execution_point(snapshot);
                     let result = plan.execute_dml(&ctx).await?;
                     Ok(QueryResult::command(result.command_tag()))
                 })
@@ -352,8 +352,7 @@ mod tests {
 
     /// Opens a test engine and creates a [`Session`] connected to it.
     pub async fn open_test_session() -> TestSession {
-        let engine = Arc::new(open_test_engine().await);
-        Session::new(engine)
+        Session::new(open_test_engine().await)
     }
 
     impl TestSession {
@@ -662,7 +661,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_rolls_back_active_transaction() {
-        let engine = Arc::new(open_test_engine().await);
+        let engine = open_test_engine().await;
         let tx_manager = Arc::clone(engine.tx_manager());
 
         let txid = {
@@ -682,7 +681,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_without_transaction_is_noop() {
-        let engine = Arc::new(open_test_engine().await);
+        let engine = open_test_engine().await;
 
         // Session with no transaction — drop should not panic
         let session = Session::new(engine);
@@ -878,7 +877,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_catalog_cache_reflects_auto_commit_ddl() {
-        let engine = Arc::new(open_test_engine().await);
+        let engine = open_test_engine().await;
         let mut session = Session::new(Arc::clone(&engine));
 
         // Before DDL: table should not exist in cached snapshot.
@@ -902,7 +901,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_catalog_cache_reflects_explicit_commit_ddl() {
-        let engine = Arc::new(open_test_engine().await);
+        let engine = open_test_engine().await;
         let mut session = Session::new(Arc::clone(&engine));
 
         session.execute_query("BEGIN").await.unwrap();
@@ -929,7 +928,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_catalog_cache_not_updated_on_rollback() {
-        let engine = Arc::new(open_test_engine().await);
+        let engine = open_test_engine().await;
         let mut session = Session::new(Arc::clone(&engine));
 
         session.execute_query("BEGIN").await.unwrap();

@@ -28,17 +28,19 @@
 
 mod core;
 mod error;
-mod exec_context;
+mod execution_point;
 mod superblock;
 
 pub use core::Engine;
 pub use error::EngineError;
-pub use exec_context::ExecContextImpl;
+pub use execution_point::ExecutionPoint;
 pub use superblock::Superblock;
 
 /// Test helpers for engine-layer tests used across multiple test modules.
 #[cfg(test)]
 pub mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::sql::tests::parse_create_table;
     use crate::storage::{LruReplacer, MemoryStorage};
@@ -48,7 +50,7 @@ pub mod tests {
     pub type TestEngine = Engine<MemoryStorage, LruReplacer>;
 
     /// Opens a test engine with in-memory storage and 100-frame buffer pool.
-    pub async fn open_test_engine() -> TestEngine {
+    pub async fn open_test_engine() -> Arc<TestEngine> {
         Engine::open(MemoryStorage::new(), 100).await.unwrap()
     }
 
