@@ -439,8 +439,8 @@ mod tests {
     use super::*;
     use crate::catalog::Catalog;
     use crate::datum::{Type, Value};
+    use crate::engine::ExecContextImpl;
     use crate::engine::tests::{TestEngine, open_test_engine};
-    use crate::executor::ExecContextImpl;
     use crate::executor::tests::{bind_expr, int_col};
     use crate::heap::{HeapPage, Record};
     use crate::sql::tests::{parse_delete, parse_insert, parse_update};

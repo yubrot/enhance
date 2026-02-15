@@ -28,9 +28,11 @@
 
 mod core;
 mod error;
+mod exec_context;
 
 pub use core::Engine;
 pub use error::EngineError;
+pub use exec_context::ExecContextImpl;
 
 /// Test helpers for engine-layer tests used across multiple test modules.
 #[cfg(test)]

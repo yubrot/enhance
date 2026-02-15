@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use super::error::EngineError;
+use super::exec_context::ExecContextImpl;
 use crate::catalog::{Catalog, CatalogCache, CatalogError, CatalogStore};
-use crate::executor::ExecContextImpl;
 use crate::storage::{BufferPool, LruReplacer, Replacer, Storage};
 use crate::tx::{Snapshot, TransactionManager};
 

@@ -48,7 +48,7 @@ mod row;
 mod runner;
 
 pub use column::{ColumnDesc, ColumnSource};
-pub use context::{ExecContext, ExecContextImpl};
+pub use context::ExecContext;
 pub use error::ExecutorError;
 pub use expr::BoundExpr;
 pub use plan::{DmlPlan, QueryPlan};
