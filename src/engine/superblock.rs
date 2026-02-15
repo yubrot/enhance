@@ -2,9 +2,26 @@
 //!
 //! The superblock occupies page 0 and contains metadata about the database,
 //! including pointers to catalog tables and ID generators.
+//!
+//! # Architecture
+//!
+//! ```text
+//! Page 0          Heap Pages
+//! +------------+  +-------------+  +---------------+  +----------------+
+//! | Superblock |  | sys_tables  |  | sys_columns   |  | sys_sequences  |
+//! +------------+  +-------------+  +---------------+  +----------------+
+//!       |               |                 |                   |
+//!       |               v                 v                   v
+//!       |         [ TableInfo ]    [ ColumnInfo ]     [ SequenceInfo ]
+//!       |
+//!       +-> Catalog Page IDs + ID Generators
+//! ```
 
-use super::error::CatalogError;
-use crate::storage::PageId;
+use super::error::EngineError;
+use crate::catalog::{ColumnInfo, SequenceInfo, SystemCatalogTable, TableInfo};
+use crate::heap::{HeapPage, insert};
+use crate::storage::{BufferPool, PageId, Replacer, Storage};
+use crate::tx::{CommandId, TxId};
 
 /// Magic number for the enhance database format ("ENHN" in hex).
 const MAGIC: u32 = 0x454E_484E;
@@ -124,15 +141,15 @@ impl Superblock {
     /// Validates the superblock magic and version.
     ///
     /// Returns `Ok(())` if valid, otherwise returns an error describing the issue.
-    pub fn validate(&self) -> Result<(), CatalogError> {
+    pub fn validate(&self) -> Result<(), EngineError> {
         if self.magic != MAGIC {
-            return Err(CatalogError::InvalidMagic {
+            return Err(EngineError::InvalidMagic {
                 expected: MAGIC,
                 found: self.magic,
             });
         }
         if self.version != VERSION {
-            return Err(CatalogError::UnsupportedVersion {
+            return Err(EngineError::UnsupportedVersion {
                 expected: VERSION,
                 found: self.version,
             });
@@ -153,6 +170,101 @@ impl Superblock {
         self.next_seq_id += 1;
         id
     }
+
+    /// Opens or initializes the database superblock.
+    ///
+    /// If the storage is empty (page_count == 0), initializes a new database
+    /// by creating catalog pages and inserting initial metadata.
+    /// Otherwise, reads and validates the existing superblock from page 0.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Storage I/O fails
+    /// - Superblock validation fails (invalid magic or version)
+    pub async fn boot<S: Storage, R: Replacer>(
+        pool: &BufferPool<S, R>,
+    ) -> Result<Self, EngineError> {
+        match pool.page_count().await {
+            0 => Self::initialize(pool).await,
+            _ => Self::load(pool).await,
+        }
+    }
+
+    /// Bootstraps the catalog for a fresh database.
+    ///
+    /// Creates the initial catalog pages and inserts metadata for the
+    /// catalog tables themselves.
+    ///
+    /// NOTE: Without WAL (Step 13), crash during bootstrap leaves the
+    /// database in an inconsistent state that cannot be recovered.
+    async fn initialize<S: Storage, R: Replacer>(
+        pool: &BufferPool<S, R>,
+    ) -> Result<Self, EngineError> {
+        let mut sb_guard = pool.new_page().await?;
+        // NOTE: Using assert_eq! here panics instead of returning an error.
+        // Production code should return an appropriate error.
+        assert_eq!(sb_guard.page_id(), PageId::new(0), "First page must be 0");
+
+        let sys_tables_guard = pool.new_page().await?;
+        let sys_tables_page = sys_tables_guard.page_id();
+        HeapPage::new(sys_tables_guard).init();
+
+        let sys_columns_guard = pool.new_page().await?;
+        let sys_columns_page = sys_columns_guard.page_id();
+        HeapPage::new(sys_columns_guard).init();
+
+        let sys_sequences_guard = pool.new_page().await?;
+        let sys_sequences_page = sys_sequences_guard.page_id();
+        HeapPage::new(sys_sequences_guard).init();
+
+        let mut superblock = Self::new();
+        superblock.sys_tables_page = sys_tables_page;
+        superblock.sys_columns_page = sys_columns_page;
+        superblock.sys_sequences_page = sys_sequences_page;
+        superblock.next_table_id = crate::catalog::LAST_RESERVED_TABLE_ID + 1;
+        superblock.next_seq_id = 1;
+
+        superblock.write(sb_guard.data_mut());
+        drop(sb_guard);
+
+        // Bootstrap uses TxId::FROZEN so tuples are immediately visible without
+        // requiring a transaction commit. This is safe because bootstrap runs
+        // exclusively at database initialization time.
+        let txid = TxId::FROZEN;
+        let cid = CommandId::FIRST;
+
+        // Insert catalog table metadata into sys_tables
+        for table_info in [
+            TableInfo::table_info(sys_tables_page),
+            ColumnInfo::table_info(sys_columns_page),
+            SequenceInfo::table_info(sys_sequences_page),
+        ] {
+            insert(pool, sys_tables_page, &table_info.to_record(), txid, cid).await?;
+        }
+
+        // Insert column metadata into sys_columns
+        for col in TableInfo::columns()
+            .into_iter()
+            .chain(ColumnInfo::columns())
+            .chain(SequenceInfo::columns())
+        {
+            insert(pool, sys_columns_page, &col.to_record(), txid, cid).await?;
+        }
+
+        pool.flush_all().await?;
+
+        Ok(superblock)
+    }
+
+    /// Reads and validates the existing superblock from page 0.
+    async fn load<S: Storage, R: Replacer>(pool: &BufferPool<S, R>) -> Result<Self, EngineError> {
+        let guard = pool.fetch_page(PageId::new(0)).await?;
+        let superblock = Self::read(guard.data());
+        drop(guard);
+        superblock.validate()?;
+        Ok(superblock)
+    }
 }
 
 impl Default for Superblock {
@@ -164,6 +276,8 @@ impl Default for Superblock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::LAST_RESERVED_TABLE_ID;
+    use crate::storage::tests::test_pool;
 
     #[test]
     fn test_superblock_new() {
@@ -202,14 +316,14 @@ mod tests {
         bad_magic.magic = 0xDEADBEEF;
         assert!(matches!(
             bad_magic.validate(),
-            Err(CatalogError::InvalidMagic { .. })
+            Err(EngineError::InvalidMagic { .. })
         ));
 
         let mut bad_version = Superblock::new();
         bad_version.version = 99;
         assert!(matches!(
             bad_version.validate(),
-            Err(CatalogError::UnsupportedVersion { .. })
+            Err(EngineError::UnsupportedVersion { .. })
         ));
     }
 
@@ -225,5 +339,34 @@ mod tests {
         assert_eq!(sb.allocate_seq_id(), 1);
         assert_eq!(sb.allocate_seq_id(), 2);
         assert_eq!(sb.next_seq_id, 3);
+    }
+
+    #[tokio::test]
+    async fn test_boot_creates_catalog() {
+        let pool = test_pool();
+
+        let sb = Superblock::boot(&pool).await.unwrap();
+
+        assert!(sb.validate().is_ok());
+        assert_eq!(sb.sys_tables_page, PageId::new(1));
+        assert_eq!(sb.sys_columns_page, PageId::new(2));
+        assert_eq!(sb.sys_sequences_page, PageId::new(3));
+        assert_eq!(sb.next_table_id, LAST_RESERVED_TABLE_ID + 1);
+    }
+
+    #[tokio::test]
+    async fn test_boot_reads_existing_superblock() {
+        let pool = test_pool();
+
+        // First boot: bootstraps a new database.
+        let sb = Superblock::boot(&pool).await.unwrap();
+
+        // Second boot: loads the existing superblock.
+        let sb2 = Superblock::boot(&pool).await.unwrap();
+
+        assert_eq!(sb2.sys_tables_page, sb.sys_tables_page);
+        assert_eq!(sb2.sys_columns_page, sb.sys_columns_page);
+        assert_eq!(sb2.sys_sequences_page, sb.sys_sequences_page);
+        assert_eq!(sb2.next_table_id, sb.next_table_id);
     }
 }

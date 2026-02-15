@@ -3,11 +3,12 @@
 //! Provides a simple interface for setting up a test server and running psql commands.
 
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-use enhance::db::Database;
+use enhance::engine::Engine;
 use enhance::server::Server;
 use enhance::storage::MemoryStorage;
 
@@ -55,11 +56,11 @@ impl PsqlTestServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        // Initialize database with in-memory storage
+        // Initialize engine with in-memory storage
         let storage = MemoryStorage::new();
-        let database = Database::open(storage, 100).await.unwrap();
+        let engine = Arc::new(Engine::open(storage, 100).await.unwrap());
 
-        let server = Server::new(listener, database);
+        let server = Server::new(listener, engine);
         let handle = tokio::spawn(async move {
             let _ = server.serve().await;
         });
