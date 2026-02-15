@@ -6,9 +6,9 @@ use parking_lot::RwLock;
 
 use super::error::EngineError;
 use super::exec_context::ExecContextImpl;
+use super::superblock::Superblock;
 use crate::catalog::{
-    Catalog, CatalogCache, CatalogError, ColumnInfo, SequenceInfo, Superblock, SystemCatalogTable,
-    TableInfo,
+    Catalog, CatalogCache, ColumnInfo, SequenceInfo, SystemCatalogTable, TableInfo,
 };
 use crate::heap::{HeapPage, insert, scan_visible_page};
 use crate::sql::{CreateTableStmt, DataType};
@@ -88,10 +88,10 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
     ///
     /// NOTE: Without WAL (Step 13), crash during bootstrap leaves the
     /// database in an inconsistent state that cannot be recovered.
-    async fn bootstrap(pool: &Arc<BufferPool<S, R>>) -> Result<Superblock, CatalogError> {
+    async fn bootstrap(pool: &Arc<BufferPool<S, R>>) -> Result<Superblock, EngineError> {
         let mut sb_guard = pool.new_page().await?;
         // NOTE: Using assert_eq! here panics instead of returning an error.
-        // Production code should return CatalogError::InvalidSuperblock or similar.
+        // Production code should return an appropriate error.
         assert_eq!(sb_guard.page_id(), PageId::new(0), "First page must be 0");
 
         let sys_tables_guard = pool.new_page().await?;
@@ -146,7 +146,7 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
     }
 
     /// Opens an existing database by reading the superblock from page 0.
-    async fn open_superblock(pool: &Arc<BufferPool<S, R>>) -> Result<Superblock, CatalogError> {
+    async fn open_superblock(pool: &Arc<BufferPool<S, R>>) -> Result<Superblock, EngineError> {
         let guard = pool.fetch_page(PageId::new(0)).await?;
         let superblock = Superblock::read(guard.data());
         drop(guard);
@@ -168,10 +168,7 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
     ///
     /// Delegates to [`CatalogCache::get_or_load`], which avoids redundant
     /// heap scans when no DDL has been committed since the last load.
-    pub async fn catalog_snapshot(
-        &self,
-        snapshot: &Snapshot,
-    ) -> Result<Arc<Catalog>, CatalogError> {
+    pub async fn catalog_snapshot(&self, snapshot: &Snapshot) -> Result<Arc<Catalog>, EngineError> {
         let pool = Arc::clone(&self.pool);
         let tx_manager_clone = Arc::clone(&self.tx_manager);
         let superblock = Arc::clone(&self.superblock);
@@ -222,13 +219,13 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
     ///
     /// # Errors
     ///
-    /// Returns `CatalogError::TableAlreadyExists` if the table exists.
+    /// Returns `EngineError::TableAlreadyExists` if the table exists.
     pub async fn create_table(
         &self,
         txid: TxId,
         cid: CommandId,
         stmt: &CreateTableStmt,
-    ) -> Result<u32, CatalogError> {
+    ) -> Result<u32, EngineError> {
         // Check if table already exists
         // NOTE: This check-then-insert pattern is not atomic without proper locking
         // or unique constraints.
@@ -237,7 +234,7 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
             if stmt.if_not_exists {
                 return Ok(table.table_id);
             }
-            return Err(CatalogError::TableAlreadyExists {
+            return Err(EngineError::TableAlreadyExists {
                 name: stmt.name.clone(),
             });
         }
@@ -290,7 +287,7 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
     ///
     /// Sequences are NOT rolled back on transaction abort (following PostgreSQL's behavior).
     /// Each call increments the sequence permanently, independent of transaction state.
-    pub async fn nextval(&self, seq_id: u32) -> Result<i64, CatalogError> {
+    pub async fn nextval(&self, seq_id: u32) -> Result<i64, EngineError> {
         super::exec_context::nextval_impl(&self.pool, &self.superblock, seq_id).await
     }
 
@@ -299,7 +296,7 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
     /// Scans sys_tables and sys_columns page chains, then calls [`Catalog::new`]
     /// to build the in-memory view.
     #[cfg(test)]
-    pub(crate) async fn load_catalog(&self, snapshot: &Snapshot) -> Result<Catalog, CatalogError> {
+    pub(crate) async fn load_catalog(&self, snapshot: &Snapshot) -> Result<Catalog, EngineError> {
         Self::load_catalog_static(
             Arc::clone(&self.pool),
             Arc::clone(&self.tx_manager),
@@ -318,7 +315,7 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
         tx_manager: Arc<TransactionManager>,
         superblock: Arc<RwLock<Superblock>>,
         snapshot: Snapshot,
-    ) -> Result<Catalog, CatalogError> {
+    ) -> Result<Catalog, EngineError> {
         let mut tables = Vec::new();
         let mut next_page_id: Option<PageId> = Some(superblock.read().sys_tables_page);
         while let Some(page_id) = next_page_id {
@@ -359,7 +356,7 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
     ///
     /// The superblock is outside the WAL system (it contains WAL metadata itself),
     /// so we must ensure durability through immediate fsync.
-    async fn flush_superblock(&self) -> Result<(), CatalogError> {
+    async fn flush_superblock(&self) -> Result<(), EngineError> {
         let sb = self.superblock();
         let mut guard = self.pool.fetch_page_mut(PageId::new(0), true).await?;
         sb.write(guard.data_mut());
@@ -379,7 +376,7 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
         &self,
         snapshot: &Snapshot,
         name: &str,
-    ) -> Result<Option<TableInfo>, CatalogError> {
+    ) -> Result<Option<TableInfo>, EngineError> {
         let mut next_page_id: Option<PageId> = Some(self.superblock.read().sys_tables_page);
         while let Some(page_id) = next_page_id {
             let (tuples, next) = scan_visible_page(
@@ -412,7 +409,7 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
         table_id: u32,
         name: &str,
         first_page: PageId,
-    ) -> Result<(), CatalogError> {
+    ) -> Result<(), EngineError> {
         let sys_tables_page = self.superblock.read().sys_tables_page;
         insert(
             &self.pool,
@@ -431,7 +428,7 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
         txid: TxId,
         cid: CommandId,
         col: &ColumnInfo,
-    ) -> Result<(), CatalogError> {
+    ) -> Result<(), EngineError> {
         let sys_columns_page = self.superblock.read().sys_columns_page;
         insert(&self.pool, sys_columns_page, &col.to_record(), txid, cid).await?;
         Ok(())
@@ -443,7 +440,7 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
         txid: TxId,
         cid: CommandId,
         name: &str,
-    ) -> Result<u32, CatalogError> {
+    ) -> Result<u32, EngineError> {
         // Allocate sequence ID and persist immediately to ensure uniqueness
         let seq_id = self.superblock.write().allocate_seq_id();
         self.flush_superblock().await?;
@@ -562,7 +559,7 @@ mod tests {
         let result = engine.create_table(txid2, cid, &stmt).await;
         assert!(matches!(
             result,
-            Err(CatalogError::TableAlreadyExists { .. })
+            Err(EngineError::TableAlreadyExists { .. })
         ));
     }
 

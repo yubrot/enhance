@@ -29,10 +29,12 @@
 mod core;
 mod error;
 mod exec_context;
+mod superblock;
 
 pub use core::Engine;
 pub use error::EngineError;
 pub use exec_context::ExecContextImpl;
+pub use superblock::Superblock;
 
 /// Test helpers for engine-layer tests used across multiple test modules.
 #[cfg(test)]

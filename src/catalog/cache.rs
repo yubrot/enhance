@@ -10,8 +10,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use super::error::CatalogError;
-use super::snapshot::Catalog;
+use super::Catalog;
 use crate::tx::{Snapshot, TransactionManager, TxId, TxState};
 
 /// Shared, MVCC-aware cache for [`Catalog`].
@@ -55,15 +54,15 @@ impl CatalogCache {
     ///
     /// The `loader` closure is called only on cache miss and should scan the
     /// catalog heap pages to build a fresh [`Catalog`].
-    pub async fn get_or_load<F, Fut>(
+    pub async fn get_or_load<E, F, Fut>(
         &self,
         loader: F,
         snapshot: &Snapshot,
         tx_manager: &TransactionManager,
-    ) -> Result<Arc<Catalog>, CatalogError>
+    ) -> Result<Arc<Catalog>, E>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<Catalog, CatalogError>> + Send,
+        Fut: Future<Output = Result<Catalog, E>> + Send,
     {
         // Phase 1: Write lock — find the visible entry (with aborted cleanup).
         {

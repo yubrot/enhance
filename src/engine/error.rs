@@ -1,10 +1,10 @@
 //! Engine-level errors.
 
-use crate::catalog::CatalogError;
 use crate::executor::ExecutorError;
+use crate::heap::HeapError;
 use crate::protocol::{ErrorInfo, sql_state};
 use crate::sql::SyntaxError;
-use crate::storage::BufferPoolError;
+use crate::storage::{BufferPoolError, StorageError};
 use crate::tx::TxError;
 
 /// Errors that can occur during engine operations.
@@ -12,30 +12,58 @@ use crate::tx::TxError;
 pub enum EngineError {
     /// SQL parsing error.
     Parse(SyntaxError),
-    /// Catalog error.
-    Catalog(CatalogError),
     /// Buffer pool error.
     BufferPool(BufferPoolError),
+    /// Heap operation error.
+    Heap(HeapError),
     /// Transaction error.
     Transaction(TxError),
     /// Executor error.
     Executor(ExecutorError),
     /// The current transaction is aborted; commands are ignored until ROLLBACK.
     TransactionAborted,
+    /// Table already exists.
+    TableAlreadyExists { name: String },
+    /// Sequence not found.
+    SequenceNotFound { seq_id: u32 },
+    /// Invalid superblock magic number.
+    InvalidMagic { expected: u32, found: u32 },
+    /// Unsupported superblock version.
+    UnsupportedVersion { expected: u32, found: u32 },
 }
 
 impl std::fmt::Display for EngineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EngineError::Parse(e) => write!(f, "parse error: {}", e.message),
-            EngineError::Catalog(e) => write!(f, "catalog error: {}", e),
             EngineError::BufferPool(e) => write!(f, "buffer pool error: {}", e),
+            EngineError::Heap(e) => write!(f, "heap error: {}", e),
             EngineError::Transaction(e) => write!(f, "transaction error: {}", e),
             EngineError::Executor(e) => write!(f, "{}", e),
             EngineError::TransactionAborted => write!(
                 f,
                 "current transaction is aborted, commands ignored until end of transaction block"
             ),
+            EngineError::TableAlreadyExists { name } => {
+                write!(f, "table \"{}\" already exists", name)
+            }
+            EngineError::SequenceNotFound { seq_id } => {
+                write!(f, "sequence {} not found", seq_id)
+            }
+            EngineError::InvalidMagic { expected, found } => {
+                write!(
+                    f,
+                    "invalid superblock magic: expected 0x{:08X}, found 0x{:08X}",
+                    expected, found
+                )
+            }
+            EngineError::UnsupportedVersion { expected, found } => {
+                write!(
+                    f,
+                    "unsupported superblock version: expected {}, found {}",
+                    expected, found
+                )
+            }
         }
     }
 }
@@ -44,24 +72,30 @@ impl std::error::Error for EngineError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             EngineError::Parse(e) => Some(e),
-            EngineError::Catalog(e) => Some(e),
             EngineError::BufferPool(e) => Some(e),
+            EngineError::Heap(e) => Some(e),
             EngineError::Transaction(e) => Some(e),
             EngineError::Executor(e) => Some(e),
-            EngineError::TransactionAborted => None,
+            _ => None,
         }
-    }
-}
-
-impl From<CatalogError> for EngineError {
-    fn from(e: CatalogError) -> Self {
-        EngineError::Catalog(e)
     }
 }
 
 impl From<BufferPoolError> for EngineError {
     fn from(e: BufferPoolError) -> Self {
         EngineError::BufferPool(e)
+    }
+}
+
+impl From<HeapError> for EngineError {
+    fn from(e: HeapError) -> Self {
+        EngineError::Heap(e)
+    }
+}
+
+impl From<StorageError> for EngineError {
+    fn from(e: StorageError) -> Self {
+        EngineError::BufferPool(BufferPoolError::from(e))
     }
 }
 

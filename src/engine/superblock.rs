@@ -3,7 +3,7 @@
 //! The superblock occupies page 0 and contains metadata about the database,
 //! including pointers to catalog tables and ID generators.
 
-use super::error::CatalogError;
+use super::error::EngineError;
 use crate::storage::PageId;
 
 /// Magic number for the enhance database format ("ENHN" in hex).
@@ -124,15 +124,15 @@ impl Superblock {
     /// Validates the superblock magic and version.
     ///
     /// Returns `Ok(())` if valid, otherwise returns an error describing the issue.
-    pub fn validate(&self) -> Result<(), CatalogError> {
+    pub fn validate(&self) -> Result<(), EngineError> {
         if self.magic != MAGIC {
-            return Err(CatalogError::InvalidMagic {
+            return Err(EngineError::InvalidMagic {
                 expected: MAGIC,
                 found: self.magic,
             });
         }
         if self.version != VERSION {
-            return Err(CatalogError::UnsupportedVersion {
+            return Err(EngineError::UnsupportedVersion {
                 expected: VERSION,
                 found: self.version,
             });
@@ -202,14 +202,14 @@ mod tests {
         bad_magic.magic = 0xDEADBEEF;
         assert!(matches!(
             bad_magic.validate(),
-            Err(CatalogError::InvalidMagic { .. })
+            Err(EngineError::InvalidMagic { .. })
         ));
 
         let mut bad_version = Superblock::new();
         bad_version.version = 99;
         assert!(matches!(
             bad_version.validate(),
-            Err(CatalogError::UnsupportedVersion { .. })
+            Err(EngineError::UnsupportedVersion { .. })
         ));
     }
 

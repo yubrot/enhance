@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::catalog::{CatalogError, SequenceInfo, Superblock, SystemCatalogTable};
+use super::error::EngineError;
+use super::superblock::Superblock;
+use crate::catalog::{SequenceInfo, SystemCatalogTable};
 use crate::executor::{ExecContext, ExecutorError};
 use crate::heap::{HeapPage, Record, TupleId, delete, insert, scan_visible_page, update};
 use crate::storage::{BufferPool, PageId, Replacer, Storage};
@@ -111,7 +113,16 @@ impl<S: Storage, R: Replacer> ExecContext for ExecContextImpl<S, R> {
     }
 
     async fn nextval(&self, seq_id: u32) -> Result<i64, ExecutorError> {
-        Ok(nextval_impl(&self.pool, &self.superblock, seq_id).await?)
+        nextval_impl(&self.pool, &self.superblock, seq_id)
+            .await
+            .map_err(|e| match e {
+                EngineError::SequenceNotFound { seq_id } => {
+                    ExecutorError::SequenceNotFound { seq_id }
+                }
+                EngineError::BufferPool(e) => ExecutorError::Heap(e.into()),
+                EngineError::Heap(e) => ExecutorError::Heap(e),
+                other => ExecutorError::Unsupported(other.to_string()),
+            })
     }
 }
 
@@ -124,7 +135,7 @@ pub(super) async fn nextval_impl<S: Storage, R: Replacer>(
     pool: &BufferPool<S, R>,
     superblock: &RwLock<Superblock>,
     seq_id: u32,
-) -> Result<i64, CatalogError> {
+) -> Result<i64, EngineError> {
     // The page latch is held during the entire operation to ensure atomicity.
     let sys_sequences_page = superblock.read().sys_sequences_page;
     let mut page = HeapPage::new(pool.fetch_page_mut(sys_sequences_page, true).await?);
@@ -136,7 +147,7 @@ pub(super) async fn nextval_impl<S: Storage, R: Replacer>(
             let seq = SequenceInfo::from_record(&record)?;
             (seq.seq_id == seq_id).then_some((slot_id, seq))
         })
-        .ok_or(CatalogError::SequenceNotFound { seq_id })?;
+        .ok_or(EngineError::SequenceNotFound { seq_id })?;
 
     let current_val = seq.next_val;
     seq.next_val += 1;
