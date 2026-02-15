@@ -2,6 +2,20 @@
 //!
 //! The superblock occupies page 0 and contains metadata about the database,
 //! including pointers to catalog tables and ID generators.
+//!
+//! # Architecture
+//!
+//! ```text
+//! Page 0          Heap Pages
+//! +------------+  +-------------+  +---------------+  +----------------+
+//! | Superblock |  | sys_tables  |  | sys_columns   |  | sys_sequences  |
+//! +------------+  +-------------+  +---------------+  +----------------+
+//!       |               |                 |                   |
+//!       |               v                 v                   v
+//!       |         [ TableInfo ]    [ ColumnInfo ]     [ SequenceInfo ]
+//!       |
+//!       +-> Catalog Page IDs + ID Generators
+//! ```
 
 use super::error::EngineError;
 use crate::storage::PageId;
