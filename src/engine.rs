@@ -8,11 +8,11 @@
 //!
 //! ```text
 //! +------------------------------------------------------------------+
-//! |                          Engine                                   |
+//! |                          Engine                                  |
 //! |  (Orchestrates core infrastructure components)                   |
 //! |                                                                  |
 //! |  +-----------------+  +--------------------+  +---------------+  |
-//! |  | Arc<BufferPool> |  | Arc<TxManager>     |  | Superblock   |  |
+//! |  | Arc<BufferPool> |  | Arc<TxManager>     |  | Superblock    |  |
 //! |  | (Page I/O,      |  | (TxId allocation,  |  | (Table/column |  |
 //! |  |  LRU eviction)  |  |  commit/abort)     |  |  page IDs)    |  |
 //! |  +--------+--------+  +--------------------+  +-------+-------+  |
@@ -63,6 +63,7 @@ pub mod tests {
             self.create_table(txid, CommandId::FIRST, &stmt)
                 .await
                 .unwrap();
+            self.register_ddl(txid);
             self.tx_manager().commit(txid).unwrap();
         }
     }
