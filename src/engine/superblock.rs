@@ -1,21 +1,7 @@
 //! Superblock structure for database metadata.
 //!
 //! The superblock occupies page 0 and contains metadata about the database,
-//! including pointers to catalog tables and ID generators.
-//!
-//! # Architecture
-//!
-//! ```text
-//! Page 0          Heap Pages
-//! +------------+  +-------------+  +---------------+  +----------------+
-//! | Superblock |  | sys_tables  |  | sys_columns   |  | sys_sequences  |
-//! +------------+  +-------------+  +---------------+  +----------------+
-//!       |               |                 |                   |
-//!       |               v                 v                   v
-//!       |         [ TableInfo ]    [ ColumnInfo ]     [ SequenceInfo ]
-//!       |
-//!       +-> Catalog Page IDs + ID Generators
-//! ```
+//! including first-page pointers for system catalog heap chains and ID generators.
 
 use super::error::EngineError;
 use crate::catalog::{ColumnInfo, SequenceInfo, SystemCatalogTable, TableInfo};
@@ -34,9 +20,9 @@ const VERSION: u32 = 1;
 /// Layout (48 bytes):
 /// - `magic`: u32 (4 bytes) - Magic number to identify format
 /// - `version`: u32 (4 bytes) - Format version for compatibility
-/// - `sys_tables_page`: u64 (8 bytes) - Page ID for sys_tables
-/// - `sys_columns_page`: u64 (8 bytes) - Page ID for sys_columns
-/// - `sys_sequences_page`: u64 (8 bytes) - Page ID for sys_sequences
+/// - `sys_tables_page`: u64 (8 bytes) - First page of sys_tables heap chain
+/// - `sys_columns_page`: u64 (8 bytes) - First page of sys_columns heap chain
+/// - `sys_sequences_page`: u64 (8 bytes) - First page of sys_sequences heap chain
 /// - `next_table_id`: u32 (4 bytes) - Next table ID to allocate
 /// - `next_seq_id`: u32 (4 bytes) - Next sequence ID to allocate
 /// - Reserved: 8 bytes for future use
@@ -46,11 +32,11 @@ pub struct Superblock {
     pub magic: u32,
     /// Format version for compatibility checks.
     pub version: u32,
-    /// Page ID of the sys_tables heap page.
+    /// First page of the sys_tables heap chain.
     pub sys_tables_page: PageId,
-    /// Page ID of the sys_columns heap page.
+    /// First page of the sys_columns heap chain.
     pub sys_columns_page: PageId,
-    /// Page ID of the sys_sequences heap page.
+    /// First page of the sys_sequences heap chain.
     pub sys_sequences_page: PageId,
     /// Next table ID to allocate.
     pub next_table_id: u32,

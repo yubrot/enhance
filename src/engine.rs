@@ -3,28 +3,6 @@
 //! The [`Engine`] type is the main entry point for database infrastructure.
 //! It initializes or opens an existing database and provides access to
 //! the core components (buffer pool, transaction manager, catalog operations).
-//!
-//! # Architecture
-//!
-//! ```text
-//! +------------------------------------------------------------------+
-//! |                          Engine                                  |
-//! |  (Orchestrates core infrastructure components)                   |
-//! |                                                                  |
-//! |  +-----------------+  +--------------------+  +---------------+  |
-//! |  | Arc<BufferPool> |  | Arc<TxManager>     |  | Superblock    |  |
-//! |  | (Page I/O,      |  | (TxId allocation,  |  | (Table/column |  |
-//! |  |  LRU eviction)  |  |  commit/abort)     |  |  page IDs)    |  |
-//! |  +--------+--------+  +--------------------+  +-------+-------+  |
-//! |           |                                           |          |
-//! +-----------+-------------------------------------------+----------+
-//!             |                                           |
-//!             v                                           | uses
-//!       +---------------------+                           |
-//!       |  storage::Storage   |<--------------------------+
-//!       | (Memory / File)     |
-//!       +---------------------+
-//! ```
 
 mod error;
 mod execution_point;
@@ -52,7 +30,11 @@ use crate::tx::{CommandId, Snapshot, TransactionManager, TxId};
 pub struct Engine<S: Storage, R: Replacer> {
     pool: BufferPool<S, R>,
     tx_manager: TransactionManager,
+    /// Persisted to page 0 via the buffer pool with immediate fsync,
+    /// bypassing the WAL (since it contains WAL metadata itself).
     superblock: RwLock<Superblock>,
+    /// Caches the [`Catalog`] loaded from heap scans.
+    /// Invalidated when DDL is committed.
     catalog_vc: CatalogVC,
 }
 
@@ -200,6 +182,52 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
         Ok(current_val)
     }
 
+    /// Loads all visible catalog data into a new [`Catalog`].
+    async fn load_catalog(&self, snapshot: &Snapshot) -> Result<Catalog, EngineError> {
+        let mut tables = Vec::new();
+        let mut columns = Vec::new();
+
+        let mut next_page_id: Option<PageId> = Some(self.superblock.read().sys_tables_page);
+        while let Some(page_id) = next_page_id {
+            let (tuples, next) = scan_visible_page(
+                &self.pool,
+                page_id,
+                TableInfo::SCHEMA,
+                snapshot,
+                &self.tx_manager,
+            )
+            .await?;
+            for table in tuples
+                .into_iter()
+                .filter_map(|(_tid, record)| TableInfo::from_record(&record))
+            {
+                tables.push(table);
+            }
+            next_page_id = next;
+        }
+
+        let mut next_page_id: Option<PageId> = Some(self.superblock.read().sys_columns_page);
+        while let Some(page_id) = next_page_id {
+            let (tuples, next) = scan_visible_page(
+                &self.pool,
+                page_id,
+                ColumnInfo::SCHEMA,
+                snapshot,
+                &self.tx_manager,
+            )
+            .await?;
+            for column in tuples
+                .into_iter()
+                .filter_map(|(_tid, record)| ColumnInfo::from_record(&record))
+            {
+                columns.push(column);
+            }
+            next_page_id = next;
+        }
+
+        Ok(Catalog::new(tables, columns))
+    }
+
     /// Creates a new table from a CREATE TABLE statement.
     ///
     /// This method:
@@ -277,49 +305,6 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
         Ok(table_id)
     }
 
-    /// Loads all visible catalog data into a new [`Catalog`].
-    async fn load_catalog(&self, snapshot: &Snapshot) -> Result<Catalog, EngineError> {
-        let mut tables = Vec::new();
-        let mut next_page_id: Option<PageId> = Some(self.superblock.read().sys_tables_page);
-        while let Some(page_id) = next_page_id {
-            let (tuples, next) = scan_visible_page(
-                &self.pool,
-                page_id,
-                TableInfo::SCHEMA,
-                snapshot,
-                &self.tx_manager,
-            )
-            .await?;
-            let page_tables: Vec<TableInfo> = tuples
-                .into_iter()
-                .filter_map(|(_tid, record)| TableInfo::from_record(&record))
-                .collect();
-            tables.extend(page_tables);
-            next_page_id = next;
-        }
-
-        let mut columns = Vec::new();
-        let mut next_page_id: Option<PageId> = Some(self.superblock.read().sys_columns_page);
-        while let Some(page_id) = next_page_id {
-            let (tuples, next) = scan_visible_page(
-                &self.pool,
-                page_id,
-                ColumnInfo::SCHEMA,
-                snapshot,
-                &self.tx_manager,
-            )
-            .await?;
-            let page_columns: Vec<ColumnInfo> = tuples
-                .into_iter()
-                .filter_map(|(_tid, record)| ColumnInfo::from_record(&record))
-                .collect();
-            columns.extend(page_columns);
-            next_page_id = next;
-        }
-
-        Ok(Catalog::new(tables, columns))
-    }
-
     /// Inserts a table record into sys_tables.
     async fn insert_table(
         &self,
@@ -376,8 +361,10 @@ impl<S: Storage, R: Replacer> Engine<S, R> {
 pub mod tests {
     use super::*;
     use crate::catalog::{LAST_RESERVED_TABLE_ID, SequenceInfo, SystemCatalogTable};
+    use crate::engine::{Engine, EngineError};
     use crate::sql::tests::parse_create_table;
     use crate::storage::MemoryStorage;
+    use crate::tx::CommandId;
 
     /// Type alias for a test engine backed by in-memory storage.
     pub type TestEngine = Engine<MemoryStorage, LruReplacer>;
@@ -442,6 +429,84 @@ pub mod tests {
 
         // Should not find non-existent table
         assert!(catalog.resolve_table("nonexistent").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_load_system_tables() {
+        let engine = Engine::open(MemoryStorage::new(), 100).await.unwrap();
+        let txid = engine.tx_manager().begin();
+        let snapshot = engine.tx_manager().snapshot(txid, CommandId::FIRST);
+
+        let catalog = engine.load_catalog(&snapshot).await.unwrap();
+
+        // Should contain the 3 system catalog tables
+        assert_eq!(
+            catalog.resolve_table("sys_tables").unwrap().info.table_id,
+            TableInfo::TABLE_ID
+        );
+        assert_eq!(
+            catalog.resolve_table("sys_columns").unwrap().info.table_id,
+            ColumnInfo::TABLE_ID
+        );
+        assert_eq!(
+            catalog
+                .resolve_table("sys_sequences")
+                .unwrap()
+                .info
+                .table_id,
+            SequenceInfo::TABLE_ID
+        );
+
+        // sys_tables should have 3 columns
+        let entry = catalog.resolve_table_by_id(TableInfo::TABLE_ID).unwrap();
+        assert_eq!(entry.columns.len(), 3);
+        assert_eq!(entry.columns[0].column_name, "table_id");
+        assert_eq!(entry.columns[1].column_name, "table_name");
+        assert_eq!(entry.columns[2].column_name, "first_page");
+    }
+
+    #[tokio::test]
+    async fn test_load_with_user_table() {
+        let engine = Engine::open(MemoryStorage::new(), 100).await.unwrap();
+        let txid = engine.tx_manager().begin();
+        let cid = CommandId::FIRST;
+
+        let stmt = parse_create_table("CREATE TABLE users (id SERIAL, name TEXT)");
+
+        engine.create_table(txid, cid, &stmt).await.unwrap();
+        engine.tx_manager().commit(txid).unwrap();
+
+        // Load catalog with a new transaction
+        let txid2 = engine.tx_manager().begin();
+        let snapshot = engine.tx_manager().snapshot(txid2, CommandId::FIRST);
+        let catalog = engine.load_catalog(&snapshot).await.unwrap();
+
+        let entry = catalog.resolve_table("users").unwrap();
+        assert_eq!(entry.info.table_id, LAST_RESERVED_TABLE_ID + 1);
+        assert_eq!(entry.columns.len(), 2);
+        assert_eq!(entry.columns[0].column_name, "id");
+        assert!(entry.columns[0].is_serial());
+        assert_eq!(entry.columns[1].column_name, "name");
+        assert!(!entry.columns[1].is_serial());
+    }
+
+    #[tokio::test]
+    async fn test_load_uncommitted_not_visible() {
+        let engine = Engine::open(MemoryStorage::new(), 100).await.unwrap();
+        let txid = engine.tx_manager().begin();
+        let cid = CommandId::FIRST;
+
+        let stmt = parse_create_table("CREATE TABLE invisible (id INTEGER)");
+
+        engine.create_table(txid, cid, &stmt).await.unwrap();
+        // Do NOT commit
+
+        // Another transaction should not see the uncommitted table
+        let txid2 = engine.tx_manager().begin();
+        let snapshot = engine.tx_manager().snapshot(txid2, CommandId::FIRST);
+        let catalog = engine.load_catalog(&snapshot).await.unwrap();
+
+        assert!(catalog.resolve_table("invisible").is_none());
     }
 
     #[tokio::test]
@@ -527,85 +592,5 @@ pub mod tests {
             panic!("expected 'users' table to exist after commit");
         };
         assert_eq!(entry.info.table_name, "users");
-    }
-
-    // --- Integration tests for load_catalog (moved from catalog/snapshot.rs) ---
-
-    #[tokio::test]
-    async fn test_load_system_tables() {
-        let engine = Engine::open(MemoryStorage::new(), 100).await.unwrap();
-        let txid = engine.tx_manager().begin();
-        let snapshot = engine.tx_manager().snapshot(txid, CommandId::FIRST);
-
-        let catalog = engine.load_catalog(&snapshot).await.unwrap();
-
-        // Should contain the 3 system catalog tables
-        assert_eq!(
-            catalog.resolve_table("sys_tables").unwrap().info.table_id,
-            TableInfo::TABLE_ID
-        );
-        assert_eq!(
-            catalog.resolve_table("sys_columns").unwrap().info.table_id,
-            ColumnInfo::TABLE_ID
-        );
-        assert_eq!(
-            catalog
-                .resolve_table("sys_sequences")
-                .unwrap()
-                .info
-                .table_id,
-            SequenceInfo::TABLE_ID
-        );
-
-        // sys_tables should have 3 columns
-        let entry = catalog.resolve_table_by_id(TableInfo::TABLE_ID).unwrap();
-        assert_eq!(entry.columns.len(), 3);
-        assert_eq!(entry.columns[0].column_name, "table_id");
-        assert_eq!(entry.columns[1].column_name, "table_name");
-        assert_eq!(entry.columns[2].column_name, "first_page");
-    }
-
-    #[tokio::test]
-    async fn test_load_with_user_table() {
-        let engine = Engine::open(MemoryStorage::new(), 100).await.unwrap();
-        let txid = engine.tx_manager().begin();
-        let cid = CommandId::FIRST;
-
-        let stmt = parse_create_table("CREATE TABLE users (id SERIAL, name TEXT)");
-
-        engine.create_table(txid, cid, &stmt).await.unwrap();
-        engine.tx_manager().commit(txid).unwrap();
-
-        // Load catalog with a new transaction
-        let txid2 = engine.tx_manager().begin();
-        let snapshot = engine.tx_manager().snapshot(txid2, CommandId::FIRST);
-        let catalog = engine.load_catalog(&snapshot).await.unwrap();
-
-        let entry = catalog.resolve_table("users").unwrap();
-        assert_eq!(entry.info.table_id, LAST_RESERVED_TABLE_ID + 1);
-        assert_eq!(entry.columns.len(), 2);
-        assert_eq!(entry.columns[0].column_name, "id");
-        assert!(entry.columns[0].is_serial());
-        assert_eq!(entry.columns[1].column_name, "name");
-        assert!(!entry.columns[1].is_serial());
-    }
-
-    #[tokio::test]
-    async fn test_load_uncommitted_not_visible() {
-        let engine = Engine::open(MemoryStorage::new(), 100).await.unwrap();
-        let txid = engine.tx_manager().begin();
-        let cid = CommandId::FIRST;
-
-        let stmt = parse_create_table("CREATE TABLE invisible (id INTEGER)");
-
-        engine.create_table(txid, cid, &stmt).await.unwrap();
-        // Do NOT commit
-
-        // Another transaction should not see the uncommitted table
-        let txid2 = engine.tx_manager().begin();
-        let snapshot = engine.tx_manager().snapshot(txid2, CommandId::FIRST);
-        let catalog = engine.load_catalog(&snapshot).await.unwrap();
-
-        assert!(catalog.resolve_table("invisible").is_none());
     }
 }
