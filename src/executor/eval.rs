@@ -183,6 +183,13 @@ impl BoundExpr {
                     },
                 })
             }
+
+            BoundExpr::AggregateCall { .. } => {
+                // This variant should never survive to evaluation; it is always
+                // rewritten by the planner. Reaching evaluate() indicates a
+                // planner bug.
+                panic!("AggregateCall should be rewritten by the planner before evaluation")
+            }
         }
     }
 }

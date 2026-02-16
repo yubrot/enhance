@@ -51,6 +51,18 @@ pub enum ExecutorError {
     /// Duplicate column name in column list.
     DuplicateColumn { name: String },
 
+    /// Aggregate function used in a context where it is not allowed.
+    AggregateNotAllowed {
+        /// The context in which the aggregate was used (e.g., "WHERE clause").
+        context: String,
+    },
+
+    /// Non-aggregated column in SELECT/HAVING/ORDER BY with GROUP BY.
+    NonAggregatedColumn {
+        /// The column name that is not aggregated.
+        name: String,
+    },
+
     /// Unsupported operation or feature.
     Unsupported(String),
 
@@ -108,6 +120,16 @@ impl std::fmt::Display for ExecutorError {
             }
             ExecutorError::DuplicateColumn { name } => {
                 write!(f, "column \"{}\" specified more than once", name)
+            }
+            ExecutorError::AggregateNotAllowed { context } => {
+                write!(f, "aggregate functions are not allowed in {}", context)
+            }
+            ExecutorError::NonAggregatedColumn { name } => {
+                write!(
+                    f,
+                    "column \"{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+                    name
+                )
             }
             ExecutorError::Unsupported(msg) => write!(f, "unsupported: {}", msg),
             ExecutorError::Heap(e) => write!(f, "{}", e),
