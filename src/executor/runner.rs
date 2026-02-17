@@ -817,7 +817,7 @@ mod tests {
     use crate::executor::planner;
     use crate::executor::tests::{bind_expr, int_col};
     use crate::heap::{HeapPage, Record};
-    use crate::sql::tests::{parse_delete, parse_insert, parse_update};
+    use crate::sql::tests::{parse_delete, parse_insert, parse_select, parse_update};
     use crate::storage::{LruReplacer, MemoryStorage, PageId};
 
     use crate::tx::CommandId;
@@ -1320,8 +1320,6 @@ mod tests {
     /// Helper to set up a table with data and plan+execute a SELECT query,
     /// returning all result rows.
     async fn query_rows(ddl: &str, inserts: &[&str], select_sql: &str) -> Vec<Vec<Value>> {
-        use crate::sql::tests::parse_select;
-
         let (db, snapshot, catalog) = setup_table_and_ctx(ddl).await;
 
         // Insert data
@@ -1753,5 +1751,231 @@ mod tests {
         // 'eng' has COUNT=2, others have COUNT=1
         assert_eq!(rows[0][0], Value::Text("eng".into()));
         assert_eq!(rows[0][1], Value::Bigint(2));
+    }
+
+    // --- Integration tests: combined queries (GROUP BY + ORDER BY + LIMIT) ---
+
+    /// Tests LIMIT cutting within rows that share equal sort keys.
+    /// Extends `test_sort_by_aggregate_with_limit` with more groups and ties.
+    #[tokio::test]
+    async fn test_group_by_order_by_limit() {
+        let rows = query_rows(
+            "CREATE TABLE t (dept TEXT, salary INTEGER)",
+            &[
+                "INSERT INTO t VALUES ('eng', 200)",
+                "INSERT INTO t VALUES ('eng', 100)",
+                "INSERT INTO t VALUES ('eng', 150)",
+                "INSERT INTO t VALUES ('sales', 300)",
+                "INSERT INTO t VALUES ('sales', 250)",
+                "INSERT INTO t VALUES ('hr', 150)",
+                "INSERT INTO t VALUES ('hr', 100)",
+                "INSERT INTO t VALUES ('ops', 400)",
+            ],
+            "SELECT dept, COUNT(*) FROM t GROUP BY dept ORDER BY COUNT(*) DESC LIMIT 3",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 3);
+        // eng has 3, sales has 2, hr has 2 (tie broken by sort stability / hash order)
+        assert_eq!(rows[0][0], Value::Text("eng".into()));
+        assert_eq!(rows[0][1], Value::Bigint(3));
+        // The next two should each have COUNT=2 (sales and hr) or COUNT=1 (ops excluded)
+        assert_eq!(rows[1][1], Value::Bigint(2));
+        assert_eq!(rows[2][1], Value::Bigint(2));
+    }
+
+    #[tokio::test]
+    async fn test_where_group_by_having_order_by_limit() {
+        // Full pipeline: WHERE → Aggregate → HAVING → Sort → Projection → Limit
+        let rows = query_rows(
+            "CREATE TABLE t (dept TEXT, salary INTEGER, active BOOLEAN)",
+            &[
+                "INSERT INTO t VALUES ('eng', 200, TRUE)",
+                "INSERT INTO t VALUES ('eng', 100, TRUE)",
+                "INSERT INTO t VALUES ('eng', 50, FALSE)",
+                "INSERT INTO t VALUES ('sales', 300, TRUE)",
+                "INSERT INTO t VALUES ('sales', 150, TRUE)",
+                "INSERT INTO t VALUES ('hr', 100, TRUE)",
+                "INSERT INTO t VALUES ('hr', 200, TRUE)",
+                "INSERT INTO t VALUES ('hr', 50, FALSE)",
+            ],
+            "SELECT dept, SUM(salary) FROM t WHERE active = TRUE GROUP BY dept HAVING SUM(salary) > 200 ORDER BY SUM(salary) DESC LIMIT 2",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 2);
+        // After WHERE: eng(200,100), sales(300,150), hr(100,200)
+        // After GROUP BY: eng=300, sales=450, hr=300
+        // After HAVING (>200): eng=300, sales=450, hr=300
+        // After ORDER BY DESC: sales=450, eng=300, hr=300
+        // After LIMIT 2: sales=450, then eng or hr (both 300)
+        assert_eq!(rows[0][0], Value::Text("sales".into()));
+        assert_eq!(rows[0][1], Value::Bigint(450));
+        assert_eq!(rows[1][1], Value::Bigint(300));
+    }
+
+    #[tokio::test]
+    async fn test_group_by_expression_order_by_alias() {
+        // GROUP BY expression (x + 1), ORDER BY alias
+        let rows = query_rows(
+            "CREATE TABLE t (x INTEGER, v INTEGER)",
+            &[
+                "INSERT INTO t VALUES (1, 10)",
+                "INSERT INTO t VALUES (1, 20)",
+                "INSERT INTO t VALUES (2, 30)",
+                "INSERT INTO t VALUES (2, 40)",
+                "INSERT INTO t VALUES (3, 50)",
+            ],
+            "SELECT x + 1 AS y, SUM(v) FROM t GROUP BY x + 1 ORDER BY y",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 3);
+        // x+1=2 → SUM=30, x+1=3 → SUM=70, x+1=4 → SUM=50
+        assert_eq!(rows[0][0], Value::Bigint(2));
+        assert_eq!(rows[0][1], Value::Bigint(30));
+        assert_eq!(rows[1][0], Value::Bigint(3));
+        assert_eq!(rows[1][1], Value::Bigint(70));
+        assert_eq!(rows[2][0], Value::Bigint(4));
+        assert_eq!(rows[2][1], Value::Bigint(50));
+    }
+
+    #[tokio::test]
+    async fn test_order_by_aggregate_result_via_alias() {
+        let rows = query_rows(
+            "CREATE TABLE t (dept TEXT, salary INTEGER)",
+            &[
+                "INSERT INTO t VALUES ('eng', 100)",
+                "INSERT INTO t VALUES ('eng', 200)",
+                "INSERT INTO t VALUES ('sales', 50)",
+                "INSERT INTO t VALUES ('hr', 300)",
+            ],
+            "SELECT dept, SUM(salary) AS total FROM t GROUP BY dept ORDER BY total DESC",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 3);
+        // eng=300, hr=300, sales=50; tie-breaking between eng/hr is non-deterministic
+        assert_eq!(rows[0][1], Value::Bigint(300));
+        assert_eq!(rows[1][1], Value::Bigint(300));
+        assert_eq!(rows[2][0], Value::Text("sales".into()));
+        assert_eq!(rows[2][1], Value::Bigint(50));
+    }
+
+    #[tokio::test]
+    async fn test_order_by_aggregate_expression() {
+        // ORDER BY an aggregate expression not in SELECT list
+        let rows = query_rows(
+            "CREATE TABLE t (dept TEXT, salary INTEGER)",
+            &[
+                "INSERT INTO t VALUES ('eng', 100)",
+                "INSERT INTO t VALUES ('eng', 200)",
+                "INSERT INTO t VALUES ('sales', 300)",
+            ],
+            "SELECT dept FROM t GROUP BY dept ORDER BY COUNT(*) DESC",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 2);
+        // eng has 2, sales has 1
+        assert_eq!(rows[0], vec![Value::Text("eng".into())]);
+        assert_eq!(rows[1], vec![Value::Text("sales".into())]);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_aggregates_with_having_and_limit() {
+        let rows = query_rows(
+            "CREATE TABLE t (cat TEXT, val INTEGER)",
+            &[
+                "INSERT INTO t VALUES ('a', 10)",
+                "INSERT INTO t VALUES ('a', 20)",
+                "INSERT INTO t VALUES ('a', 30)",
+                "INSERT INTO t VALUES ('b', 5)",
+                "INSERT INTO t VALUES ('b', 15)",
+                "INSERT INTO t VALUES ('c', 100)",
+            ],
+            "SELECT cat, COUNT(*), SUM(val), MIN(val), MAX(val) FROM t GROUP BY cat HAVING COUNT(*) > 1 ORDER BY cat LIMIT 2",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 2);
+        // cat='a': COUNT=3, SUM=60, MIN=10, MAX=30
+        assert_eq!(rows[0][0], Value::Text("a".into()));
+        assert_eq!(rows[0][1], Value::Bigint(3));
+        assert_eq!(rows[0][2], Value::Bigint(60));
+        assert_eq!(rows[0][3], Value::Integer(10));
+        assert_eq!(rows[0][4], Value::Integer(30));
+        // cat='b': COUNT=2, SUM=20, MIN=5, MAX=15
+        assert_eq!(rows[1][0], Value::Text("b".into()));
+        assert_eq!(rows[1][1], Value::Bigint(2));
+        assert_eq!(rows[1][2], Value::Bigint(20));
+        assert_eq!(rows[1][3], Value::Integer(5));
+        assert_eq!(rows[1][4], Value::Integer(15));
+    }
+
+    #[tokio::test]
+    async fn test_combined_explain_output() {
+        // Verify EXPLAIN output includes all node types in a combined plan
+
+        let (db, snapshot, catalog) =
+            setup_table_and_ctx("CREATE TABLE t (dept TEXT, salary INTEGER)").await;
+
+        // We only need to plan, not execute
+        let _ = (db, snapshot); // suppress unused warnings
+        let select = parse_select(
+            "SELECT dept, COUNT(*) FROM t GROUP BY dept ORDER BY COUNT(*) DESC LIMIT 3",
+        );
+        let plan = planner::plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+
+        // Full plan tree: Limit → Projection → Sort → Aggregate → SeqScan
+        assert!(explain.contains("Limit:"), "explain should contain Limit");
+        assert!(
+            explain.contains("Projection:"),
+            "explain should contain Projection"
+        );
+        assert!(explain.contains("Sort:"), "explain should contain Sort");
+        assert!(
+            explain.contains("Aggregate:"),
+            "explain should contain Aggregate"
+        );
+        assert!(
+            explain.contains("SeqScan on t"),
+            "explain should contain SeqScan"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_combined_explain_with_filter_and_having() {
+        // Verify EXPLAIN output with WHERE and HAVING
+
+        let (db, snapshot, catalog) =
+            setup_table_and_ctx("CREATE TABLE t (dept TEXT, salary INTEGER, active BOOLEAN)").await;
+
+        let _ = (db, snapshot);
+        let select = parse_select(
+            "SELECT dept, SUM(salary) FROM t WHERE active = TRUE GROUP BY dept HAVING SUM(salary) > 100 ORDER BY dept LIMIT 5",
+        );
+        let plan = planner::plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+
+        // Full plan tree: Limit → Projection → Sort → Filter(HAVING) → Aggregate → Filter(WHERE) → SeqScan
+        assert!(explain.contains("Limit:"), "explain should contain Limit");
+        assert!(explain.contains("Sort:"), "explain should contain Sort");
+        // There should be two Filter nodes (WHERE and HAVING)
+        let filter_count = explain.matches("Filter:").count();
+        assert_eq!(
+            filter_count, 2,
+            "explain should contain two Filter nodes (WHERE and HAVING), got {}",
+            filter_count
+        );
+        assert!(
+            explain.contains("Aggregate:"),
+            "explain should contain Aggregate"
+        );
+        assert!(
+            explain.contains("SeqScan on t"),
+            "explain should contain SeqScan"
+        );
     }
 }

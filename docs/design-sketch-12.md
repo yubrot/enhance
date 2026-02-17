@@ -598,6 +598,7 @@ No circular dependencies. `aggregate` is a peer of `expr`/`eval`, both under `ex
   - Edge cases: LIMIT 0, large OFFSET, negative values (planning-time error), non-integer expressions (planning-time error).
   - Deviation: Combined with Commit 3 (see above). Added `plan_limit_offset` guard to skip creating a no-op Limit node when `limit.is_none() && offset == 0` (not in original plan, identified during review). Updated `test_psql_complex_select` integration test to reflect ORDER BY support (no longer returns "unsupported").
 
-- [ ] **Commit 5: Integration and combined queries** — End-to-end tests combining all features. Full plan tree verification.
+- [x] **Commit 5: Integration and combined queries** — End-to-end tests combining all features. Full plan tree verification.
   - Tests: `SELECT dept, COUNT(*) FROM t GROUP BY dept ORDER BY COUNT(*) DESC LIMIT 3`, `SELECT COUNT(*) FROM t`, aggregate with WHERE + HAVING + ORDER BY + LIMIT, `SELECT x + 1 AS y, SUM(v) FROM t GROUP BY x + 1 ORDER BY y`. Full EXPLAIN output validation for combined plans.
   - Edge cases: ORDER BY aggregate result via alias, GROUP BY + ORDER BY + LIMIT interaction, EXPLAIN with all node types.
+  - Deviation: `SELECT COUNT(*) FROM t` is not added as a separate integration test because it is already covered by `test_aggregate_scalar_count` from Commit 2. Added session-layer end-to-end tests (`test_group_by_order_by_limit_end_to_end`, `test_explain_combined_plan`, `test_aggregate_with_where_having_order_limit`) beyond what was specified, to validate the full SQL-to-result pipeline including parsing and session management.
