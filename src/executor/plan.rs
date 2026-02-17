@@ -9,10 +9,23 @@
 //!   [`DmlPlan::execute_dml`].
 
 use crate::datum::Type;
+use crate::sql::{NullOrdering, SortDirection};
 use crate::storage::PageId;
 
 use super::ColumnDesc;
+use super::aggregate::AggregateOp;
 use super::expr::BoundExpr;
+
+/// ORDER BY item in a plan node.
+#[derive(Debug, Clone)]
+pub struct SortItem {
+    /// Expression to sort by (bound against the Sort node's child output schema).
+    pub expr: BoundExpr,
+    /// Sort direction (ASC/DESC).
+    pub direction: SortDirection,
+    /// NULL ordering (FIRST/LAST/Default).
+    pub nulls: NullOrdering,
+}
 
 /// A row-producing logical query plan node.
 ///
@@ -48,6 +61,40 @@ pub enum QueryPlan {
         exprs: Vec<BoundExpr>,
         /// Output column descriptors.
         columns: Vec<ColumnDesc>,
+    },
+    /// Hash-aggregate node.
+    ///
+    /// Output schema: \[group_by columns..., aggregate results...\].
+    /// When `group_by` is empty, produces exactly one row (scalar aggregate).
+    Aggregate {
+        /// Child plan to pull rows from.
+        input: Box<QueryPlan>,
+        /// GROUP BY expressions (bound against child's output schema).
+        group_by: Vec<BoundExpr>,
+        /// Aggregate operations to compute.
+        aggregates: Vec<AggregateOp>,
+        /// Output column descriptors.
+        columns: Vec<ColumnDesc>,
+    },
+    /// In-memory sort node.
+    Sort {
+        /// Child plan to pull rows from.
+        input: Box<QueryPlan>,
+        /// Sort key items (expression, direction, null ordering).
+        items: Vec<SortItem>,
+    },
+    /// LIMIT/OFFSET node.
+    ///
+    /// Values are evaluated at planning time (constant expressions only).
+    /// Type checking (must be integer), negative value rejection, and
+    /// i64→u64 conversion all happen in the planner, not at execution time.
+    Limit {
+        /// Child plan to pull rows from.
+        input: Box<QueryPlan>,
+        /// Maximum rows to return (None = no limit).
+        limit: Option<u64>,
+        /// Rows to skip before returning (0 = no offset).
+        offset: u64,
     },
     /// Single-row scan for queries without FROM (e.g., `SELECT 1+1`).
     ValuesScan,
@@ -103,6 +150,9 @@ impl QueryPlan {
             QueryPlan::SeqScan { columns, .. } => columns,
             QueryPlan::Filter { input, .. } => input.columns(),
             QueryPlan::Projection { columns, .. } => columns,
+            QueryPlan::Aggregate { columns, .. } => columns,
+            QueryPlan::Sort { input, .. } => input.columns(),
+            QueryPlan::Limit { input, .. } => input.columns(),
             QueryPlan::ValuesScan => &[],
         }
     }
@@ -158,6 +208,69 @@ impl QueryPlan {
                 writeln!(f)?;
                 input.fmt_explain(f, indent + 1)
             }
+            QueryPlan::Aggregate {
+                input,
+                group_by,
+                aggregates,
+                ..
+            } => {
+                write!(f, "Aggregate: group_by=[")?;
+                for (i, expr) in group_by.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", expr)?;
+                }
+                write!(f, "], aggregates=[")?;
+                for (i, op) in aggregates.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", op)?;
+                }
+                writeln!(f, "]")?;
+                input.fmt_explain(f, indent + 1)
+            }
+            QueryPlan::Sort { input, items } => {
+                write!(f, "Sort: ")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", item.expr)?;
+                    match item.direction {
+                        SortDirection::Asc => write!(f, " ASC")?,
+                        SortDirection::Desc => write!(f, " DESC")?,
+                    }
+                    match item.nulls {
+                        NullOrdering::First => write!(f, " NULLS FIRST")?,
+                        NullOrdering::Last => write!(f, " NULLS LAST")?,
+                        NullOrdering::Default => {}
+                    }
+                }
+                writeln!(f)?;
+                input.fmt_explain(f, indent + 1)
+            }
+            QueryPlan::Limit {
+                input,
+                limit,
+                offset,
+            } => {
+                write!(f, "Limit: ")?;
+                let mut first = true;
+                if let Some(n) = limit {
+                    write!(f, "limit={}", n)?;
+                    first = false;
+                }
+                if *offset > 0 {
+                    if !first {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "offset={}", offset)?;
+                }
+                writeln!(f)?;
+                input.fmt_explain(f, indent + 1)
+            }
             QueryPlan::ValuesScan => write!(f, "ValuesScan (1 row)"),
         }
     }
@@ -207,6 +320,7 @@ impl DmlPlan {
 mod tests {
     use super::*;
     use crate::datum::Type;
+    use crate::executor::aggregate::{AggregateFunction, AggregateOp};
     use crate::executor::tests::{bind_expr, int_col};
     use crate::storage::PageId;
 
@@ -259,6 +373,98 @@ mod tests {
             plan.explain(),
             "Projection: $col1 (name)\n  SeqScan on users (cols: id, name)"
         );
+    }
+
+    #[test]
+    fn test_explain_aggregate() {
+        let scan = QueryPlan::SeqScan {
+            table_name: "emp".to_string(),
+            table_id: 1,
+            first_page: PageId::new(10),
+            schema: vec![Type::Text, Type::Bigint],
+            columns: vec![int_col("dept"), int_col("salary")],
+        };
+        let plan = QueryPlan::Aggregate {
+            input: Box::new(scan),
+            group_by: vec![bind_expr("dept", &[int_col("dept"), int_col("salary")])],
+            aggregates: vec![AggregateOp {
+                func: AggregateFunction::Count,
+                args: vec![],
+                distinct: false,
+            }],
+            columns: vec![int_col("dept"), int_col("count")],
+        };
+        assert_eq!(
+            plan.explain(),
+            "Aggregate: group_by=[$col0 (dept)], aggregates=[COUNT(*)]\n  SeqScan on emp (cols: dept, salary)"
+        );
+    }
+
+    #[test]
+    fn test_explain_sort() {
+        let scan = QueryPlan::SeqScan {
+            table_name: "users".to_string(),
+            table_id: 1,
+            first_page: PageId::new(10),
+            schema: vec![Type::Bigint, Type::Text],
+            columns: vec![int_col("id"), int_col("name")],
+        };
+        let plan = QueryPlan::Sort {
+            input: Box::new(scan),
+            items: vec![
+                SortItem {
+                    expr: bind_expr("name", &[int_col("id"), int_col("name")]),
+                    direction: crate::sql::SortDirection::Asc,
+                    nulls: crate::sql::NullOrdering::Default,
+                },
+                SortItem {
+                    expr: bind_expr("id", &[int_col("id"), int_col("name")]),
+                    direction: crate::sql::SortDirection::Desc,
+                    nulls: crate::sql::NullOrdering::First,
+                },
+            ],
+        };
+        assert_eq!(
+            plan.explain(),
+            "Sort: $col1 (name) ASC, $col0 (id) DESC NULLS FIRST\n  SeqScan on users (cols: id, name)"
+        );
+    }
+
+    #[test]
+    fn test_explain_limit() {
+        let scan = QueryPlan::SeqScan {
+            table_name: "users".to_string(),
+            table_id: 1,
+            first_page: PageId::new(10),
+            schema: vec![Type::Bigint],
+            columns: vec![int_col("id")],
+        };
+        let plan = QueryPlan::Limit {
+            input: Box::new(scan),
+            limit: Some(10),
+            offset: 5,
+        };
+        assert_eq!(
+            plan.explain(),
+            "Limit: limit=10 offset=5\n  SeqScan on users (cols: id)"
+        );
+    }
+
+    #[test]
+    fn test_explain_limit_only() {
+        let scan = QueryPlan::SeqScan {
+            table_name: "t".to_string(),
+            table_id: 1,
+            first_page: PageId::new(10),
+            schema: vec![Type::Bigint],
+            columns: vec![int_col("id")],
+        };
+        let plan = QueryPlan::Limit {
+            input: Box::new(scan),
+            limit: Some(5),
+            offset: 0,
+        };
+        assert_eq!(plan.explain(), "Limit: limit=5\n  SeqScan on t (cols: id)");
     }
 
     #[test]

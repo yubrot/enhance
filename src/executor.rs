@@ -37,6 +37,7 @@
 //! - [`Row`]: A single row produced by executor nodes (record + optional physical location)
 //! - [`ColumnDesc`]: Metadata describing a result column (name, type, source table info)
 
+mod aggregate;
 mod column;
 mod context;
 mod error;
@@ -47,11 +48,12 @@ mod planner;
 mod row;
 mod runner;
 
+pub use aggregate::{AggregateFunction, AggregateOp};
 pub use column::{ColumnDesc, ColumnSource};
 pub use context::ExecContext;
 pub use error::ExecutorError;
 pub use expr::BoundExpr;
-pub use plan::{DmlPlan, QueryPlan};
+pub use plan::{DmlPlan, QueryPlan, SortItem};
 pub use planner::{plan_delete, plan_insert, plan_select, plan_update};
 pub use row::Row;
 pub use runner::{DmlResult, QueryNode};

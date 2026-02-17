@@ -8,9 +8,10 @@ use crate::sql::{
     DeleteStmt, Expr, FromClause, InsertStmt, SelectItem, SelectStmt, TableRef, UpdateStmt,
 };
 
+use super::aggregate::{AggregateFunction, AggregateOp};
 use super::error::ExecutorError;
-use super::expr::BoundExpr;
-use super::plan::{DmlPlan, QueryPlan};
+use super::expr::{BoundExpr, BoundWhenClause};
+use super::plan::{DmlPlan, QueryPlan, SortItem};
 use super::{ColumnDesc, ColumnSource};
 
 /// Plans a SELECT statement into a logical [`QueryPlan`] tree.
@@ -33,21 +34,6 @@ pub fn plan_select(select: &SelectStmt, catalog: &Catalog) -> Result<QueryPlan, 
     if select.distinct {
         return Err(ExecutorError::Unsupported("DISTINCT".to_string()));
     }
-    if !select.group_by.is_empty() {
-        return Err(ExecutorError::Unsupported("GROUP BY".to_string()));
-    }
-    if select.having.is_some() {
-        return Err(ExecutorError::Unsupported("HAVING".to_string()));
-    }
-    if !select.order_by.is_empty() {
-        return Err(ExecutorError::Unsupported("ORDER BY".to_string()));
-    }
-    if select.limit.is_some() {
-        return Err(ExecutorError::Unsupported("LIMIT".to_string()));
-    }
-    if select.offset.is_some() {
-        return Err(ExecutorError::Unsupported("OFFSET".to_string()));
-    }
     if select.locking.is_some() {
         return Err(ExecutorError::Unsupported("FOR UPDATE/SHARE".to_string()));
     }
@@ -57,14 +43,198 @@ pub fn plan_select(select: &SelectStmt, catalog: &Catalog) -> Result<QueryPlan, 
         Some(from) => build_from_plan(from, catalog)?,
         None => QueryPlan::ValuesScan,
     };
+    let scan_columns = plan.columns().to_vec();
 
-    // Step 2: WHERE clause -> Filter (bind column names to indices)
+    // Step 2: WHERE clause -> Filter
+    // Validate: no aggregates in WHERE
+    if let Some(ref where_clause) = select.where_clause
+        && contains_aggregate(where_clause)
+    {
+        return Err(ExecutorError::AggregateNotAllowed {
+            context: "WHERE clause".to_string(),
+        });
+    }
     plan = apply_filter(plan, select.where_clause.as_ref())?;
 
-    // Step 3: SELECT list -> Projection
-    plan = build_projection_plan(plan, &select.columns)?;
+    // Step 3: Detect aggregation context
+    // ORDER BY expressions must also be checked — `SELECT x FROM t ORDER BY COUNT(*)`
+    // triggers aggregation context, leading to NonAggregatedColumn for x.
+    let has_aggregation = !select.group_by.is_empty()
+        || select.columns.iter().any(|item| match item {
+            SelectItem::Expr { expr, .. } => contains_aggregate(expr),
+            _ => false,
+        })
+        || select.having.as_ref().is_some_and(contains_aggregate)
+        || select
+            .order_by
+            .iter()
+            .any(|ob| contains_aggregate(&ob.expr));
+
+    if has_aggregation {
+        plan = plan_aggregation(plan, select, &scan_columns)?;
+    } else {
+        // No aggregation — HAVING without aggregate context is an error
+        if select.having.is_some() {
+            return Err(ExecutorError::Unsupported(
+                "HAVING without GROUP BY or aggregates".to_string(),
+            ));
+        }
+
+        // Step 4a: ORDER BY without aggregation
+        plan = plan_order_by_simple(plan, select)?;
+
+        // Step 5a: Projection
+        plan = build_projection_plan(plan, &select.columns)?;
+    }
+
+    // Step 6: LIMIT/OFFSET
+    plan = plan_limit_offset(plan, select)?;
 
     Ok(plan)
+}
+
+/// Plans the aggregation portion of a SELECT: GROUP BY binding, aggregate
+/// extraction, HAVING rewrite, ORDER BY rewrite, and final Projection.
+///
+/// Called only when the SELECT is in an aggregation context (GROUP BY is
+/// present, or SELECT/HAVING/ORDER BY contain aggregate function calls).
+fn plan_aggregation(
+    plan: QueryPlan,
+    select: &SelectStmt,
+    scan_columns: &[ColumnDesc],
+) -> Result<QueryPlan, ExecutorError> {
+    // 1. Bind GROUP BY expressions against scan_columns
+    let mut bound_group_by = Vec::new();
+    for expr in &select.group_by {
+        // Validate: no aggregates in GROUP BY
+        if contains_aggregate(expr) {
+            return Err(ExecutorError::AggregateNotAllowed {
+                context: "GROUP BY expression".to_string(),
+            });
+        }
+        bound_group_by.push(expr.bind(scan_columns)?);
+    }
+
+    // 2. Resolve SELECT items against scan_columns
+    let mut select_bound_exprs = Vec::new();
+    let mut select_descs = Vec::new();
+    for item in &select.columns {
+        for (expr, desc) in resolve_select_item(item, scan_columns)? {
+            select_bound_exprs.push(expr);
+            select_descs.push(desc);
+        }
+    }
+
+    // 3. Validate aggregate argument types (SUM/AVG must be numeric)
+    // and no nested aggregates (aggregate within aggregate)
+    for expr in &select_bound_exprs {
+        validate_bound_aggregates(expr)?;
+    }
+
+    // 4. Rewrite SELECT expressions for aggregate output.
+    // All aggregate extraction (SELECT, HAVING, ORDER BY) shares a single
+    // aggregates Vec so duplicate aggregates reuse the same output position.
+    let mut aggregates: Vec<AggregateOp> = Vec::new();
+    let mut rewritten_select = Vec::new();
+    for expr in select_bound_exprs {
+        rewritten_select.push(rewrite_for_aggregate_output(
+            expr,
+            &bound_group_by,
+            &mut aggregates,
+        )?);
+    }
+
+    // 5. Rewrite HAVING if present (shares aggregate list with SELECT)
+    let rewritten_having = if let Some(ref having_expr) = select.having {
+        let bound_having = having_expr.bind(scan_columns)?;
+        validate_bound_aggregates(&bound_having)?;
+        Some(rewrite_for_aggregate_output(
+            bound_having,
+            &bound_group_by,
+            &mut aggregates,
+        )?)
+    } else {
+        None
+    };
+
+    // 6. Resolve ORDER BY expressions (shares aggregate list with SELECT/HAVING).
+    // Must be resolved before building the Aggregate node because ORDER BY
+    // expressions like `ORDER BY COUNT(*)` may add new aggregates.
+    let sort_items = if !select.order_by.is_empty() {
+        let mut items = Vec::new();
+        for ob in &select.order_by {
+            let sort_item = resolve_order_by_expr(ob, &rewritten_select, &select_descs, |expr| {
+                let bound = expr.bind(scan_columns)?;
+                validate_bound_aggregates(&bound)?;
+                rewrite_for_aggregate_output(bound, &bound_group_by, &mut aggregates)
+            })?;
+            items.push(sort_item);
+        }
+        Some(items)
+    } else {
+        None
+    };
+
+    // 7. Build Aggregate output schema (done after ORDER BY so the schema
+    // includes any aggregates added by ORDER BY expressions).
+    let mut agg_columns = Vec::new();
+    for (i, gb_expr) in bound_group_by.iter().enumerate() {
+        if let BoundExpr::Column { index, .. } = gb_expr {
+            agg_columns.push(scan_columns[*index].clone());
+        } else {
+            // GROUP BY expression: synthetic descriptor
+            agg_columns.push(ColumnDesc {
+                name: format!("group_{}", i),
+                source: None,
+                ty: gb_expr.ty().unwrap_or(Type::Text),
+            });
+        }
+    }
+    for op in &aggregates {
+        agg_columns.push(ColumnDesc {
+            name: op.to_string().to_lowercase(),
+            source: None,
+            ty: op.output_type(),
+        });
+    }
+
+    // 8. Build Aggregate plan node
+    let mut result = QueryPlan::Aggregate {
+        input: Box::new(plan),
+        group_by: bound_group_by,
+        aggregates,
+        columns: agg_columns,
+    };
+
+    // 9. Apply HAVING filter
+    if let Some(having_pred) = rewritten_having {
+        result = QueryPlan::Filter {
+            input: Box::new(result),
+            predicate: having_pred,
+        };
+    }
+
+    // 10. Apply Sort if ORDER BY was present
+    if let Some(items) = sort_items {
+        result = QueryPlan::Sort {
+            input: Box::new(result),
+            items,
+        };
+    }
+
+    // 11. Build Projection (update column types from rewritten expressions first)
+    for (i, expr) in rewritten_select.iter().enumerate() {
+        if let Some(ty) = expr.ty() {
+            select_descs[i].ty = ty;
+        }
+    }
+    result = QueryPlan::Projection {
+        input: Box::new(result),
+        exprs: rewritten_select,
+        columns: select_descs,
+    };
+
+    Ok(result)
 }
 
 /// Plans an INSERT statement into a logical [`DmlPlan::Insert`].
@@ -417,6 +587,542 @@ fn resolve_select_item(
             };
             Ok(vec![(bound, ColumnDesc { name, source, ty })])
         }
+    }
+}
+
+/// Checks whether an AST [`Expr`] contains an aggregate function call.
+///
+/// Used to detect aggregation context and to validate that aggregates are
+/// not present in forbidden positions (WHERE, GROUP BY).
+/// Does not descend into subqueries, as aggregates in subqueries belong
+/// to the inner context.
+fn contains_aggregate(expr: &Expr) -> bool {
+    match expr {
+        // NOTE: Does not recurse into `args` because non-aggregate functions
+        // are currently unsupported (Expr::bind returns Unsupported). If
+        // scalar functions are added, this must recurse into args.
+        Expr::Function { name, .. } => AggregateFunction::from_name(name).is_some(),
+        Expr::BinaryOp { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
+        Expr::UnaryOp { operand, .. } => contains_aggregate(operand),
+        Expr::IsNull { expr, .. } => contains_aggregate(expr),
+        Expr::InList { expr, list, .. } => {
+            contains_aggregate(expr) || list.iter().any(contains_aggregate)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => contains_aggregate(expr) || contains_aggregate(low) || contains_aggregate(high),
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            contains_aggregate(expr)
+                || contains_aggregate(pattern)
+                || escape.as_deref().is_some_and(contains_aggregate)
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(contains_aggregate)
+                || when_clauses
+                    .iter()
+                    .any(|wc| contains_aggregate(&wc.condition) || contains_aggregate(&wc.result))
+                || else_result.as_deref().is_some_and(contains_aggregate)
+        }
+        Expr::Cast { expr, .. } => contains_aggregate(expr),
+        // Leaf nodes and subqueries — no aggregate in this context
+        Expr::Null
+        | Expr::Boolean(_)
+        | Expr::Integer(_)
+        | Expr::Float(_)
+        | Expr::String(_)
+        | Expr::ColumnRef { .. }
+        | Expr::Parameter(_)
+        | Expr::InSubquery { .. }
+        | Expr::Exists { .. }
+        | Expr::Subquery(_) => false,
+    }
+}
+
+/// Validates aggregate function arguments within a [`BoundExpr`] tree.
+///
+/// Checks two invariants:
+/// - **No nested aggregates**: `COUNT(SUM(x))` is an error
+/// - **SUM/AVG arguments must be numeric**: `SUM(text_column)` is an error
+fn validate_bound_aggregates(expr: &BoundExpr) -> Result<(), ExecutorError> {
+    match expr {
+        BoundExpr::AggregateCall { func, args, .. } => {
+            // Check for nested aggregates
+            for arg in args {
+                if bound_contains_aggregate(arg) {
+                    return Err(ExecutorError::AggregateNotAllowed {
+                        context: "aggregate function call".to_string(),
+                    });
+                }
+            }
+            // Check SUM/AVG argument types
+            if matches!(func, AggregateFunction::Sum | AggregateFunction::Avg)
+                && let Some(arg) = args.first()
+                && let Some(ty) = arg.ty()
+                && ty.to_wide_numeric().is_none()
+            {
+                return Err(ExecutorError::TypeMismatch {
+                    expected: "numeric".to_string(),
+                    found: Some(ty),
+                });
+            }
+            Ok(())
+        }
+        BoundExpr::BinaryOp { left, right, .. } => {
+            validate_bound_aggregates(left)?;
+            validate_bound_aggregates(right)
+        }
+        BoundExpr::UnaryOp { operand, .. } => validate_bound_aggregates(operand),
+        BoundExpr::IsNull { expr, .. } => validate_bound_aggregates(expr),
+        BoundExpr::InList { expr, list, .. } => {
+            validate_bound_aggregates(expr)?;
+            for e in list {
+                validate_bound_aggregates(e)?;
+            }
+            Ok(())
+        }
+        BoundExpr::Between {
+            expr, low, high, ..
+        } => {
+            validate_bound_aggregates(expr)?;
+            validate_bound_aggregates(low)?;
+            validate_bound_aggregates(high)
+        }
+        BoundExpr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            validate_bound_aggregates(expr)?;
+            validate_bound_aggregates(pattern)?;
+            if let Some(e) = escape {
+                validate_bound_aggregates(e)?;
+            }
+            Ok(())
+        }
+        BoundExpr::Case {
+            operand,
+            when_clauses,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                validate_bound_aggregates(op)?;
+            }
+            for wc in when_clauses {
+                validate_bound_aggregates(&wc.condition)?;
+                validate_bound_aggregates(&wc.result)?;
+            }
+            if let Some(e) = else_result {
+                validate_bound_aggregates(e)?;
+            }
+            Ok(())
+        }
+        BoundExpr::Cast { expr, .. } => validate_bound_aggregates(expr),
+        _ => Ok(()),
+    }
+}
+
+/// Returns `true` if a [`BoundExpr`] tree contains an [`BoundExpr::AggregateCall`].
+fn bound_contains_aggregate(expr: &BoundExpr) -> bool {
+    match expr {
+        BoundExpr::AggregateCall { .. } => true,
+        BoundExpr::BinaryOp { left, right, .. } => {
+            bound_contains_aggregate(left) || bound_contains_aggregate(right)
+        }
+        BoundExpr::UnaryOp { operand, .. } => bound_contains_aggregate(operand),
+        BoundExpr::IsNull { expr, .. } => bound_contains_aggregate(expr),
+        BoundExpr::InList { expr, list, .. } => {
+            bound_contains_aggregate(expr) || list.iter().any(bound_contains_aggregate)
+        }
+        BoundExpr::Between {
+            expr, low, high, ..
+        } => {
+            bound_contains_aggregate(expr)
+                || bound_contains_aggregate(low)
+                || bound_contains_aggregate(high)
+        }
+        BoundExpr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            bound_contains_aggregate(expr)
+                || bound_contains_aggregate(pattern)
+                || escape.as_deref().is_some_and(bound_contains_aggregate)
+        }
+        BoundExpr::Case {
+            operand,
+            when_clauses,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(bound_contains_aggregate)
+                || when_clauses.iter().any(|wc| {
+                    bound_contains_aggregate(&wc.condition) || bound_contains_aggregate(&wc.result)
+                })
+                || else_result.as_deref().is_some_and(bound_contains_aggregate)
+        }
+        BoundExpr::Cast { expr, .. } => bound_contains_aggregate(expr),
+        _ => false,
+    }
+}
+
+/// Rewrites a [`BoundExpr`] for use on top of an Aggregate node's output.
+///
+/// Four rewrite rules applied in order:
+///
+/// 1. **`AggregateCall` extraction**: Moves the aggregate operation into the
+///    shared `aggregates` list (deduplicating via `PartialEq`) and replaces
+///    the call with a `Column` reference pointing to the aggregate's output
+///    position (`group_by.len() + agg_index`).
+///
+/// 2. **GROUP BY match**: If the entire expression structurally matches a
+///    GROUP BY expression (via `PartialEq`), it is replaced with a `Column`
+///    reference pointing to the matching group key position.
+///
+/// 3. **Leaf handling**: Literal constants pass through unchanged. Unresolved
+///    `Column` references that don't match any GROUP BY key produce
+///    [`ExecutorError::NonAggregatedColumn`].
+///
+/// 4. **Composite expressions**: Recursed into child nodes.
+fn rewrite_for_aggregate_output(
+    expr: BoundExpr,
+    group_by: &[BoundExpr],
+    aggregates: &mut Vec<AggregateOp>,
+) -> Result<BoundExpr, ExecutorError> {
+    // Rule 1: Extract AggregateCall
+    if let BoundExpr::AggregateCall {
+        func,
+        args,
+        distinct,
+    } = &expr
+    {
+        let op = AggregateOp {
+            func: *func,
+            args: args.clone(),
+            distinct: *distinct,
+        };
+        // Dedup: reuse existing position if an identical aggregate exists
+        let output_ty = op.output_type();
+        let agg_idx = if let Some(pos) = aggregates.iter().position(|a| a == &op) {
+            pos
+        } else {
+            aggregates.push(op);
+            aggregates.len() - 1
+        };
+        let output_idx = group_by.len() + agg_idx;
+        return Ok(BoundExpr::Column {
+            index: output_idx,
+            name: None,
+            ty: output_ty,
+        });
+    }
+
+    // Rule 2: Whole-expression GROUP BY match
+    for (i, gb) in group_by.iter().enumerate() {
+        if &expr == gb {
+            let ty = expr.ty().unwrap_or(Type::Text);
+            return Ok(BoundExpr::Column {
+                index: i,
+                name: None,
+                ty,
+            });
+        }
+    }
+
+    // Rule 3: Leaf handling
+    match &expr {
+        BoundExpr::Column { name, .. } => {
+            return Err(ExecutorError::NonAggregatedColumn {
+                name: name.as_deref().unwrap_or("?column?").to_string(),
+            });
+        }
+        BoundExpr::Null
+        | BoundExpr::Boolean(_)
+        | BoundExpr::Integer(_)
+        | BoundExpr::Float(_)
+        | BoundExpr::String(_) => {
+            return Ok(expr);
+        }
+        _ => {}
+    }
+
+    // Rule 4: Composite expressions — recurse into children
+    match expr {
+        BoundExpr::BinaryOp { left, op, right } => Ok(BoundExpr::BinaryOp {
+            left: Box::new(rewrite_for_aggregate_output(*left, group_by, aggregates)?),
+            op,
+            right: Box::new(rewrite_for_aggregate_output(*right, group_by, aggregates)?),
+        }),
+        BoundExpr::UnaryOp { op, operand } => Ok(BoundExpr::UnaryOp {
+            op,
+            operand: Box::new(rewrite_for_aggregate_output(
+                *operand, group_by, aggregates,
+            )?),
+        }),
+        BoundExpr::IsNull { expr, negated } => Ok(BoundExpr::IsNull {
+            expr: Box::new(rewrite_for_aggregate_output(*expr, group_by, aggregates)?),
+            negated,
+        }),
+        BoundExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let rewritten_list = list
+                .into_iter()
+                .map(|e| rewrite_for_aggregate_output(e, group_by, aggregates))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(BoundExpr::InList {
+                expr: Box::new(rewrite_for_aggregate_output(*expr, group_by, aggregates)?),
+                list: rewritten_list,
+                negated,
+            })
+        }
+        BoundExpr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Ok(BoundExpr::Between {
+            expr: Box::new(rewrite_for_aggregate_output(*expr, group_by, aggregates)?),
+            low: Box::new(rewrite_for_aggregate_output(*low, group_by, aggregates)?),
+            high: Box::new(rewrite_for_aggregate_output(*high, group_by, aggregates)?),
+            negated,
+        }),
+        BoundExpr::Like {
+            expr,
+            pattern,
+            escape,
+            negated,
+            case_insensitive,
+        } => Ok(BoundExpr::Like {
+            expr: Box::new(rewrite_for_aggregate_output(*expr, group_by, aggregates)?),
+            pattern: Box::new(rewrite_for_aggregate_output(
+                *pattern, group_by, aggregates,
+            )?),
+            escape: escape
+                .map(|e| rewrite_for_aggregate_output(*e, group_by, aggregates).map(Box::new))
+                .transpose()?,
+            negated,
+            case_insensitive,
+        }),
+        BoundExpr::Case {
+            operand,
+            when_clauses,
+            else_result,
+        } => {
+            let rewritten_operand = operand
+                .map(|op| rewrite_for_aggregate_output(*op, group_by, aggregates).map(Box::new))
+                .transpose()?;
+            let rewritten_whens = when_clauses
+                .into_iter()
+                .map(|wc| {
+                    Ok(BoundWhenClause {
+                        condition: rewrite_for_aggregate_output(
+                            wc.condition,
+                            group_by,
+                            aggregates,
+                        )?,
+                        result: rewrite_for_aggregate_output(wc.result, group_by, aggregates)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, ExecutorError>>()?;
+            let rewritten_else = else_result
+                .map(|e| rewrite_for_aggregate_output(*e, group_by, aggregates).map(Box::new))
+                .transpose()?;
+            Ok(BoundExpr::Case {
+                operand: rewritten_operand,
+                when_clauses: rewritten_whens,
+                else_result: rewritten_else,
+            })
+        }
+        BoundExpr::Cast { expr, ty } => Ok(BoundExpr::Cast {
+            expr: Box::new(rewrite_for_aggregate_output(*expr, group_by, aggregates)?),
+            ty,
+        }),
+        // Already handled above: Null, Boolean, Integer, Float, String, Column, AggregateCall
+        _ => unreachable!(),
+    }
+}
+
+/// Resolves a single ORDER BY expression into a [`SortItem`].
+///
+/// Resolution follows three cases in order:
+///
+/// **Case A**: Integer literal N → positional reference (1-indexed).
+/// Uses the already-rewritten SELECT expression at position N-1.
+///
+/// **Case B**: Simple column name matching a SELECT output name (including aliases).
+/// Uses the already-rewritten SELECT expression for that output column.
+///
+/// **Case C**: No positional/alias match.
+/// Calls `fallback_bind` to bind and (optionally) rewrite the expression.
+fn resolve_order_by_expr(
+    ob: &crate::sql::OrderByItem,
+    rewritten_select: &[BoundExpr],
+    select_descs: &[ColumnDesc],
+    mut fallback_bind: impl FnMut(&Expr) -> Result<BoundExpr, ExecutorError>,
+) -> Result<SortItem, ExecutorError> {
+    let sort_expr = match &ob.expr {
+        // Case A: Positional reference (e.g., ORDER BY 1)
+        Expr::Integer(n) => {
+            let pos = *n;
+            if pos < 1 || pos as usize > rewritten_select.len() {
+                return Err(ExecutorError::Unsupported(format!(
+                    "ORDER BY position {} is not in select list (1..{})",
+                    pos,
+                    rewritten_select.len()
+                )));
+            }
+            rewritten_select[(pos - 1) as usize].clone()
+        }
+
+        // Case B: Simple column name matching a SELECT output name (including aliases)
+        Expr::ColumnRef {
+            table: None,
+            column,
+        } => {
+            if let Some(pos) = select_descs
+                .iter()
+                .position(|d| d.name.eq_ignore_ascii_case(column))
+            {
+                rewritten_select[pos].clone()
+            } else {
+                // Not an alias — fall through to Case C
+                fallback_bind(&ob.expr)?
+            }
+        }
+
+        // Case C: Arbitrary expression
+        _ => fallback_bind(&ob.expr)?,
+    };
+
+    Ok(SortItem {
+        expr: sort_expr,
+        direction: ob.direction,
+        nulls: ob.nulls,
+    })
+}
+
+/// Plans ORDER BY for non-aggregation queries.
+///
+/// Inserts a Sort node between the current plan (after Filter, before Projection).
+/// ORDER BY expressions are resolved via alias, positional, or scan-schema binding.
+fn plan_order_by_simple(plan: QueryPlan, select: &SelectStmt) -> Result<QueryPlan, ExecutorError> {
+    if select.order_by.is_empty() {
+        return Ok(plan);
+    }
+
+    let input_columns = plan.columns().to_vec();
+
+    // Pre-compute SELECT aliases and bound expressions for alias/positional resolution
+    let mut select_bound_exprs = Vec::new();
+    let mut select_descs = Vec::new();
+    for item in &select.columns {
+        for (expr, desc) in resolve_select_item(item, &input_columns)? {
+            select_bound_exprs.push(expr);
+            select_descs.push(desc);
+        }
+    }
+
+    let mut sort_items = Vec::new();
+    for ob in &select.order_by {
+        let sort_item = resolve_order_by_expr(ob, &select_bound_exprs, &select_descs, |expr| {
+            // Case C: Bind against the scan schema (pre-Projection)
+            expr.bind(&input_columns)
+        })?;
+        sort_items.push(sort_item);
+    }
+
+    Ok(QueryPlan::Sort {
+        input: Box::new(plan),
+        items: sort_items,
+    })
+}
+
+/// Plans LIMIT/OFFSET into a [`QueryPlan::Limit`] node.
+///
+/// Binds limit/offset as constant expressions (no column references allowed),
+/// evaluates them at planning time, validates type (integer) and sign
+/// (non-negative), and converts to u64.
+fn plan_limit_offset(plan: QueryPlan, select: &SelectStmt) -> Result<QueryPlan, ExecutorError> {
+    if select.limit.is_none() && select.offset.is_none() {
+        return Ok(plan);
+    }
+
+    let limit = if let Some(ref limit_expr) = select.limit {
+        Some(eval_constant_u64(limit_expr, "LIMIT")?)
+    } else {
+        None
+    };
+
+    let offset = if let Some(ref offset_expr) = select.offset {
+        eval_constant_u64(offset_expr, "OFFSET")?
+    } else {
+        0
+    };
+
+    // Skip creating a Limit node if it would be a no-op (no limit, zero offset)
+    if limit.is_none() && offset == 0 {
+        return Ok(plan);
+    }
+
+    Ok(QueryPlan::Limit {
+        input: Box::new(plan),
+        limit,
+        offset,
+    })
+}
+
+/// Evaluates a constant expression to a non-negative u64.
+///
+/// Used for LIMIT/OFFSET where the value must be an integer literal
+/// or constant expression. Column references are not allowed.
+fn eval_constant_u64(expr: &Expr, context: &str) -> Result<u64, ExecutorError> {
+    use crate::datum::Value;
+    use crate::heap::Record;
+
+    // Bind with empty column list — column refs are not allowed
+    let bound = expr.bind(&[])?;
+    let empty_record = Record::new(vec![]);
+    let value = bound.evaluate(&empty_record)?;
+
+    match value {
+        Value::Smallint(n) => {
+            if n < 0 {
+                Err(ExecutorError::Unsupported(format!("negative {}", context)))
+            } else {
+                Ok(n as u64)
+            }
+        }
+        Value::Integer(n) => {
+            if n < 0 {
+                Err(ExecutorError::Unsupported(format!("negative {}", context)))
+            } else {
+                Ok(n as u64)
+            }
+        }
+        Value::Bigint(n) => {
+            if n < 0 {
+                Err(ExecutorError::Unsupported(format!("negative {}", context)))
+            } else {
+                Ok(n as u64)
+            }
+        }
+        _ => Err(ExecutorError::TypeMismatch {
+            expected: "integer".to_string(),
+            found: value.ty(),
+        }),
     }
 }
 
@@ -1082,5 +1788,453 @@ mod tests {
 
         let result = plan_delete(&delete, &catalog);
         assert!(matches!(result, Err(ExecutorError::TableNotFound { .. })));
+    }
+
+    // --- Aggregate planner tests ---
+
+    #[tokio::test]
+    async fn test_plan_select_scalar_aggregate() {
+        let catalog = setup_catalog().await;
+        let select = parse_select("SELECT COUNT(*) FROM sys_tables");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+
+        assert_eq!(plan.columns().len(), 1);
+        assert_eq!(plan.columns()[0].ty, Type::Bigint);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_scalar_aggregate_with_alias() {
+        let catalog = setup_catalog().await;
+        let select = parse_select("SELECT COUNT(*) AS total FROM sys_tables");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+
+        assert_eq!(plan.columns().len(), 1);
+        assert_eq!(plan.columns()[0].name, "total");
+        assert_eq!(plan.columns()[0].ty, Type::Bigint);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_group_by_single_column() {
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE emp (dept TEXT, salary INTEGER)").await;
+        let select = parse_select("SELECT dept, COUNT(*) FROM emp GROUP BY dept");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+
+        assert_eq!(plan.columns().len(), 2);
+        assert_eq!(plan.columns()[0].name, "dept");
+        assert_eq!(plan.columns()[0].ty, Type::Text);
+        assert_eq!(plan.columns()[1].ty, Type::Bigint);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_group_by_multiple_columns() {
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE emp (dept TEXT, role TEXT, salary INTEGER)")
+                .await;
+        let select = parse_select("SELECT dept, role, SUM(salary) FROM emp GROUP BY dept, role");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+
+        assert_eq!(plan.columns().len(), 3);
+        assert_eq!(plan.columns()[0].name, "dept");
+        assert_eq!(plan.columns()[1].name, "role");
+        assert_eq!(plan.columns()[2].ty, Type::Bigint); // SUM(integer) → Bigint
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_group_by_with_having() {
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE emp (dept TEXT, salary INTEGER)").await;
+        let select =
+            parse_select("SELECT dept, COUNT(*) FROM emp GROUP BY dept HAVING COUNT(*) > 1");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+
+        // Plan should be: Projection → Filter (HAVING) → Aggregate → SeqScan
+        assert_eq!(plan.columns().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_having_without_group_by() {
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE emp (dept TEXT, salary INTEGER)").await;
+        // Scalar aggregate with HAVING
+        let select = parse_select("SELECT COUNT(*) FROM emp HAVING COUNT(*) > 0");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+
+        assert_eq!(plan.columns().len(), 1);
+        assert_eq!(plan.columns()[0].ty, Type::Bigint);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_multiple_aggregates() {
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE emp (dept TEXT, salary INTEGER)").await;
+        let select = parse_select("SELECT MIN(salary), MAX(salary), AVG(salary) FROM emp");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+
+        assert_eq!(plan.columns().len(), 3);
+        assert_eq!(plan.columns()[0].ty, Type::Integer); // MIN preserves type
+        assert_eq!(plan.columns()[1].ty, Type::Integer); // MAX preserves type
+        assert_eq!(plan.columns()[2].ty, Type::Double); // AVG always Double
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_aggregate_with_literal() {
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE emp (dept TEXT, salary INTEGER)").await;
+        // Literal in SELECT with aggregation is allowed
+        let select = parse_select("SELECT 1, COUNT(*) FROM emp");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+
+        assert_eq!(plan.columns().len(), 2);
+        assert_eq!(plan.columns()[0].ty, Type::Bigint); // literal 1
+        assert_eq!(plan.columns()[1].ty, Type::Bigint); // COUNT(*)
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_duplicate_aggregate_reuses_position() {
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE emp (dept TEXT, salary INTEGER)").await;
+        // Same COUNT(*) used in SELECT and HAVING should share the aggregate position
+        let select =
+            parse_select("SELECT dept, COUNT(*) FROM emp GROUP BY dept HAVING COUNT(*) > 1");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+
+        // Should succeed (the planner deduplicates the COUNT(*) aggregate)
+        assert_eq!(plan.columns().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_explain_aggregate() {
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE emp (dept TEXT, salary INTEGER)").await;
+        let select = parse_select("SELECT dept, COUNT(*) FROM emp GROUP BY dept");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+
+        assert!(explain.contains("Aggregate:"));
+        assert!(explain.contains("group_by="));
+        assert!(explain.contains("COUNT(*)"));
+    }
+
+    // --- Aggregate error tests ---
+
+    #[tokio::test]
+    async fn test_plan_select_aggregate_in_where_error() {
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE emp (dept TEXT, salary INTEGER)").await;
+        let select = parse_select("SELECT * FROM emp WHERE COUNT(*) > 1");
+
+        let Err(err) = plan_select(&select, &catalog) else {
+            panic!("expected error");
+        };
+        let ExecutorError::AggregateNotAllowed { context } = &err else {
+            panic!("expected AggregateNotAllowed, got {:?}", err);
+        };
+        assert!(context.contains("WHERE"));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_aggregate_in_group_by_error() {
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE emp (dept TEXT, salary INTEGER)").await;
+        let select = parse_select("SELECT dept FROM emp GROUP BY COUNT(*)");
+
+        let Err(err) = plan_select(&select, &catalog) else {
+            panic!("expected error");
+        };
+        let ExecutorError::AggregateNotAllowed { context } = &err else {
+            panic!("expected AggregateNotAllowed, got {:?}", err);
+        };
+        assert!(context.contains("GROUP BY"));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_non_aggregated_column_error() {
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE emp (dept TEXT, salary INTEGER)").await;
+        let select = parse_select("SELECT dept, salary FROM emp GROUP BY dept");
+
+        let Err(err) = plan_select(&select, &catalog) else {
+            panic!("expected error");
+        };
+        let ExecutorError::NonAggregatedColumn { name } = &err else {
+            panic!("expected NonAggregatedColumn, got {:?}", err);
+        };
+        assert!(name.contains("salary"));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_sum_text_type_error() {
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE emp (dept TEXT, salary INTEGER)").await;
+        let select = parse_select("SELECT SUM(dept) FROM emp");
+
+        let result = plan_select(&select, &catalog);
+        assert!(matches!(
+            result,
+            Err(ExecutorError::TypeMismatch { expected, .. }) if expected == "numeric"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_avg_text_type_error() {
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE emp (dept TEXT, salary INTEGER)").await;
+        let select = parse_select("SELECT AVG(dept) FROM emp");
+
+        let result = plan_select(&select, &catalog);
+        assert!(matches!(
+            result,
+            Err(ExecutorError::TypeMismatch { expected, .. }) if expected == "numeric"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_nested_aggregate_error() {
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE emp (dept TEXT, salary INTEGER)").await;
+        let select = parse_select("SELECT COUNT(SUM(salary)) FROM emp");
+
+        let Err(err) = plan_select(&select, &catalog) else {
+            panic!("expected error");
+        };
+        let ExecutorError::AggregateNotAllowed { context } = &err else {
+            panic!("expected AggregateNotAllowed, got {:?}", err);
+        };
+        assert!(context.contains("aggregate function call"));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_having_without_aggregate_error() {
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE emp (dept TEXT, salary INTEGER)").await;
+        // HAVING without any aggregate context → error
+        let select = parse_select("SELECT * FROM emp HAVING true");
+
+        let result = plan_select(&select, &catalog);
+        assert!(matches!(result, Err(ExecutorError::Unsupported(msg)) if msg.contains("HAVING")));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_wildcard_with_group_by_error() {
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE emp (dept TEXT, salary INTEGER)").await;
+        // SELECT * with GROUP BY — expanded columns are not all in GROUP BY
+        let select = parse_select("SELECT * FROM emp GROUP BY dept");
+
+        let result = plan_select(&select, &catalog);
+        assert!(matches!(
+            result,
+            Err(ExecutorError::NonAggregatedColumn { .. })
+        ));
+    }
+
+    // --- ORDER BY planner tests ---
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_single_column() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER, name TEXT)").await;
+        let select = parse_select("SELECT * FROM t ORDER BY id");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("Sort:"), "explain: {}", explain);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_desc() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER, name TEXT)").await;
+        let select = parse_select("SELECT * FROM t ORDER BY id DESC");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("DESC"), "explain: {}", explain);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_alias() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER, name TEXT)").await;
+        let select = parse_select("SELECT name AS n FROM t ORDER BY n");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("Sort:"), "explain: {}", explain);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_positional() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER, name TEXT)").await;
+        let select = parse_select("SELECT id, name FROM t ORDER BY 2");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("Sort:"), "explain: {}", explain);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_positional_out_of_range() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER, name TEXT)").await;
+        let select = parse_select("SELECT id, name FROM t ORDER BY 3");
+
+        let result = plan_select(&select, &catalog);
+        assert!(matches!(result, Err(ExecutorError::Unsupported(msg)) if msg.contains("position")));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_positional_zero() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER, name TEXT)").await;
+        let select = parse_select("SELECT id FROM t ORDER BY 0");
+
+        let result = plan_select(&select, &catalog);
+        assert!(matches!(result, Err(ExecutorError::Unsupported(msg)) if msg.contains("position")));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_expression() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER, name TEXT)").await;
+        let select = parse_select("SELECT * FROM t ORDER BY id + 1");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("Sort:"), "explain: {}", explain);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_with_group_by() {
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE emp (dept TEXT, salary INTEGER)").await;
+        let select = parse_select("SELECT dept, COUNT(*) FROM emp GROUP BY dept ORDER BY dept");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("Sort:"), "explain: {}", explain);
+        assert!(explain.contains("Aggregate:"), "explain: {}", explain);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_aggregate_expr() {
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE emp (dept TEXT, salary INTEGER)").await;
+        // ORDER BY an aggregate expression not in SELECT
+        let select = parse_select("SELECT dept FROM emp GROUP BY dept ORDER BY COUNT(*)");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("Sort:"), "explain: {}", explain);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_triggers_aggregation() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER)").await;
+        // ORDER BY COUNT(*) triggers aggregation context for the entire query.
+        // Since id is not in GROUP BY and not aggregated → NonAggregatedColumn
+        let select = parse_select("SELECT id FROM t ORDER BY COUNT(*)");
+
+        let result = plan_select(&select, &catalog);
+        assert!(matches!(
+            result,
+            Err(ExecutorError::NonAggregatedColumn { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_nulls_first() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER)").await;
+        let select = parse_select("SELECT * FROM t ORDER BY id NULLS FIRST");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("NULLS FIRST"), "explain: {}", explain);
+    }
+
+    // --- LIMIT/OFFSET planner tests ---
+
+    #[tokio::test]
+    async fn test_plan_select_limit() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER)").await;
+        let select = parse_select("SELECT * FROM t LIMIT 10");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("Limit:"), "explain: {}", explain);
+        assert!(explain.contains("limit=10"), "explain: {}", explain);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_offset() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER)").await;
+        let select = parse_select("SELECT * FROM t OFFSET 5");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("Limit:"), "explain: {}", explain);
+        assert!(explain.contains("offset=5"), "explain: {}", explain);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_limit_and_offset() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER)").await;
+        let select = parse_select("SELECT * FROM t LIMIT 10 OFFSET 5");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("limit=10"), "explain: {}", explain);
+        assert!(explain.contains("offset=5"), "explain: {}", explain);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_negative_limit_error() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER)").await;
+        let select = parse_select("SELECT * FROM t LIMIT -1");
+
+        let result = plan_select(&select, &catalog);
+        assert!(matches!(
+            result,
+            Err(ExecutorError::Unsupported(msg)) if msg.contains("negative")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_negative_offset_error() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER)").await;
+        let select = parse_select("SELECT * FROM t OFFSET -1");
+
+        let result = plan_select(&select, &catalog);
+        assert!(matches!(
+            result,
+            Err(ExecutorError::Unsupported(msg)) if msg.contains("negative")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_limit_non_integer_error() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER)").await;
+        let select = parse_select("SELECT * FROM t LIMIT 'abc'");
+
+        let result = plan_select(&select, &catalog);
+        assert!(matches!(
+            result,
+            Err(ExecutorError::TypeMismatch { expected, .. }) if expected == "integer"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_limit_zero() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER)").await;
+        let select = parse_select("SELECT * FROM t LIMIT 0");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("limit=0"), "explain: {}", explain);
     }
 }

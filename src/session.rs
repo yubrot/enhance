@@ -942,4 +942,102 @@ mod tests {
         let catalog = engine.catalog(&snapshot).await.unwrap();
         assert!(catalog.resolve_table("t").is_none());
     }
+
+    // --- Sort, Aggregate, Limit integration tests ---
+
+    #[tokio::test]
+    async fn test_group_by_order_by_limit_end_to_end() {
+        let mut session = open_test_session().await;
+
+        session
+            .execute_query("CREATE TABLE employees (dept TEXT, salary INTEGER)")
+            .await
+            .unwrap();
+        session
+            .execute_query(
+                "INSERT INTO employees VALUES ('eng', 200), ('eng', 100), ('eng', 150), ('sales', 300), ('sales', 250), ('hr', 100)",
+            )
+            .await
+            .unwrap();
+
+        let (columns, rows) = session
+            .query_rows(
+                "SELECT dept, COUNT(*), SUM(salary) FROM employees GROUP BY dept ORDER BY COUNT(*) DESC LIMIT 2",
+            )
+            .await;
+
+        assert_eq!(columns.len(), 3);
+        assert_eq!(rows.len(), 2);
+        // eng has 3 employees
+        assert_eq!(rows[0].record.values[0], Value::Text("eng".into()));
+        assert_eq!(rows[0].record.values[1], Value::Bigint(3));
+        assert_eq!(rows[0].record.values[2], Value::Bigint(450));
+    }
+
+    #[tokio::test]
+    async fn test_explain_combined_plan() {
+        let mut session = open_test_session().await;
+
+        session
+            .execute_query("CREATE TABLE t (dept TEXT, salary INTEGER)")
+            .await
+            .unwrap();
+
+        let (columns, rows) = session
+            .query_rows(
+                "EXPLAIN SELECT dept, SUM(salary) FROM t GROUP BY dept ORDER BY dept LIMIT 5",
+            )
+            .await;
+
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "QUERY PLAN");
+
+        let plan_text: String = rows
+            .iter()
+            .map(|r| match &r.record.values[0] {
+                Value::Text(s) => s.as_str(),
+                _ => "",
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(plan_text.contains("Limit:"), "should contain Limit node");
+        assert!(plan_text.contains("Sort:"), "should contain Sort node");
+        assert!(
+            plan_text.contains("Aggregate:"),
+            "should contain Aggregate node"
+        );
+        assert!(
+            plan_text.contains("SeqScan on t"),
+            "should contain SeqScan node"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_with_where_having_order_limit() {
+        let mut session = open_test_session().await;
+
+        session
+            .execute_query("CREATE TABLE sales (region TEXT, amount INTEGER, active BOOLEAN)")
+            .await
+            .unwrap();
+        session
+            .execute_query(
+                "INSERT INTO sales VALUES ('east', 100, TRUE), ('east', 200, TRUE), ('east', 50, FALSE), ('west', 300, TRUE), ('west', 100, TRUE), ('north', 50, TRUE)",
+            )
+            .await
+            .unwrap();
+
+        // WHERE filters inactive, GROUP BY region, HAVING SUM > 100, ORDER BY SUM DESC, LIMIT 1
+        let (_, rows) = session
+            .query_rows(
+                "SELECT region, SUM(amount) FROM sales WHERE active = TRUE GROUP BY region HAVING SUM(amount) > 100 ORDER BY SUM(amount) DESC LIMIT 1",
+            )
+            .await;
+
+        assert_eq!(rows.len(), 1);
+        // west: 300+100=400, east: 100+200=300, north: 50 (filtered by HAVING)
+        assert_eq!(rows[0].record.values[0], Value::Text("west".into()));
+        assert_eq!(rows[0].record.values[1], Value::Bigint(400));
+    }
 }

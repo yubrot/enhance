@@ -10,6 +10,7 @@ use crate::datum::Type;
 use crate::sql::{BinaryOperator, Expr, UnaryOperator};
 
 use super::ColumnDesc;
+use super::aggregate::{AggregateFunction, aggregate_output_type, fmt_aggregate};
 use super::error::ExecutorError;
 
 /// An expression tree with column references resolved to positional indices.
@@ -18,7 +19,7 @@ use super::error::ExecutorError;
 /// `ColumnRef { table, column }` with `Column { index, name, ty }`, enabling O(1) column
 /// access during evaluation instead of O(n) name matching on every row.
 /// Each variant carries enough information to compute its output [`Type`] via [`BoundExpr::ty()`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum BoundExpr {
     /// NULL literal.
     Null,
@@ -81,10 +82,24 @@ pub enum BoundExpr {
     },
     /// CAST expression.
     Cast { expr: Box<BoundExpr>, ty: Type },
+    /// Aggregate function call (transient: extracted by planner).
+    ///
+    /// This variant exists only during expression binding. The planner's
+    /// `rewrite_for_aggregate_output` extracts all `AggregateCall` nodes,
+    /// moves them into the Aggregate plan node, and replaces them with
+    /// `Column` references pointing to the Aggregate node's output positions.
+    AggregateCall {
+        /// Aggregate function.
+        func: AggregateFunction,
+        /// Argument expressions (empty for COUNT(\*)).
+        args: Vec<BoundExpr>,
+        /// Whether DISTINCT was specified.
+        distinct: bool,
+    },
 }
 
 /// A WHEN clause in a bound CASE expression.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoundWhenClause {
     /// Condition (searched CASE) or comparison value (simple CASE).
     pub condition: BoundExpr,
@@ -127,6 +142,10 @@ impl BoundExpr {
                 from_whens.chain(from_else).next()
             }
             BoundExpr::Cast { ty, .. } => Some(*ty),
+            BoundExpr::AggregateCall { func, args, .. } => {
+                let input_ty = args.first().and_then(|e| e.ty());
+                Some(aggregate_output_type(*func, input_ty))
+            }
         }
     }
 
@@ -313,9 +332,54 @@ impl Expr {
                 "parameter placeholders are not yet supported".to_string(),
             )),
 
-            Expr::Function { .. } => Err(ExecutorError::Unsupported(
-                "function calls are not yet supported".to_string(),
-            )),
+            Expr::Function {
+                name,
+                args,
+                distinct,
+            } => {
+                if let Some(func) = AggregateFunction::from_name(name) {
+                    // COUNT(*) special handling: parser produces
+                    // ColumnRef { table: None, column: "*" } for COUNT(*)
+                    if func == AggregateFunction::Count
+                        && args.len() == 1
+                        && matches!(
+                            &args[0],
+                            Expr::ColumnRef { table: None, column } if column == "*"
+                        )
+                    {
+                        return Ok(BoundExpr::AggregateCall {
+                            func,
+                            args: vec![],
+                            distinct: *distinct,
+                        });
+                    }
+
+                    // All aggregates require at least one argument
+                    // (except COUNT(*) handled above)
+                    if args.is_empty() {
+                        return Err(ExecutorError::Unsupported(format!(
+                            "{}() requires at least one argument",
+                            name
+                        )));
+                    }
+
+                    let bound_args = args
+                        .iter()
+                        .map(|a| a.bind(columns))
+                        .collect::<Result<Vec<_>, _>>()?;
+
+                    Ok(BoundExpr::AggregateCall {
+                        func,
+                        args: bound_args,
+                        distinct: *distinct,
+                    })
+                } else {
+                    Err(ExecutorError::Unsupported(format!(
+                        "function \"{}\" is not supported",
+                        name
+                    )))
+                }
+            }
 
             Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::Subquery(_) => Err(
                 ExecutorError::Unsupported("subqueries are not yet supported".to_string()),
@@ -399,6 +463,11 @@ impl fmt::Display for BoundExpr {
             BoundExpr::Cast { expr, ty } => {
                 write!(f, "CAST({} AS {})", expr, ty.display_name())
             }
+            BoundExpr::AggregateCall {
+                func,
+                args,
+                distinct,
+            } => fmt_aggregate(f, func, args, *distinct),
         }
     }
 }
@@ -885,5 +954,274 @@ mod tests {
         };
         assert_eq!(*ty, Type::Smallint);
         assert!(matches!(expr.as_ref(), BoundExpr::Integer(42)));
+    }
+
+    // ========================================================================
+    // AggregateCall binding
+    // ========================================================================
+
+    #[test]
+    fn test_bind_count_star() {
+        let columns = make_columns();
+        let bound = bind_expr("COUNT(*)", &columns);
+        let BoundExpr::AggregateCall {
+            func,
+            args,
+            distinct,
+        } = &bound
+        else {
+            panic!("expected AggregateCall, got {:?}", bound);
+        };
+        assert_eq!(*func, AggregateFunction::Count);
+        assert!(args.is_empty());
+        assert!(!distinct);
+    }
+
+    #[test]
+    fn test_bind_sum() {
+        let columns = make_columns();
+        let bound = bind_expr("SUM(user_id)", &columns);
+        let BoundExpr::AggregateCall {
+            func,
+            args,
+            distinct,
+        } = &bound
+        else {
+            panic!("expected AggregateCall, got {:?}", bound);
+        };
+        assert_eq!(*func, AggregateFunction::Sum);
+        assert_eq!(args.len(), 1);
+        assert!(matches!(&args[0], BoundExpr::Column { index: 3, .. }));
+        assert!(!distinct);
+    }
+
+    #[test]
+    fn test_bind_avg() {
+        let columns = make_columns();
+        let bound = bind_expr("AVG(user_id)", &columns);
+        let BoundExpr::AggregateCall { func, args, .. } = &bound else {
+            panic!("expected AggregateCall, got {:?}", bound);
+        };
+        assert_eq!(*func, AggregateFunction::Avg);
+        assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn test_bind_min() {
+        let columns = make_columns();
+        let bound = bind_expr("MIN(name)", &columns);
+        let BoundExpr::AggregateCall { func, args, .. } = &bound else {
+            panic!("expected AggregateCall, got {:?}", bound);
+        };
+        assert_eq!(*func, AggregateFunction::Min);
+        assert_eq!(args.len(), 1);
+        assert!(matches!(&args[0], BoundExpr::Column { index: 1, .. }));
+    }
+
+    #[test]
+    fn test_bind_max() {
+        let columns = make_columns();
+        let bound = bind_expr("MAX(user_id)", &columns);
+        let BoundExpr::AggregateCall { func, args, .. } = &bound else {
+            panic!("expected AggregateCall, got {:?}", bound);
+        };
+        assert_eq!(*func, AggregateFunction::Max);
+        assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn test_bind_count_distinct() {
+        let columns = make_columns();
+        let bound = bind_expr("COUNT(DISTINCT name)", &columns);
+        let BoundExpr::AggregateCall {
+            func,
+            args,
+            distinct,
+        } = &bound
+        else {
+            panic!("expected AggregateCall, got {:?}", bound);
+        };
+        assert_eq!(*func, AggregateFunction::Count);
+        assert_eq!(args.len(), 1);
+        assert!(matches!(&args[0], BoundExpr::Column { index: 1, .. }));
+        assert!(distinct);
+    }
+
+    #[test]
+    fn test_bind_unknown_function() {
+        let columns = make_columns();
+        let err = parse_expr("coalesce(name, 'default')")
+            .bind(&columns)
+            .unwrap_err();
+        assert!(matches!(err, ExecutorError::Unsupported(msg) if msg.contains("coalesce")));
+    }
+
+    #[test]
+    fn test_bind_aggregate_case_insensitive() {
+        let columns = make_columns();
+        // All these should bind as aggregate calls
+        for name in ["count(*)", "COUNT(*)", "Count(*)"] {
+            let bound = bind_expr(name, &columns);
+            assert!(
+                matches!(
+                    &bound,
+                    BoundExpr::AggregateCall {
+                        func: AggregateFunction::Count,
+                        ..
+                    }
+                ),
+                "expected AggregateCall for {}, got {:?}",
+                name,
+                bound
+            );
+        }
+    }
+
+    // ========================================================================
+    // AggregateCall — ty() and Display
+    // ========================================================================
+
+    #[test]
+    fn test_ty_aggregate_call_count() {
+        let expr = BoundExpr::AggregateCall {
+            func: AggregateFunction::Count,
+            args: vec![],
+            distinct: false,
+        };
+        assert_eq!(expr.ty(), Some(Type::Bigint));
+    }
+
+    #[test]
+    fn test_ty_aggregate_call_sum_integer() {
+        let expr = BoundExpr::AggregateCall {
+            func: AggregateFunction::Sum,
+            args: vec![BoundExpr::Column {
+                index: 0,
+                name: None,
+                ty: Type::Integer,
+            }],
+            distinct: false,
+        };
+        assert_eq!(expr.ty(), Some(Type::Bigint));
+    }
+
+    #[test]
+    fn test_ty_aggregate_call_avg_always_double() {
+        let expr = BoundExpr::AggregateCall {
+            func: AggregateFunction::Avg,
+            args: vec![BoundExpr::Column {
+                index: 0,
+                name: None,
+                ty: Type::Integer,
+            }],
+            distinct: false,
+        };
+        assert_eq!(expr.ty(), Some(Type::Double));
+    }
+
+    #[test]
+    fn test_ty_aggregate_call_min_preserves_type() {
+        let expr = BoundExpr::AggregateCall {
+            func: AggregateFunction::Min,
+            args: vec![BoundExpr::Column {
+                index: 0,
+                name: None,
+                ty: Type::Text,
+            }],
+            distinct: false,
+        };
+        assert_eq!(expr.ty(), Some(Type::Text));
+    }
+
+    #[test]
+    fn test_display_aggregate_call_count_star() {
+        let expr = BoundExpr::AggregateCall {
+            func: AggregateFunction::Count,
+            args: vec![],
+            distinct: false,
+        };
+        assert_eq!(expr.to_string(), "COUNT(*)");
+    }
+
+    #[test]
+    fn test_display_aggregate_call_sum() {
+        let columns = make_columns();
+        let bound = bind_expr("SUM(user_id)", &columns);
+        assert_eq!(bound.to_string(), "SUM($col3 (orders.user_id))");
+    }
+
+    #[test]
+    fn test_display_aggregate_call_count_distinct() {
+        let columns = make_columns();
+        let bound = bind_expr("COUNT(DISTINCT name)", &columns);
+        assert_eq!(bound.to_string(), "COUNT(DISTINCT $col1 (users.name))");
+    }
+
+    // ========================================================================
+    // BoundExpr::PartialEq
+    // ========================================================================
+
+    #[test]
+    fn test_partial_eq_literals() {
+        assert_eq!(BoundExpr::Null, BoundExpr::Null);
+        assert_eq!(BoundExpr::Boolean(true), BoundExpr::Boolean(true));
+        assert_ne!(BoundExpr::Boolean(true), BoundExpr::Boolean(false));
+        assert_eq!(BoundExpr::Integer(42), BoundExpr::Integer(42));
+        assert_ne!(BoundExpr::Integer(42), BoundExpr::Integer(43));
+        assert_eq!(
+            BoundExpr::String("a".to_string()),
+            BoundExpr::String("a".to_string())
+        );
+        assert_ne!(
+            BoundExpr::String("a".to_string()),
+            BoundExpr::String("b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_partial_eq_column() {
+        let a = BoundExpr::Column {
+            index: 0,
+            name: Some("x".into()),
+            ty: Type::Bigint,
+        };
+        let b = BoundExpr::Column {
+            index: 0,
+            name: Some("x".into()),
+            ty: Type::Bigint,
+        };
+        let c = BoundExpr::Column {
+            index: 1,
+            name: Some("y".into()),
+            ty: Type::Bigint,
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_partial_eq_binary_op() {
+        let columns = make_columns();
+        let a = bind_expr("user_id + 1", &columns);
+        let b = bind_expr("user_id + 1", &columns);
+        let c = bind_expr("user_id + 2", &columns);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_partial_eq_aggregate_call() {
+        let columns = make_columns();
+        let a = bind_expr("COUNT(*)", &columns);
+        let b = bind_expr("COUNT(*)", &columns);
+        let c = bind_expr("SUM(user_id)", &columns);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_partial_eq_float_nan() {
+        // IEEE 754: NaN != NaN for structural matching (derived PartialEq on f64)
+        assert_ne!(BoundExpr::Float(f64::NAN), BoundExpr::Float(f64::NAN));
     }
 }
