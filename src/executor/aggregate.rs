@@ -73,6 +73,7 @@ pub fn aggregate_output_type(func: AggregateFunction, input_ty: Option<Type>) ->
             None => Type::Bigint, // default for NULL input
         },
         AggregateFunction::Avg => Type::Double,
+        // NULL literal input defaults to Text (PostgreSQL "unknown" type resolution).
         AggregateFunction::Min | AggregateFunction::Max => input_ty.unwrap_or(Type::Text),
     }
 }
@@ -318,7 +319,7 @@ impl Accumulator for MaxAccumulator {
 /// single-element Vec (the argument value) for dedup.
 ///
 #[derive(Debug, Clone)]
-pub struct GroupKey(pub Vec<Value>);
+pub struct GroupKey(pub(super) Vec<Value>);
 
 impl PartialEq for GroupKey {
     fn eq(&self, other: &Self) -> bool {
@@ -329,7 +330,8 @@ impl PartialEq for GroupKey {
             match (a, b) {
                 (Value::Null, Value::Null) => true,
                 (Value::Null, _) | (_, Value::Null) => false,
-                // Use PartialOrd for NaN-aware comparison (NaN == NaN via compare_f64)
+                // Value::partial_cmp uses total ordering for floats (NaN == NaN),
+                // satisfying GROUP BY semantics where NaN values are grouped together.
                 _ => a.partial_cmp(b) == Some(std::cmp::Ordering::Equal),
             }
         })

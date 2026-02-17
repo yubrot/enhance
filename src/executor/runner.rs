@@ -1914,6 +1914,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_distinct_aggregate_with_group_by() {
+        let rows = query_rows(
+            "CREATE TABLE t (dept TEXT, role TEXT)",
+            &[
+                "INSERT INTO t VALUES ('eng', 'dev')",
+                "INSERT INTO t VALUES ('eng', 'dev')",
+                "INSERT INTO t VALUES ('eng', 'qa')",
+                "INSERT INTO t VALUES ('sales', 'rep')",
+                "INSERT INTO t VALUES ('sales', 'rep')",
+            ],
+            "SELECT dept, COUNT(DISTINCT role) FROM t GROUP BY dept ORDER BY dept",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 2);
+        // eng: 2 distinct roles (dev, qa)
+        assert_eq!(rows[0][0], Value::Text("eng".into()));
+        assert_eq!(rows[0][1], Value::Bigint(2));
+        // sales: 1 distinct role (rep)
+        assert_eq!(rows[1][0], Value::Text("sales".into()));
+        assert_eq!(rows[1][1], Value::Bigint(1));
+    }
+
+    #[tokio::test]
     async fn test_combined_explain_output() {
         // Verify EXPLAIN output includes all node types in a combined plan
 
