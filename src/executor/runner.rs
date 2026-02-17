@@ -10,11 +10,14 @@
 //! All nodes are generic over [`ExecContext`], which provides storage
 //! operations. This keeps executor logic decoupled from concrete storage types.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::datum::{Type, Value};
 use crate::heap::Record;
 use crate::storage::PageId;
 
 use super::ColumnDesc;
+use super::aggregate::{AggregateOp, GroupKey};
 use super::context::ExecContext;
 use super::error::ExecutorError;
 use super::expr::BoundExpr;
@@ -63,6 +66,8 @@ pub enum QueryNode<C: ExecContext> {
     Filter(Filter<C>),
     /// Column projection (SELECT list).
     Projection(Projection<C>),
+    /// Hash-aggregate node.
+    Aggregate(Aggregate<C>),
     /// Single-row scan for queries without FROM (e.g., `SELECT 1+1`).
     ValuesScan(ValuesScan),
 }
@@ -97,6 +102,17 @@ impl QueryPlan {
             } => QueryNode::Projection(Projection::new(
                 input.prepare_for_execute(ctx),
                 exprs,
+                columns,
+            )),
+            QueryPlan::Aggregate {
+                input,
+                group_by,
+                aggregates,
+                columns,
+            } => QueryNode::Aggregate(Aggregate::new(
+                input.prepare_for_execute(ctx),
+                group_by,
+                aggregates,
                 columns,
             )),
             QueryPlan::ValuesScan => QueryNode::ValuesScan(ValuesScan::new()),
@@ -248,6 +264,7 @@ impl<C: ExecContext> QueryNode<C> {
                 QueryNode::SeqScan(n) => n.next().await,
                 QueryNode::Filter(n) => n.next().await,
                 QueryNode::Projection(n) => n.next().await,
+                QueryNode::Aggregate(n) => n.next().await,
                 QueryNode::ValuesScan(n) => n.next().await,
             }
         })
@@ -259,6 +276,7 @@ impl<C: ExecContext> QueryNode<C> {
             QueryNode::SeqScan(n) => &n.columns,
             QueryNode::Filter(n) => n.child.columns(),
             QueryNode::Projection(n) => &n.columns,
+            QueryNode::Aggregate(n) => &n.columns,
             QueryNode::ValuesScan(n) => &n.columns,
         }
     }
@@ -400,6 +418,176 @@ impl<C: ExecContext> Projection<C> {
             }
             None => Ok(None),
         }
+    }
+}
+
+/// Hash-aggregate node.
+///
+/// Consumes all input rows on first `next()` call, groups them by the
+/// GROUP BY key (using [`GroupKey`] for NULL=NULL HashMap semantics),
+/// computes aggregate values per group, then emits result rows one
+/// at a time.
+///
+/// Output schema: \[group_key_values..., aggregate_results...\].
+///
+/// NOTE: Loads all group keys and accumulators into memory. For
+/// production, consider sort-based grouping with spill-to-disk for
+/// high-cardinality GROUP BY.
+pub struct Aggregate<C: ExecContext> {
+    /// Child node to pull rows from.
+    child: Box<QueryNode<C>>,
+    /// GROUP BY expressions (bound against child's output schema).
+    group_by: Vec<BoundExpr>,
+    /// Aggregate operations to compute.
+    aggregates: Vec<AggregateOp>,
+    /// Output column descriptors.
+    columns: Vec<ColumnDesc>,
+    /// Buffered result rows (populated on first `next()` call).
+    buffer: Option<std::vec::IntoIter<Row>>,
+}
+
+impl<C: ExecContext> Aggregate<C> {
+    /// Creates a new Aggregate node.
+    pub fn new(
+        child: QueryNode<C>,
+        group_by: Vec<BoundExpr>,
+        aggregates: Vec<AggregateOp>,
+        columns: Vec<ColumnDesc>,
+    ) -> Self {
+        Self {
+            child: Box::new(child),
+            group_by,
+            aggregates,
+            columns,
+            buffer: None,
+        }
+    }
+
+    /// Returns the next aggregated row, or `None` if exhausted.
+    ///
+    /// On the first call, consumes all input rows and builds the aggregation
+    /// result. Subsequent calls return buffered rows.
+    async fn next(&mut self) -> Result<Option<Row>, ExecutorError> {
+        if let Some(ref mut iter) = self.buffer {
+            return Ok(iter.next());
+        }
+
+        // --- First call: consume all input and compute aggregates ---
+
+        // Per-group state:
+        // - accumulators: one per aggregate operation
+        // - distinct_sets: one HashSet per DISTINCT aggregate (None for non-DISTINCT)
+        struct GroupState {
+            accumulators: Vec<Box<dyn super::aggregate::Accumulator>>,
+            distinct_sets: Vec<Option<HashSet<GroupKey>>>,
+        }
+
+        let mut groups: HashMap<GroupKey, GroupState> = HashMap::new();
+        // Track insertion order for deterministic output (important for scalar aggregates)
+        let mut group_order: Vec<GroupKey> = Vec::new();
+
+        // Consume all input rows
+        while let Some(row) = self.child.next().await? {
+            // Evaluate GROUP BY expressions to form the group key
+            let key_values: Vec<Value> = self
+                .group_by
+                .iter()
+                .map(|expr| expr.evaluate(&row.record))
+                .collect::<Result<_, _>>()?;
+            let key = GroupKey(key_values);
+
+            // Get or create group state (one clone for the HashMap key,
+            // move the original into group_order for vacant entries)
+            let state = match groups.entry(key.clone()) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    group_order.push(key);
+                    e.insert(GroupState {
+                        accumulators: self
+                            .aggregates
+                            .iter()
+                            .map(|op| op.create_accumulator())
+                            .collect(),
+                        distinct_sets: self
+                            .aggregates
+                            .iter()
+                            .map(|op| {
+                                if op.distinct {
+                                    Some(HashSet::new())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect(),
+                    })
+                }
+            };
+
+            // Feed each aggregate
+            for (i, op) in self.aggregates.iter().enumerate() {
+                if op.args.is_empty() {
+                    // COUNT(*): feed once per row (value is ignored)
+                    state.accumulators[i].feed(&Value::Null)?;
+                } else {
+                    // Evaluate aggregate argument
+                    let val = op.args[0].evaluate(&row.record)?;
+
+                    // Skip NULLs for non-COUNT(*) aggregates
+                    if val.is_null() {
+                        continue;
+                    }
+
+                    // DISTINCT dedup check
+                    if let Some(ref mut dedup_set) = state.distinct_sets[i] {
+                        let dedup_key = GroupKey(vec![val.clone()]);
+                        if !dedup_set.insert(dedup_key) {
+                            continue; // Duplicate value, skip
+                        }
+                    }
+
+                    state.accumulators[i].feed(&val)?;
+                }
+            }
+        }
+
+        // If no groups were created and no GROUP BY (scalar aggregate),
+        // produce one row with default accumulator results
+        if groups.is_empty() && self.group_by.is_empty() {
+            let accumulators: Vec<Box<dyn super::aggregate::Accumulator>> = self
+                .aggregates
+                .iter()
+                .map(|op| op.create_accumulator())
+                .collect();
+            let mut values = Vec::with_capacity(self.aggregates.len());
+            for acc in &accumulators {
+                values.push(acc.finish());
+            }
+            let rows = vec![Row::computed(Record::new(values))];
+            self.buffer = Some(rows.into_iter());
+            return Ok(self.buffer.as_mut().unwrap().next());
+        }
+
+        // Build result rows in insertion order
+        let mut rows = Vec::with_capacity(groups.len());
+        for key in &group_order {
+            let state = groups.remove(key).unwrap();
+            let mut values = Vec::with_capacity(self.group_by.len() + self.aggregates.len());
+
+            // Group key values first
+            for v in &key.0 {
+                values.push(v.clone());
+            }
+
+            // Then aggregate results
+            for acc in &state.accumulators {
+                values.push(acc.finish());
+            }
+
+            rows.push(Row::computed(Record::new(values)));
+        }
+
+        self.buffer = Some(rows.into_iter());
+        Ok(self.buffer.as_mut().unwrap().next())
     }
 }
 
@@ -938,5 +1126,164 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tuples.len(), 0);
+    }
+
+    // --- Aggregate execution tests ---
+
+    /// Helper to collect all rows from a QueryNode into a Vec of value Vecs.
+    async fn collect_rows(mut node: QueryNode<TestCtx>) -> Vec<Vec<Value>> {
+        let mut rows = Vec::new();
+        while let Some(row) = node.next().await.unwrap() {
+            rows.push(row.record.values);
+        }
+        rows
+    }
+
+    /// Helper to set up a table with data and plan+execute a SELECT query,
+    /// returning all result rows.
+    async fn query_rows(ddl: &str, inserts: &[&str], select_sql: &str) -> Vec<Vec<Value>> {
+        use crate::sql::tests::parse_select;
+
+        let (db, snapshot, catalog) = setup_table_and_ctx(ddl).await;
+
+        // Insert data
+        let mut cid_counter = 0u32;
+        for &sql in inserts {
+            let insert = parse_insert(sql);
+            let plan = planner::plan_insert(&insert, &catalog).unwrap();
+            let snap = db
+                .tx_manager()
+                .snapshot(snapshot.current_txid, CommandId::new(cid_counter));
+            let ctx = db.execution_point(snap);
+            plan.execute_dml(&ctx).await.unwrap();
+            cid_counter += 1;
+        }
+
+        // Execute select query
+        let select = parse_select(select_sql);
+        let plan = planner::plan_select(&select, &catalog).unwrap();
+        let snap = db
+            .tx_manager()
+            .snapshot(snapshot.current_txid, CommandId::new(cid_counter));
+        let ctx = db.execution_point(snap);
+        let node = plan.prepare_for_execute(&ctx);
+        collect_rows(node).await
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_scalar_count() {
+        let rows = query_rows(
+            "CREATE TABLE t (id INTEGER)",
+            &["INSERT INTO t VALUES (1), (2), (3)"],
+            "SELECT COUNT(*) FROM t",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec![Value::Bigint(3)]);
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_scalar_sum() {
+        let rows = query_rows(
+            "CREATE TABLE t (val INTEGER)",
+            &["INSERT INTO t VALUES (10), (20), (30)"],
+            "SELECT SUM(val) FROM t",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec![Value::Bigint(60)]);
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_scalar_empty_table() {
+        let rows = query_rows(
+            "CREATE TABLE t (val INTEGER)",
+            &[],
+            "SELECT COUNT(*), SUM(val), AVG(val), MIN(val), MAX(val) FROM t",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 1);
+        // COUNT(*) on empty = 0; SUM/AVG/MIN/MAX on empty = NULL
+        assert_eq!(rows[0][0], Value::Bigint(0));
+        assert!(rows[0][1].is_null());
+        assert!(rows[0][2].is_null());
+        assert!(rows[0][3].is_null());
+        assert!(rows[0][4].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_group_by() {
+        let rows = query_rows(
+            "CREATE TABLE t (dept TEXT, salary INTEGER)",
+            &[
+                "INSERT INTO t VALUES ('eng', 100)",
+                "INSERT INTO t VALUES ('eng', 200)",
+                "INSERT INTO t VALUES ('sales', 300)",
+            ],
+            "SELECT dept, COUNT(*), SUM(salary) FROM t GROUP BY dept",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 2);
+        // Order depends on insertion order of group keys
+        let eng_row = rows.iter().find(|r| r[0] == Value::Text("eng".into()));
+        let sales_row = rows.iter().find(|r| r[0] == Value::Text("sales".into()));
+        assert!(eng_row.is_some());
+        assert!(sales_row.is_some());
+        let eng = eng_row.unwrap();
+        assert_eq!(eng[1], Value::Bigint(2)); // COUNT
+        assert_eq!(eng[2], Value::Bigint(300)); // SUM(100+200)
+        let sales = sales_row.unwrap();
+        assert_eq!(sales[1], Value::Bigint(1)); // COUNT
+        assert_eq!(sales[2], Value::Bigint(300)); // SUM(300)
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_having_filter() {
+        let rows = query_rows(
+            "CREATE TABLE t (dept TEXT, salary INTEGER)",
+            &[
+                "INSERT INTO t VALUES ('eng', 100)",
+                "INSERT INTO t VALUES ('eng', 200)",
+                "INSERT INTO t VALUES ('sales', 300)",
+            ],
+            "SELECT dept, COUNT(*) FROM t GROUP BY dept HAVING COUNT(*) > 1",
+        )
+        .await;
+
+        // Only 'eng' has COUNT > 1
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Text("eng".into()));
+        assert_eq!(rows[0][1], Value::Bigint(2));
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_avg() {
+        let rows = query_rows(
+            "CREATE TABLE t (val INTEGER)",
+            &["INSERT INTO t VALUES (10), (20), (30)"],
+            "SELECT AVG(val) FROM t",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Double(20.0));
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_min_max() {
+        let rows = query_rows(
+            "CREATE TABLE t (val INTEGER)",
+            &["INSERT INTO t VALUES (30), (10), (20)"],
+            "SELECT MIN(val), MAX(val) FROM t",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Integer(10));
+        assert_eq!(rows[0][1], Value::Integer(30));
     }
 }

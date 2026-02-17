@@ -317,9 +317,6 @@ impl Accumulator for MaxAccumulator {
 /// per group maintains a `HashSet<GroupKey>` where `GroupKey` wraps a
 /// single-element Vec (the argument value) for dedup.
 ///
-/// NOTE: Currently constructed only in tests and the Aggregate executor node
-/// (added in Commit 2). The `allow(dead_code)` will be removed at that point.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct GroupKey(pub Vec<Value>);
 

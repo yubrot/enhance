@@ -12,6 +12,7 @@ use crate::datum::Type;
 use crate::storage::PageId;
 
 use super::ColumnDesc;
+use super::aggregate::AggregateOp;
 use super::expr::BoundExpr;
 
 /// A row-producing logical query plan node.
@@ -46,6 +47,20 @@ pub enum QueryPlan {
         input: Box<QueryPlan>,
         /// Bound expressions to evaluate for each output column.
         exprs: Vec<BoundExpr>,
+        /// Output column descriptors.
+        columns: Vec<ColumnDesc>,
+    },
+    /// Hash-aggregate node.
+    ///
+    /// Output schema: \[group_by columns..., aggregate results...\].
+    /// When `group_by` is empty, produces exactly one row (scalar aggregate).
+    Aggregate {
+        /// Child plan to pull rows from.
+        input: Box<QueryPlan>,
+        /// GROUP BY expressions (bound against child's output schema).
+        group_by: Vec<BoundExpr>,
+        /// Aggregate operations to compute.
+        aggregates: Vec<AggregateOp>,
         /// Output column descriptors.
         columns: Vec<ColumnDesc>,
     },
@@ -103,6 +118,7 @@ impl QueryPlan {
             QueryPlan::SeqScan { columns, .. } => columns,
             QueryPlan::Filter { input, .. } => input.columns(),
             QueryPlan::Projection { columns, .. } => columns,
+            QueryPlan::Aggregate { columns, .. } => columns,
             QueryPlan::ValuesScan => &[],
         }
     }
@@ -158,6 +174,29 @@ impl QueryPlan {
                 writeln!(f)?;
                 input.fmt_explain(f, indent + 1)
             }
+            QueryPlan::Aggregate {
+                input,
+                group_by,
+                aggregates,
+                ..
+            } => {
+                write!(f, "Aggregate: group_by=[")?;
+                for (i, expr) in group_by.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", expr)?;
+                }
+                write!(f, "], aggregates=[")?;
+                for (i, op) in aggregates.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", op)?;
+                }
+                writeln!(f, "]")?;
+                input.fmt_explain(f, indent + 1)
+            }
             QueryPlan::ValuesScan => write!(f, "ValuesScan (1 row)"),
         }
     }
@@ -207,6 +246,7 @@ impl DmlPlan {
 mod tests {
     use super::*;
     use crate::datum::Type;
+    use crate::executor::aggregate::{AggregateFunction, AggregateOp};
     use crate::executor::tests::{bind_expr, int_col};
     use crate::storage::PageId;
 
@@ -258,6 +298,31 @@ mod tests {
         assert_eq!(
             plan.explain(),
             "Projection: $col1 (name)\n  SeqScan on users (cols: id, name)"
+        );
+    }
+
+    #[test]
+    fn test_explain_aggregate() {
+        let scan = QueryPlan::SeqScan {
+            table_name: "emp".to_string(),
+            table_id: 1,
+            first_page: PageId::new(10),
+            schema: vec![Type::Text, Type::Bigint],
+            columns: vec![int_col("dept"), int_col("salary")],
+        };
+        let plan = QueryPlan::Aggregate {
+            input: Box::new(scan),
+            group_by: vec![bind_expr("dept", &[int_col("dept"), int_col("salary")])],
+            aggregates: vec![AggregateOp {
+                func: AggregateFunction::Count,
+                args: vec![],
+                distinct: false,
+            }],
+            columns: vec![int_col("dept"), int_col("count")],
+        };
+        assert_eq!(
+            plan.explain(),
+            "Aggregate: group_by=[$col0 (dept)], aggregates=[COUNT(*)]\n  SeqScan on emp (cols: dept, salary)"
         );
     }
 
