@@ -232,12 +232,14 @@ LINE 1: SELECT FROM users;
 async fn test_psql_complex_select() {
     let server = PsqlTestServer::start().await;
 
-    // ORDER BY is not yet supported (Step 12), so this should return an error
+    // The "users" table doesn't exist, so this should return a table-not-found error.
+    // ORDER BY and LIMIT are supported, but the query still fails at planning due to the
+    // missing table.
     let result = server.run_psql_c(
         "SELECT id, name, age FROM users WHERE active = TRUE AND age >= 18 ORDER BY name ASC LIMIT 10;",
     );
 
-    result.assert_output_contains("unsupported");
+    result.assert_output_contains("does not exist");
 }
 
 #[tokio::test(flavor = "multi_thread")]

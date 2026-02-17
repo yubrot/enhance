@@ -21,7 +21,7 @@ use super::aggregate::{AggregateOp, GroupKey};
 use super::context::ExecContext;
 use super::error::ExecutorError;
 use super::expr::BoundExpr;
-use super::plan::{DmlPlan, QueryPlan};
+use super::plan::{DmlPlan, QueryPlan, SortItem};
 use super::row::Row;
 
 /// Result of executing a DML plan.
@@ -68,6 +68,10 @@ pub enum QueryNode<C: ExecContext> {
     Projection(Projection<C>),
     /// Hash-aggregate node.
     Aggregate(Aggregate<C>),
+    /// In-memory sort node.
+    Sort(Sort<C>),
+    /// LIMIT/OFFSET node.
+    Limit(Limit<C>),
     /// Single-row scan for queries without FROM (e.g., `SELECT 1+1`).
     ValuesScan(ValuesScan),
 }
@@ -115,6 +119,14 @@ impl QueryPlan {
                 aggregates,
                 columns,
             )),
+            QueryPlan::Sort { input, items } => {
+                QueryNode::Sort(Sort::new(input.prepare_for_execute(ctx), items))
+            }
+            QueryPlan::Limit {
+                input,
+                limit,
+                offset,
+            } => QueryNode::Limit(Limit::new(input.prepare_for_execute(ctx), limit, offset)),
             QueryPlan::ValuesScan => QueryNode::ValuesScan(ValuesScan::new()),
         }
     }
@@ -265,6 +277,8 @@ impl<C: ExecContext> QueryNode<C> {
                 QueryNode::Filter(n) => n.next().await,
                 QueryNode::Projection(n) => n.next().await,
                 QueryNode::Aggregate(n) => n.next().await,
+                QueryNode::Sort(n) => n.next().await,
+                QueryNode::Limit(n) => n.next().await,
                 QueryNode::ValuesScan(n) => n.next().await,
             }
         })
@@ -277,6 +291,8 @@ impl<C: ExecContext> QueryNode<C> {
             QueryNode::Filter(n) => n.child.columns(),
             QueryNode::Projection(n) => &n.columns,
             QueryNode::Aggregate(n) => &n.columns,
+            QueryNode::Sort(n) => n.child.columns(),
+            QueryNode::Limit(n) => n.child.columns(),
             QueryNode::ValuesScan(n) => &n.columns,
         }
     }
@@ -588,6 +604,168 @@ impl<C: ExecContext> Aggregate<C> {
 
         self.buffer = Some(rows.into_iter());
         Ok(self.buffer.as_mut().unwrap().next())
+    }
+}
+
+/// In-memory sort node.
+///
+/// Buffers all input rows on first `next()` call, sorts them by the
+/// specified key expressions, then emits one row at a time.
+///
+/// NOTE: Loads entire result set into memory. For production, consider
+/// external sort (disk-based merge sort) for data exceeding memory limits.
+pub struct Sort<C: ExecContext> {
+    /// Child node to pull rows from.
+    child: Box<QueryNode<C>>,
+    /// Sort key items.
+    items: Vec<SortItem>,
+    /// Buffered sorted rows (populated on first `next()` call).
+    buffer: Option<std::vec::IntoIter<Row>>,
+}
+
+impl<C: ExecContext> Sort<C> {
+    /// Creates a new Sort node.
+    pub fn new(child: QueryNode<C>, items: Vec<SortItem>) -> Self {
+        Self {
+            child: Box::new(child),
+            items,
+            buffer: None,
+        }
+    }
+
+    /// Returns the next sorted row, or `None` if exhausted.
+    ///
+    /// On the first call, consumes all input rows, sorts them, then returns
+    /// buffered rows one at a time.
+    async fn next(&mut self) -> Result<Option<Row>, ExecutorError> {
+        if let Some(ref mut iter) = self.buffer {
+            return Ok(iter.next());
+        }
+
+        // Consume all input rows
+        let mut rows = Vec::new();
+        while let Some(row) = self.child.next().await? {
+            rows.push(row);
+        }
+
+        // Sort using stable sort to preserve input order for equal keys
+        let items = &self.items;
+        rows.sort_by(|a, b| {
+            for item in items {
+                let a_val = item.expr.evaluate(&a.record);
+                let b_val = item.expr.evaluate(&b.record);
+
+                // If evaluation fails, treat as NULL (sort to end)
+                let a_val = a_val.unwrap_or(crate::datum::Value::Null);
+                let b_val = b_val.unwrap_or(crate::datum::Value::Null);
+
+                let a_null = a_val.is_null();
+                let b_null = b_val.is_null();
+
+                // Determine effective null ordering
+                let nulls_first = match item.nulls {
+                    crate::sql::NullOrdering::First => true,
+                    crate::sql::NullOrdering::Last => false,
+                    crate::sql::NullOrdering::Default => {
+                        // Default: NULLS LAST for ASC, NULLS FIRST for DESC
+                        matches!(item.direction, crate::sql::SortDirection::Desc)
+                    }
+                };
+
+                // Handle NULL comparisons
+                match (a_null, b_null) {
+                    (true, true) => continue,
+                    (true, false) => {
+                        return if nulls_first {
+                            std::cmp::Ordering::Less
+                        } else {
+                            std::cmp::Ordering::Greater
+                        };
+                    }
+                    (false, true) => {
+                        return if nulls_first {
+                            std::cmp::Ordering::Greater
+                        } else {
+                            std::cmp::Ordering::Less
+                        };
+                    }
+                    (false, false) => {}
+                }
+
+                // Non-null comparison
+                let ord = a_val
+                    .partial_cmp(&b_val)
+                    .unwrap_or(std::cmp::Ordering::Equal);
+
+                let ord = match item.direction {
+                    crate::sql::SortDirection::Asc => ord,
+                    crate::sql::SortDirection::Desc => ord.reverse(),
+                };
+
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+
+        self.buffer = Some(rows.into_iter());
+        Ok(self.buffer.as_mut().unwrap().next())
+    }
+}
+
+/// LIMIT/OFFSET node.
+///
+/// Skips `offset` rows from the child, then returns at most `limit` rows.
+pub struct Limit<C: ExecContext> {
+    /// Child node to pull rows from.
+    child: Box<QueryNode<C>>,
+    /// Maximum rows to return (None = no limit).
+    limit: Option<u64>,
+    /// Rows to skip before returning.
+    offset: u64,
+    /// Number of rows skipped so far.
+    skipped: u64,
+    /// Number of rows emitted so far.
+    emitted: u64,
+}
+
+impl<C: ExecContext> Limit<C> {
+    /// Creates a new Limit node.
+    pub fn new(child: QueryNode<C>, limit: Option<u64>, offset: u64) -> Self {
+        Self {
+            child: Box::new(child),
+            limit,
+            offset,
+            skipped: 0,
+            emitted: 0,
+        }
+    }
+
+    /// Returns the next row within the LIMIT/OFFSET window.
+    async fn next(&mut self) -> Result<Option<Row>, ExecutorError> {
+        // Skip offset rows
+        while self.skipped < self.offset {
+            match self.child.next().await? {
+                Some(_) => self.skipped += 1,
+                None => return Ok(None),
+            }
+        }
+
+        // Check limit
+        if let Some(limit) = self.limit
+            && self.emitted >= limit
+        {
+            return Ok(None);
+        }
+
+        match self.child.next().await? {
+            Some(row) => {
+                self.emitted += 1;
+                Ok(Some(row))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -1285,5 +1463,295 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Value::Integer(10));
         assert_eq!(rows[0][1], Value::Integer(30));
+    }
+
+    // --- Sort and Limit execution tests ---
+
+    #[tokio::test]
+    async fn test_sort_ascending() {
+        let rows = query_rows(
+            "CREATE TABLE t (val INTEGER)",
+            &["INSERT INTO t VALUES (30), (10), (20)"],
+            "SELECT val FROM t ORDER BY val ASC",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![Value::Integer(10)]);
+        assert_eq!(rows[1], vec![Value::Integer(20)]);
+        assert_eq!(rows[2], vec![Value::Integer(30)]);
+    }
+
+    #[tokio::test]
+    async fn test_sort_descending() {
+        let rows = query_rows(
+            "CREATE TABLE t (val INTEGER)",
+            &["INSERT INTO t VALUES (30), (10), (20)"],
+            "SELECT val FROM t ORDER BY val DESC",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![Value::Integer(30)]);
+        assert_eq!(rows[1], vec![Value::Integer(20)]);
+        assert_eq!(rows[2], vec![Value::Integer(10)]);
+    }
+
+    #[tokio::test]
+    async fn test_sort_text() {
+        let rows = query_rows(
+            "CREATE TABLE t (name TEXT)",
+            &[
+                "INSERT INTO t VALUES ('charlie')",
+                "INSERT INTO t VALUES ('alice')",
+                "INSERT INTO t VALUES ('bob')",
+            ],
+            "SELECT name FROM t ORDER BY name",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![Value::Text("alice".into())]);
+        assert_eq!(rows[1], vec![Value::Text("bob".into())]);
+        assert_eq!(rows[2], vec![Value::Text("charlie".into())]);
+    }
+
+    #[tokio::test]
+    async fn test_sort_nulls_last_default() {
+        let rows = query_rows(
+            "CREATE TABLE t (val INTEGER)",
+            &[
+                "INSERT INTO t VALUES (20)",
+                "INSERT INTO t VALUES (NULL)",
+                "INSERT INTO t VALUES (10)",
+            ],
+            "SELECT val FROM t ORDER BY val ASC",
+        )
+        .await;
+
+        // Default: NULLS LAST for ASC
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![Value::Integer(10)]);
+        assert_eq!(rows[1], vec![Value::Integer(20)]);
+        assert!(rows[2][0].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_sort_nulls_first_default_desc() {
+        let rows = query_rows(
+            "CREATE TABLE t (val INTEGER)",
+            &[
+                "INSERT INTO t VALUES (20)",
+                "INSERT INTO t VALUES (NULL)",
+                "INSERT INTO t VALUES (10)",
+            ],
+            "SELECT val FROM t ORDER BY val DESC",
+        )
+        .await;
+
+        // Default: NULLS FIRST for DESC
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0][0].is_null());
+        assert_eq!(rows[1], vec![Value::Integer(20)]);
+        assert_eq!(rows[2], vec![Value::Integer(10)]);
+    }
+
+    #[tokio::test]
+    async fn test_sort_nulls_first_explicit() {
+        let rows = query_rows(
+            "CREATE TABLE t (val INTEGER)",
+            &[
+                "INSERT INTO t VALUES (20)",
+                "INSERT INTO t VALUES (NULL)",
+                "INSERT INTO t VALUES (10)",
+            ],
+            "SELECT val FROM t ORDER BY val ASC NULLS FIRST",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0][0].is_null());
+        assert_eq!(rows[1], vec![Value::Integer(10)]);
+        assert_eq!(rows[2], vec![Value::Integer(20)]);
+    }
+
+    #[tokio::test]
+    async fn test_sort_multi_key() {
+        let rows = query_rows(
+            "CREATE TABLE t (dept TEXT, salary INTEGER)",
+            &[
+                "INSERT INTO t VALUES ('eng', 200)",
+                "INSERT INTO t VALUES ('sales', 100)",
+                "INSERT INTO t VALUES ('eng', 100)",
+                "INSERT INTO t VALUES ('sales', 200)",
+            ],
+            "SELECT dept, salary FROM t ORDER BY dept ASC, salary DESC",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows[0],
+            vec![Value::Text("eng".into()), Value::Integer(200)]
+        );
+        assert_eq!(
+            rows[1],
+            vec![Value::Text("eng".into()), Value::Integer(100)]
+        );
+        assert_eq!(
+            rows[2],
+            vec![Value::Text("sales".into()), Value::Integer(200)]
+        );
+        assert_eq!(
+            rows[3],
+            vec![Value::Text("sales".into()), Value::Integer(100)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sort_empty_table() {
+        let rows = query_rows(
+            "CREATE TABLE t (val INTEGER)",
+            &[],
+            "SELECT val FROM t ORDER BY val",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_sort_by_positional() {
+        let rows = query_rows(
+            "CREATE TABLE t (val INTEGER)",
+            &["INSERT INTO t VALUES (30), (10), (20)"],
+            "SELECT val FROM t ORDER BY 1",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![Value::Integer(10)]);
+        assert_eq!(rows[1], vec![Value::Integer(20)]);
+        assert_eq!(rows[2], vec![Value::Integer(30)]);
+    }
+
+    #[tokio::test]
+    async fn test_limit_basic() {
+        let rows = query_rows(
+            "CREATE TABLE t (val INTEGER)",
+            &["INSERT INTO t VALUES (1), (2), (3), (4), (5)"],
+            "SELECT val FROM t ORDER BY val LIMIT 3",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![Value::Integer(1)]);
+        assert_eq!(rows[1], vec![Value::Integer(2)]);
+        assert_eq!(rows[2], vec![Value::Integer(3)]);
+    }
+
+    #[tokio::test]
+    async fn test_limit_exceeds_rows() {
+        let rows = query_rows(
+            "CREATE TABLE t (val INTEGER)",
+            &["INSERT INTO t VALUES (1), (2), (3)"],
+            "SELECT val FROM t ORDER BY val LIMIT 10",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_offset_basic() {
+        let rows = query_rows(
+            "CREATE TABLE t (val INTEGER)",
+            &["INSERT INTO t VALUES (1), (2), (3), (4), (5)"],
+            "SELECT val FROM t ORDER BY val OFFSET 2",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![Value::Integer(3)]);
+        assert_eq!(rows[1], vec![Value::Integer(4)]);
+        assert_eq!(rows[2], vec![Value::Integer(5)]);
+    }
+
+    #[tokio::test]
+    async fn test_limit_and_offset() {
+        let rows = query_rows(
+            "CREATE TABLE t (val INTEGER)",
+            &["INSERT INTO t VALUES (1), (2), (3), (4), (5)"],
+            "SELECT val FROM t ORDER BY val LIMIT 2 OFFSET 1",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec![Value::Integer(2)]);
+        assert_eq!(rows[1], vec![Value::Integer(3)]);
+    }
+
+    #[tokio::test]
+    async fn test_limit_zero() {
+        let rows = query_rows(
+            "CREATE TABLE t (val INTEGER)",
+            &["INSERT INTO t VALUES (1), (2), (3)"],
+            "SELECT val FROM t LIMIT 0",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_offset_exceeds_rows() {
+        let rows = query_rows(
+            "CREATE TABLE t (val INTEGER)",
+            &["INSERT INTO t VALUES (1), (2), (3)"],
+            "SELECT val FROM t ORDER BY val OFFSET 10",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_sort_with_group_by() {
+        let rows = query_rows(
+            "CREATE TABLE t (dept TEXT, salary INTEGER)",
+            &[
+                "INSERT INTO t VALUES ('eng', 200)",
+                "INSERT INTO t VALUES ('sales', 100)",
+                "INSERT INTO t VALUES ('eng', 100)",
+            ],
+            "SELECT dept, SUM(salary) FROM t GROUP BY dept ORDER BY dept",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::Text("eng".into()));
+        assert_eq!(rows[0][1], Value::Bigint(300));
+        assert_eq!(rows[1][0], Value::Text("sales".into()));
+        assert_eq!(rows[1][1], Value::Bigint(100));
+    }
+
+    #[tokio::test]
+    async fn test_sort_by_aggregate_with_limit() {
+        let rows = query_rows(
+            "CREATE TABLE t (dept TEXT, salary INTEGER)",
+            &[
+                "INSERT INTO t VALUES ('eng', 200)",
+                "INSERT INTO t VALUES ('eng', 100)",
+                "INSERT INTO t VALUES ('sales', 300)",
+                "INSERT INTO t VALUES ('hr', 150)",
+            ],
+            "SELECT dept, COUNT(*) FROM t GROUP BY dept ORDER BY COUNT(*) DESC LIMIT 2",
+        )
+        .await;
+
+        assert_eq!(rows.len(), 2);
+        // 'eng' has COUNT=2, others have COUNT=1
+        assert_eq!(rows[0][0], Value::Text("eng".into()));
+        assert_eq!(rows[0][1], Value::Bigint(2));
     }
 }

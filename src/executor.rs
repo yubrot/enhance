@@ -53,7 +53,7 @@ pub use column::{ColumnDesc, ColumnSource};
 pub use context::ExecContext;
 pub use error::ExecutorError;
 pub use expr::BoundExpr;
-pub use plan::{DmlPlan, QueryPlan};
+pub use plan::{DmlPlan, QueryPlan, SortItem};
 pub use planner::{plan_delete, plan_insert, plan_select, plan_update};
 pub use row::Row;
 pub use runner::{DmlResult, QueryNode};

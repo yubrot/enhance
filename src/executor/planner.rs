@@ -11,7 +11,7 @@ use crate::sql::{
 use super::aggregate::{AggregateFunction, AggregateOp};
 use super::error::ExecutorError;
 use super::expr::{BoundExpr, BoundWhenClause};
-use super::plan::{DmlPlan, QueryPlan};
+use super::plan::{DmlPlan, QueryPlan, SortItem};
 use super::{ColumnDesc, ColumnSource};
 
 /// Plans a SELECT statement into a logical [`QueryPlan`] tree.
@@ -33,15 +33,6 @@ pub fn plan_select(select: &SelectStmt, catalog: &Catalog) -> Result<QueryPlan, 
     // Check for unsupported features
     if select.distinct {
         return Err(ExecutorError::Unsupported("DISTINCT".to_string()));
-    }
-    if !select.order_by.is_empty() {
-        return Err(ExecutorError::Unsupported("ORDER BY".to_string()));
-    }
-    if select.limit.is_some() {
-        return Err(ExecutorError::Unsupported("LIMIT".to_string()));
-    }
-    if select.offset.is_some() {
-        return Err(ExecutorError::Unsupported("OFFSET".to_string()));
     }
     if select.locking.is_some() {
         return Err(ExecutorError::Unsupported("FOR UPDATE/SHARE".to_string()));
@@ -66,16 +57,18 @@ pub fn plan_select(select: &SelectStmt, catalog: &Catalog) -> Result<QueryPlan, 
     plan = apply_filter(plan, select.where_clause.as_ref())?;
 
     // Step 3: Detect aggregation context
-    // NOTE: ORDER BY expressions must also be checked here once ORDER BY
-    // support is added (Commit 3). Currently ORDER BY is rejected above,
-    // so queries like `SELECT x FROM t ORDER BY COUNT(*)` never reach
-    // this point.
+    // ORDER BY expressions must also be checked — `SELECT x FROM t ORDER BY COUNT(*)`
+    // triggers aggregation context, leading to NonAggregatedColumn for x.
     let has_aggregation = !select.group_by.is_empty()
         || select.columns.iter().any(|item| match item {
             SelectItem::Expr { expr, .. } => contains_aggregate(expr),
             _ => false,
         })
-        || select.having.as_ref().is_some_and(contains_aggregate);
+        || select.having.as_ref().is_some_and(contains_aggregate)
+        || select
+            .order_by
+            .iter()
+            .any(|ob| contains_aggregate(&ob.expr));
 
     if has_aggregation {
         plan = plan_aggregation(plan, select, &scan_columns)?;
@@ -86,23 +79,31 @@ pub fn plan_select(select: &SelectStmt, catalog: &Catalog) -> Result<QueryPlan, 
                 "HAVING without GROUP BY or aggregates".to_string(),
             ));
         }
+
+        // Step 4a: ORDER BY without aggregation
+        plan = plan_order_by_simple(plan, select)?;
+
+        // Step 5a: Projection
         plan = build_projection_plan(plan, &select.columns)?;
     }
+
+    // Step 6: LIMIT/OFFSET
+    plan = plan_limit_offset(plan, select)?;
 
     Ok(plan)
 }
 
 /// Plans the aggregation portion of a SELECT: GROUP BY binding, aggregate
-/// extraction, HAVING rewrite, and final Projection.
+/// extraction, HAVING rewrite, ORDER BY rewrite, and final Projection.
 ///
 /// Called only when the SELECT is in an aggregation context (GROUP BY is
-/// present, or SELECT/HAVING contain aggregate function calls).
+/// present, or SELECT/HAVING/ORDER BY contain aggregate function calls).
 fn plan_aggregation(
     plan: QueryPlan,
     select: &SelectStmt,
     scan_columns: &[ColumnDesc],
 ) -> Result<QueryPlan, ExecutorError> {
-    // Step 3a: Bind GROUP BY expressions against scan_columns
+    // 1. Bind GROUP BY expressions against scan_columns
     let mut bound_group_by = Vec::new();
     for expr in &select.group_by {
         // Validate: no aggregates in GROUP BY
@@ -114,7 +115,7 @@ fn plan_aggregation(
         bound_group_by.push(expr.bind(scan_columns)?);
     }
 
-    // Step 3b: Resolve SELECT items against scan_columns
+    // 2. Resolve SELECT items against scan_columns
     let mut select_bound_exprs = Vec::new();
     let mut select_descs = Vec::new();
     for item in &select.columns {
@@ -124,13 +125,15 @@ fn plan_aggregation(
         }
     }
 
-    // Step 3c: Validate aggregate argument types (SUM/AVG must be numeric)
+    // 3. Validate aggregate argument types (SUM/AVG must be numeric)
     // and no nested aggregates (aggregate within aggregate)
     for expr in &select_bound_exprs {
         validate_bound_aggregates(expr)?;
     }
 
-    // Step 3d: Rewrite SELECT expressions for aggregate output
+    // 4. Rewrite SELECT expressions for aggregate output.
+    // All aggregate extraction (SELECT, HAVING, ORDER BY) shares a single
+    // aggregates Vec so duplicate aggregates reuse the same output position.
     let mut aggregates: Vec<AggregateOp> = Vec::new();
     let mut rewritten_select = Vec::new();
     for expr in select_bound_exprs {
@@ -141,7 +144,7 @@ fn plan_aggregation(
         )?);
     }
 
-    // Step 3e: Rewrite HAVING if present (shares aggregate list with SELECT)
+    // 5. Rewrite HAVING if present (shares aggregate list with SELECT)
     let rewritten_having = if let Some(ref having_expr) = select.having {
         let bound_having = having_expr.bind(scan_columns)?;
         validate_bound_aggregates(&bound_having)?;
@@ -154,7 +157,26 @@ fn plan_aggregation(
         None
     };
 
-    // Step 3f: Build Aggregate output schema
+    // 6. Resolve ORDER BY expressions (shares aggregate list with SELECT/HAVING).
+    // Must be resolved before building the Aggregate node because ORDER BY
+    // expressions like `ORDER BY COUNT(*)` may add new aggregates.
+    let sort_items = if !select.order_by.is_empty() {
+        let mut items = Vec::new();
+        for ob in &select.order_by {
+            let sort_item = resolve_order_by_expr(ob, &rewritten_select, &select_descs, |expr| {
+                let bound = expr.bind(scan_columns)?;
+                validate_bound_aggregates(&bound)?;
+                rewrite_for_aggregate_output(bound, &bound_group_by, &mut aggregates)
+            })?;
+            items.push(sort_item);
+        }
+        Some(items)
+    } else {
+        None
+    };
+
+    // 7. Build Aggregate output schema (done after ORDER BY so the schema
+    // includes any aggregates added by ORDER BY expressions).
     let mut agg_columns = Vec::new();
     for (i, gb_expr) in bound_group_by.iter().enumerate() {
         if let BoundExpr::Column { index, .. } = gb_expr {
@@ -176,7 +198,7 @@ fn plan_aggregation(
         });
     }
 
-    // Step 3g: Build Aggregate plan node
+    // 8. Build Aggregate plan node
     let mut result = QueryPlan::Aggregate {
         input: Box::new(plan),
         group_by: bound_group_by,
@@ -184,7 +206,7 @@ fn plan_aggregation(
         columns: agg_columns,
     };
 
-    // Step 3h: Apply HAVING filter
+    // 9. Apply HAVING filter
     if let Some(having_pred) = rewritten_having {
         result = QueryPlan::Filter {
             input: Box::new(result),
@@ -192,14 +214,20 @@ fn plan_aggregation(
         };
     }
 
-    // Step 3i: Update SELECT column types from rewritten expressions
+    // 10. Apply Sort if ORDER BY was present
+    if let Some(items) = sort_items {
+        result = QueryPlan::Sort {
+            input: Box::new(result),
+            items,
+        };
+    }
+
+    // 11. Build Projection (update column types from rewritten expressions first)
     for (i, expr) in rewritten_select.iter().enumerate() {
         if let Some(ty) = expr.ty() {
             select_descs[i].ty = ty;
         }
     }
-
-    // Step 3j: Build Projection
     result = QueryPlan::Projection {
         input: Box::new(result),
         exprs: rewritten_select,
@@ -924,6 +952,177 @@ fn rewrite_for_aggregate_output(
         }),
         // Already handled above: Null, Boolean, Integer, Float, String, Column, AggregateCall
         _ => unreachable!(),
+    }
+}
+
+/// Resolves a single ORDER BY expression into a [`SortItem`].
+///
+/// Resolution follows three cases in order:
+///
+/// **Case A**: Integer literal N → positional reference (1-indexed).
+/// Uses the already-rewritten SELECT expression at position N-1.
+///
+/// **Case B**: Simple column name matching a SELECT output name (including aliases).
+/// Uses the already-rewritten SELECT expression for that output column.
+///
+/// **Case C**: No positional/alias match.
+/// Calls `fallback_bind` to bind and (optionally) rewrite the expression.
+fn resolve_order_by_expr(
+    ob: &crate::sql::OrderByItem,
+    rewritten_select: &[BoundExpr],
+    select_descs: &[ColumnDesc],
+    mut fallback_bind: impl FnMut(&Expr) -> Result<BoundExpr, ExecutorError>,
+) -> Result<SortItem, ExecutorError> {
+    let sort_expr = match &ob.expr {
+        // Case A: Positional reference (e.g., ORDER BY 1)
+        Expr::Integer(n) => {
+            let pos = *n;
+            if pos < 1 || pos as usize > rewritten_select.len() {
+                return Err(ExecutorError::Unsupported(format!(
+                    "ORDER BY position {} is not in select list (1..{})",
+                    pos,
+                    rewritten_select.len()
+                )));
+            }
+            rewritten_select[(pos - 1) as usize].clone()
+        }
+
+        // Case B: Simple column name matching a SELECT output name (including aliases)
+        Expr::ColumnRef {
+            table: None,
+            column,
+        } => {
+            if let Some(pos) = select_descs
+                .iter()
+                .position(|d| d.name.eq_ignore_ascii_case(column))
+            {
+                rewritten_select[pos].clone()
+            } else {
+                // Not an alias — fall through to Case C
+                fallback_bind(&ob.expr)?
+            }
+        }
+
+        // Case C: Arbitrary expression
+        _ => fallback_bind(&ob.expr)?,
+    };
+
+    Ok(SortItem {
+        expr: sort_expr,
+        direction: ob.direction,
+        nulls: ob.nulls,
+    })
+}
+
+/// Plans ORDER BY for non-aggregation queries.
+///
+/// Inserts a Sort node between the current plan (after Filter, before Projection).
+/// ORDER BY expressions are resolved via alias, positional, or scan-schema binding.
+fn plan_order_by_simple(plan: QueryPlan, select: &SelectStmt) -> Result<QueryPlan, ExecutorError> {
+    if select.order_by.is_empty() {
+        return Ok(plan);
+    }
+
+    let input_columns = plan.columns().to_vec();
+
+    // Pre-compute SELECT aliases and bound expressions for alias/positional resolution
+    let mut select_bound_exprs = Vec::new();
+    let mut select_descs = Vec::new();
+    for item in &select.columns {
+        for (expr, desc) in resolve_select_item(item, &input_columns)? {
+            select_bound_exprs.push(expr);
+            select_descs.push(desc);
+        }
+    }
+
+    let mut sort_items = Vec::new();
+    for ob in &select.order_by {
+        let sort_item = resolve_order_by_expr(ob, &select_bound_exprs, &select_descs, |expr| {
+            // Case C: Bind against the scan schema (pre-Projection)
+            expr.bind(&input_columns)
+        })?;
+        sort_items.push(sort_item);
+    }
+
+    Ok(QueryPlan::Sort {
+        input: Box::new(plan),
+        items: sort_items,
+    })
+}
+
+/// Plans LIMIT/OFFSET into a [`QueryPlan::Limit`] node.
+///
+/// Binds limit/offset as constant expressions (no column references allowed),
+/// evaluates them at planning time, validates type (integer) and sign
+/// (non-negative), and converts to u64.
+fn plan_limit_offset(plan: QueryPlan, select: &SelectStmt) -> Result<QueryPlan, ExecutorError> {
+    if select.limit.is_none() && select.offset.is_none() {
+        return Ok(plan);
+    }
+
+    let limit = if let Some(ref limit_expr) = select.limit {
+        Some(eval_constant_u64(limit_expr, "LIMIT")?)
+    } else {
+        None
+    };
+
+    let offset = if let Some(ref offset_expr) = select.offset {
+        eval_constant_u64(offset_expr, "OFFSET")?
+    } else {
+        0
+    };
+
+    // Skip creating a Limit node if it would be a no-op (no limit, zero offset)
+    if limit.is_none() && offset == 0 {
+        return Ok(plan);
+    }
+
+    Ok(QueryPlan::Limit {
+        input: Box::new(plan),
+        limit,
+        offset,
+    })
+}
+
+/// Evaluates a constant expression to a non-negative u64.
+///
+/// Used for LIMIT/OFFSET where the value must be an integer literal
+/// or constant expression. Column references are not allowed.
+fn eval_constant_u64(expr: &Expr, context: &str) -> Result<u64, ExecutorError> {
+    use crate::datum::Value;
+    use crate::heap::Record;
+
+    // Bind with empty column list — column refs are not allowed
+    let bound = expr.bind(&[])?;
+    let empty_record = Record::new(vec![]);
+    let value = bound.evaluate(&empty_record)?;
+
+    match value {
+        Value::Smallint(n) => {
+            if n < 0 {
+                Err(ExecutorError::Unsupported(format!("negative {}", context)))
+            } else {
+                Ok(n as u64)
+            }
+        }
+        Value::Integer(n) => {
+            if n < 0 {
+                Err(ExecutorError::Unsupported(format!("negative {}", context)))
+            } else {
+                Ok(n as u64)
+            }
+        }
+        Value::Bigint(n) => {
+            if n < 0 {
+                Err(ExecutorError::Unsupported(format!("negative {}", context)))
+            } else {
+                Ok(n as u64)
+            }
+        }
+        _ => Err(ExecutorError::TypeMismatch {
+            expected: "integer".to_string(),
+            found: value.ty(),
+        }),
     }
 }
 
@@ -1838,5 +2037,204 @@ mod tests {
             result,
             Err(ExecutorError::NonAggregatedColumn { .. })
         ));
+    }
+
+    // --- ORDER BY planner tests ---
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_single_column() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER, name TEXT)").await;
+        let select = parse_select("SELECT * FROM t ORDER BY id");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("Sort:"), "explain: {}", explain);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_desc() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER, name TEXT)").await;
+        let select = parse_select("SELECT * FROM t ORDER BY id DESC");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("DESC"), "explain: {}", explain);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_alias() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER, name TEXT)").await;
+        let select = parse_select("SELECT name AS n FROM t ORDER BY n");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("Sort:"), "explain: {}", explain);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_positional() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER, name TEXT)").await;
+        let select = parse_select("SELECT id, name FROM t ORDER BY 2");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("Sort:"), "explain: {}", explain);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_positional_out_of_range() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER, name TEXT)").await;
+        let select = parse_select("SELECT id, name FROM t ORDER BY 3");
+
+        let result = plan_select(&select, &catalog);
+        assert!(matches!(result, Err(ExecutorError::Unsupported(msg)) if msg.contains("position")));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_positional_zero() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER, name TEXT)").await;
+        let select = parse_select("SELECT id FROM t ORDER BY 0");
+
+        let result = plan_select(&select, &catalog);
+        assert!(matches!(result, Err(ExecutorError::Unsupported(msg)) if msg.contains("position")));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_expression() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER, name TEXT)").await;
+        let select = parse_select("SELECT * FROM t ORDER BY id + 1");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("Sort:"), "explain: {}", explain);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_with_group_by() {
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE emp (dept TEXT, salary INTEGER)").await;
+        let select = parse_select("SELECT dept, COUNT(*) FROM emp GROUP BY dept ORDER BY dept");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("Sort:"), "explain: {}", explain);
+        assert!(explain.contains("Aggregate:"), "explain: {}", explain);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_aggregate_expr() {
+        let catalog =
+            setup_catalog_with_table("CREATE TABLE emp (dept TEXT, salary INTEGER)").await;
+        // ORDER BY an aggregate expression not in SELECT
+        let select = parse_select("SELECT dept FROM emp GROUP BY dept ORDER BY COUNT(*)");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("Sort:"), "explain: {}", explain);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_triggers_aggregation() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER)").await;
+        // ORDER BY COUNT(*) triggers aggregation context for the entire query.
+        // Since id is not in GROUP BY and not aggregated → NonAggregatedColumn
+        let select = parse_select("SELECT id FROM t ORDER BY COUNT(*)");
+
+        let result = plan_select(&select, &catalog);
+        assert!(matches!(
+            result,
+            Err(ExecutorError::NonAggregatedColumn { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_order_by_nulls_first() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER)").await;
+        let select = parse_select("SELECT * FROM t ORDER BY id NULLS FIRST");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("NULLS FIRST"), "explain: {}", explain);
+    }
+
+    // --- LIMIT/OFFSET planner tests ---
+
+    #[tokio::test]
+    async fn test_plan_select_limit() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER)").await;
+        let select = parse_select("SELECT * FROM t LIMIT 10");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("Limit:"), "explain: {}", explain);
+        assert!(explain.contains("limit=10"), "explain: {}", explain);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_offset() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER)").await;
+        let select = parse_select("SELECT * FROM t OFFSET 5");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("Limit:"), "explain: {}", explain);
+        assert!(explain.contains("offset=5"), "explain: {}", explain);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_limit_and_offset() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER)").await;
+        let select = parse_select("SELECT * FROM t LIMIT 10 OFFSET 5");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("limit=10"), "explain: {}", explain);
+        assert!(explain.contains("offset=5"), "explain: {}", explain);
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_negative_limit_error() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER)").await;
+        let select = parse_select("SELECT * FROM t LIMIT -1");
+
+        let result = plan_select(&select, &catalog);
+        assert!(matches!(
+            result,
+            Err(ExecutorError::Unsupported(msg)) if msg.contains("negative")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_negative_offset_error() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER)").await;
+        let select = parse_select("SELECT * FROM t OFFSET -1");
+
+        let result = plan_select(&select, &catalog);
+        assert!(matches!(
+            result,
+            Err(ExecutorError::Unsupported(msg)) if msg.contains("negative")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_limit_non_integer_error() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER)").await;
+        let select = parse_select("SELECT * FROM t LIMIT 'abc'");
+
+        let result = plan_select(&select, &catalog);
+        assert!(matches!(
+            result,
+            Err(ExecutorError::TypeMismatch { expected, .. }) if expected == "integer"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_plan_select_limit_zero() {
+        let catalog = setup_catalog_with_table("CREATE TABLE t (id INTEGER)").await;
+        let select = parse_select("SELECT * FROM t LIMIT 0");
+
+        let plan = plan_select(&select, &catalog).unwrap();
+        let explain = plan.explain();
+        assert!(explain.contains("limit=0"), "explain: {}", explain);
     }
 }
